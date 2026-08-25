@@ -26,6 +26,23 @@ A few hundred conversations are enough for a style change. A few thousand for a 
 Defaults: learning rate 1e-5 with cosine decay, loss only on assistant tokens, batch of
 32,768 tokens per step, quantisation kept in the loop so the exported model matches the
 trained one. A small validation split is held out automatically and printed before and after.
+The trainer also audits pathological repetition, mixes 10 percent recovery examples, and
+uses repetition-completion unlikelihood loss with weight 0.2. Disable both additions with
+`--recovery-ratio 0 --ul-alpha 0` for an MLE baseline.
+
+Write the audit to disk and reject problematic examples strictly with:
+
+    python finetune.py --data my_data.jsonl --audit-report my_model/audit.json \
+        --repeat-policy error
+
+Samples are packed whole. A conversation longer than `--ctx` is rejected by default; use
+`--overlength truncate` only when complete earlier assistant turns may be retained safely.
+For a short three-way ablation, keep the data split and seed fixed and compare: MLE only;
+recovery only (`--ul-alpha 0`); and the defaults (recovery plus unlikelihood).
+After exporting each checkpoint, compare deployed models with
+`python benchmarks/anti_repetition_eval.py --model base=base.shdw --model tuned=tuned.shdw
+--out results/repetition.json`. Run the evaluator once per `--profile greedy`, `sampled`, and
+`guarded` to separate training improvements from runtime protection.
 
 | hardware | speed | 150 steps |
 |---|---|---|

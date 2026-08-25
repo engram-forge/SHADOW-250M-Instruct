@@ -242,6 +242,12 @@ Python:
     eng = Engine("shadow250m_instruct.shdw", "fp131072.npy", archive="path/to/archive")
     print(eng.answer("your question"))
 
+Chat uses temperature 0.25, top-k 30, repetition penalty 1.15, and a repetition guard by
+default. The guard retries a detected loop once with stronger settings and truncates a
+confirmed loop if both generations fail. Use `python shadow_chat.py --greedy --no-guard` to
+recover the original deterministic behavior, or see `python shadow_chat.py --help` for
+individual decoding controls.
+
 ### Chat template
 
     <start_of_turn>user
