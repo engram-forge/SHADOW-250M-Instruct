@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Fine-tuning outputs and downloaded master checkpoint
+finetune/shadow250m_instruct.pt
+finetune/*_model/
+finetune/finetuned/
+finetune/anti_repeat_model/
+finetune/ablation_data/
+finetune/ablation_run_*/
+data/oasst1_raw/
+data/neutral_sft/
+finetune/neutral_candidate_*/
+
+rsync.sh
