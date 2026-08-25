@@ -48,6 +48,7 @@ class Engine:
     def __init__(s, model, table, archive=None, kernel=None, threads=None):
         s.model = str(pathlib.Path(model).resolve()); s.table = str(pathlib.Path(table).resolve())
         s.kernel = str(pathlib.Path(kernel).resolve()) if kernel else str((HERE.parent / "deployment" / "bin" / ("windows/shadow.exe" if os.name == "nt" else "linux/shadow")).resolve())
+        if os.name != "nt": pathlib.Path(s.kernel).chmod(0o755)
         s.env = dict(os.environ)
         if threads: s.env["SHADOW_THREADS"] = str(threads)
         s.ext = None
