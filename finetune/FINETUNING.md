@@ -44,6 +44,11 @@ After exporting each checkpoint, compare deployed models with
 --out results/repetition.json`. Run the evaluator once per `--profile greedy`, `sampled`, and
 `guarded` to separate training improvements from runtime protection.
 
+For a leakage-safe validation split, pass a separate conversation file with `--val-data`.
+`prepare_oasst1.py` can prepare a neutral English dataset from the pinned Apache-2.0 OASST1
+ready-message export; it filters low-quality and repetitive paths and splits entire conversation
+trees between train and validation. The downloaded source and prepared data remain ignored.
+
 | hardware | speed | 150 steps |
 |---|---|---|
 | laptop RTX 3080 (thermally limited) | ~0.9k tokens/s | ~90 min |

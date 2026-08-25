@@ -1,4 +1,6 @@
 import random
+import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -12,6 +14,16 @@ from shadow_runtime import Engine, repetition_metrics
 
 
 class TrainingUtilitiesTest(unittest.TestCase):
+    def test_separate_validation_file_is_not_mixed(self):
+        train = {"messages": [{"role": "user", "content": "train question"}, {"role": "assistant", "content": "train answer"}]}
+        val = {"messages": [{"role": "user", "content": "validation question"}, {"role": "assistant", "content": "validation answer"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            train_path = f"{directory}/train.jsonl"; val_path = f"{directory}/val.jsonl"
+            with open(train_path, "w") as stream: stream.write((json.dumps(train) + "\n") * 2)
+            with open(val_path, "w") as stream: stream.write(json.dumps(val) + "\n")
+            from finetune.finetune import Packer
+            packer = Packer(train_path, 128, random.Random(0), 0.5, val_path=val_path)
+            self.assertEqual(len(packer.train), 2); self.assertEqual(len(packer.val), 1)
     def test_adjacent_loop_detection(self):
         self.assertEqual(repeated_span_start([1, 2, 3] * 3), 0)
         self.assertIsNone(repeated_span_start([1, 2, 3, 1, 2, 4]))

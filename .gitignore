@@ -9,5 +9,8 @@ finetune/finetuned/
 finetune/anti_repeat_model/
 finetune/ablation_data/
 finetune/ablation_run_*/
+data/oasst1_raw/
+data/neutral_sft/
+finetune/neutral_candidate_*/
 
 rsync.sh

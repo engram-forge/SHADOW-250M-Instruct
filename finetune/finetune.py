@@ -29,6 +29,7 @@ BOS, EOS, SOT, EOT = 2, 1, 8, 9
 def get_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="jsonl with {'messages': [...]} per line")
+    ap.add_argument("--val-data", help="separate held-out JSONL; disables random validation split")
     ap.add_argument("--init", default=str(HERE / "shadow250m_instruct.pt"))
     ap.add_argument("--table", default=str(ROOT / "deployment" / "fp131072.npy"))
     ap.add_argument("--out", default="finetuned")
@@ -107,41 +108,53 @@ def recovery_example(ids, msk, rng):
 
 class Packer:
     def __init__(s, path, ctx, rng, val_frac, repeat_policy="warn", overlength="error",
-                 recovery_ratio=0.10, audit_report=None):
+                 recovery_ratio=0.10, audit_report=None, val_path=None):
         s.ex = []
+        def load(source, is_validation=False):
+            loaded = []
+            with open(source, encoding="utf-8") as stream:
+                for lineno, line in enumerate(stream, 1):
+                    line = line.strip()
+                    if not line: continue
+                    audit["total"] += 1
+                    messages = json.loads(line)["messages"]
+                    info = audit_messages(messages)
+                    pathological = info["repeated_span"] or info["repeat_4gram_ratio"] > 0.5
+                    location = f"{source}:{lineno}" if val_path else lineno
+                    if info["empty_assistant"]: audit["empty_assistant"].append(location)
+                    if pathological:
+                        audit["pathological_repeat"].append(location)
+                        if repeat_policy == "drop": audit["dropped"] += 1; continue
+                        if repeat_policy == "error": raise SystemExit(f"pathological repetition at {location}")
+                    ids, msk = build_ids(messages)
+                    if len(ids) > ctx:
+                        audit["overlength"].append(location)
+                        if overlength == "error": raise SystemExit(f"{location} has {len(ids)} tokens, over --ctx {ctx}")
+                        messages = truncate_complete_turns(messages, ctx)
+                        if not messages: raise SystemExit(f"{location} has no complete assistant turn within --ctx {ctx}")
+                        ids, msk = build_ids(messages)
+                    loaded.append((np.asarray(ids, np.int64), np.asarray(msk, np.int64)))
+                    audit["accepted"] += 1
+            return loaded
         audit = {"total": 0, "accepted": 0, "dropped": 0, "overlength": [],
                  "pathological_repeat": [], "empty_assistant": []}
-        for lineno, line in enumerate(open(path, encoding="utf-8"), 1):
-            line = line.strip()
-            if not line: continue
-            audit["total"] += 1
-            messages = json.loads(line)["messages"]
-            info = audit_messages(messages)
-            pathological = info["repeated_span"] or info["repeat_4gram_ratio"] > 0.5
-            if info["empty_assistant"]: audit["empty_assistant"].append(lineno)
-            if pathological:
-                audit["pathological_repeat"].append(lineno)
-                if repeat_policy == "drop": audit["dropped"] += 1; continue
-                if repeat_policy == "error": raise SystemExit(f"pathological repetition at data line {lineno}")
-            ids, msk = build_ids(messages)
-            if len(ids) > ctx:
-                audit["overlength"].append(lineno)
-                if overlength == "error": raise SystemExit(f"data line {lineno} has {len(ids)} tokens, over --ctx {ctx}")
-                messages = truncate_complete_turns(messages, ctx)
-                if not messages: raise SystemExit(f"data line {lineno} has no complete assistant turn within --ctx {ctx}")
-                ids, msk = build_ids(messages)
-            s.ex.append((np.asarray(ids, np.int64), np.asarray(msk, np.int64)))
-            audit["accepted"] += 1
+        s.ex = load(path)
+        separate_val = load(val_path, True) if val_path else None
         if audit_report:
             report_path = pathlib.Path(audit_report)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
         print(f"audit: {audit['total']} total, {len(audit['pathological_repeat'])} repetitive, "
               f"{len(audit['overlength'])} overlength, {audit['dropped']} dropped")
-        rng.shuffle(s.ex)
         if len(s.ex) < 2: raise SystemExit("need at least 2 conversations in the data file")
-        nval = min(max(1, int(len(s.ex) * val_frac)), max(1, len(s.ex) // 5))
-        s.val = s.ex[:nval]; s.train = s.ex[nval:]; s.ctx = ctx; s.rng = rng
+        rng.shuffle(s.ex)
+        if separate_val is not None:
+            if not separate_val: raise SystemExit("separate validation file is empty")
+            s.train, s.val = s.ex, separate_val
+        else:
+            nval = min(max(1, int(len(s.ex) * val_frac)), max(1, len(s.ex) // 5))
+            s.val = s.ex[:nval]; s.train = s.ex[nval:]
+        s.ctx = ctx; s.rng = rng
         s.recovery_ratio = recovery_ratio
         print(f"data: {len(s.train)} train / {len(s.val)} val conversations")
     def pack(s, B, val=False):
@@ -212,7 +225,7 @@ def main():
     if not 0 <= a.recovery_ratio <= 1: raise SystemExit("--recovery-ratio must be in [0, 1]")
     if a.ul_alpha < 0 or a.ul_window < 1 or a.ul_ngram < 2: raise SystemExit("invalid unlikelihood settings")
     data = Packer(a.data, a.ctx, rng, a.val_frac, a.repeat_policy, a.overlength,
-                  a.recovery_ratio, a.audit_report)
+                  a.recovery_ratio, a.audit_report, a.val_data)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     def loss_of(x, y, include_ul=True):
         h, _ = model.trunk(x); ph = model.head(h).float().reshape(-1, 512)
