@@ -18,3 +18,8 @@ constraints, neutral style, repetition, output length, and pirate-style leakage.
       --out results/qualification.json --review-out results/blind_review.jsonl
 
 These generative checks are not substitutes for canonical PIQA or ARC likelihood scoring.
+
+`anti_repetition_eval.py` evaluates deployed models on the balanced 50-prompt suite in
+`anti_repetition_prompts.json`. The final retained anti-repetition model results, training
+recipe, qualification gates, and artifact hashes are consolidated in
+`anti_repetition_report.md`; intermediate experiment reports are not retained.

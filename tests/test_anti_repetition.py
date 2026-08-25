@@ -44,12 +44,13 @@ class TrainingUtilitiesTest(unittest.TestCase):
         self.assertTrue(any(mask))
 
     def test_recovery_prefix_is_not_supervised(self):
-        ids = list(range(30)); mask = [0] * 5 + [1] * 25
+        ids = list(range(60)); mask = [0] * 5 + [1] * 55
         changed_ids, changed_mask = recovery_example(ids, mask, random.Random(0))
-        injected = len(changed_ids) - len(ids)
-        self.assertGreater(injected, 0)
-        self.assertEqual(changed_mask[5:5 + injected], [0] * injected)
-        self.assertEqual(changed_ids[5 + injected:], ids[5:])
+        first_supervised = next(i for i, value in enumerate(changed_mask) if value)
+        self.assertGreater(first_supervised, 5)
+        self.assertEqual(changed_mask[:first_supervised], [0] * first_supervised)
+        # The supervised suffix comes from a later point in the clean answer.
+        self.assertIn(changed_ids[first_supervised], ids[10:])
 
     def test_ul_negative_completes_prior_trigram(self):
         # At position 4, context ends in 1,2; token 3 previously followed 1,2.

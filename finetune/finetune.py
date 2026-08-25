@@ -96,15 +96,24 @@ def truncate_complete_turns(messages, ctx):
     return kept
 
 def recovery_example(ids, msk, rng):
-    """Inject a short repeated assistant prefix, supervised only after the perturbation."""
+    """Replace an assistant prefix with a repeated span, then supervise a later continuation."""
     supervised = [i for i, value in enumerate(msk) if value]
-    if len(supervised) < 12:
+    if len(supervised) < 24:
         return ids, msk
-    start = supervised[0]
-    width = min(rng.randint(3, 12), max(3, len(supervised) // 3))
+    answer_start, answer_end = supervised[0], supervised[-1] + 1
+    width = min(rng.randint(3, 12), max(3, len(supervised) // 6))
+    max_start = answer_start + max(0, len(supervised) // 3 - width)
+    start = rng.randint(answer_start, max_start)
+    continuation = min(answer_end, start + width + rng.randint(4, max(4, width * 2)))
+    if continuation >= answer_end:
+        return ids, msk
     pattern = ids[start:start + width]
-    injected = pattern + pattern
-    return ids[:start] + injected + ids[start:], msk[:start] + [0] * len(injected) + msk[start:]
+    repeats = rng.randint(2, 4)
+    corrupted = ids[:start] + pattern * repeats + ids[continuation:]
+    # The entire context through the corruption has zero loss. Gold supervision starts on a
+    # genuinely later continuation, never on another copy of the repeated span.
+    mask = [0] * (start + width * repeats) + msk[continuation:]
+    return corrupted, mask
 
 class Packer:
     def __init__(s, path, ctx, rng, val_frac, repeat_policy="warn", overlength="error",
