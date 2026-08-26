@@ -259,6 +259,12 @@ results are: ternary 2.25--2.33x, RVQ row decode about 1.4x, and paired
 `up`/`gt` 2.18--2.47x. Existing decode performance remains the regression
 baseline, not evidence of batch-prefill acceleration.
 
+An embedding-only batch-4 staging path was tested and rejected. On a 16-token,
+four-thread prompt it changed median prefill from 105.25 to 98.96 prompt tok/s.
+Batch setup and copies exceeded the single embedding RVQ saving, confirming that
+batching must cover the complete transformer matrix pipeline before it is
+enabled. The partial runtime path was removed.
+
 ## Remaining hardware gates
 
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.

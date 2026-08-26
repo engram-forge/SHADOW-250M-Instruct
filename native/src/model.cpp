@@ -1095,6 +1095,20 @@ void Tensor::matvec_batch4_into(std::span<const float> x,
   }
 }
 
+void Tensor::matvec_pair_batch4_into(const Tensor &other,
+                                     std::span<const float> x,
+                                     std::span<float> y,
+                                     std::span<float> other_y) const {
+  if (in != other.in || out != other.out || x.size() != 4 * in ||
+      y.size() != 4 * out || other_y.size() != 4 * other.out)
+    throw std::runtime_error(name + " paired batch4 matvec shape mismatch");
+  // Each matrix reuses its decoded weights across all four token states. Keeping
+  // the two dispatches separate avoids the paired single-token kernel's larger
+  // register footprint while retaining exact per-token accumulation order.
+  matvec_batch4_into(x, y);
+  other.matvec_batch4_into(x, other_y);
+}
+
 #if 0 // rejected scheduling experiments; results live in the benchmark report
 /* Rejected K/V shared-dispatch experiment retained only in benchmark records.
 void Tensor::rvq_pair_into(const Tensor &other, std::span<const float> x,
