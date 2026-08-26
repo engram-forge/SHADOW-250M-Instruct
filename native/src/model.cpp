@@ -501,7 +501,7 @@ std::array<float, HD> codec_unpack(std::span<const std::uint8_t> packed,
 }
 
 struct LayerCache {
-  std::vector<std::array<float, NKV * HD>> keys, values;
+  std::array<std::vector<std::array<float, HD>>, NKV> keys, values;
 };
 
 struct LayerWeights {
@@ -1956,8 +1956,8 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
     validate_archive_assets(options.archive, model_.path(), table_.path());
   }
   for (auto &cache : impl_->cache) {
-    cache.keys.clear();
-    cache.values.clear();
+    for (auto &keys : cache.keys) keys.clear();
+    for (auto &values : cache.values) values.clear();
   }
   impl_->trunk.clear();
   impl_->position = 0;
@@ -2029,11 +2029,16 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         std::copy(vh.begin(), vh.end(), va.begin() + head * HD);
       }
       auto &cache = impl_->cache[layer];
-      cache.keys.push_back(ka);
-      cache.values.push_back(va);
-      if (cache.keys.size() > 2048) {
-        cache.keys.erase(cache.keys.begin());
-        cache.values.erase(cache.values.begin());
+      for (std::size_t kvh = 0; kvh < NKV; ++kvh) {
+        std::array<float, HD> key{}, value{};
+        std::copy_n(ka.data() + kvh * HD, HD, key.data());
+        std::copy_n(va.data() + kvh * HD, HD, value.data());
+        cache.keys[kvh].push_back(key);
+        cache.values[kvh].push_back(value);
+        if (cache.keys[kvh].size() > 2048) {
+          cache.keys[kvh].erase(cache.keys[kvh].begin());
+          cache.values[kvh].erase(cache.values[kvh].begin());
+        }
       }
       std::array<std::vector<std::array<float, HD>>, NKV> cold_keys,
           cold_values;
@@ -2080,7 +2085,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         const std::size_t kvh = head / (NH / NKV);
         auto qh = std::span<const float>(q).subspan(head * HD, HD);
         const std::size_t cold_count = cold_keys[kvh].size();
-        s.score.assign(cold_count + cache.keys.size(), 0.0f);
+        s.score.assign(cold_count + cache.keys[kvh].size(), 0.0f);
         auto &score = s.score;
         float peak = -std::numeric_limits<float>::infinity();
         for (std::size_t t = 0; t < cold_count; ++t) {
@@ -2089,13 +2094,11 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
               std::floor(aq * bfloat16_round(dot(qh, cold_keys[kvh][t])));
           peak = std::max(peak, score[t]);
         }
-        for (std::size_t t = 0; t < cache.keys.size(); ++t) {
+        for (std::size_t t = 0; t < cache.keys[kvh].size(); ++t) {
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
           const float raw =
               aq *
-              bfloat16_round(dot(
-                  qh,
-                  std::span<const float>(cache.keys[t]).subspan(kvh * HD, HD)));
+              bfloat16_round(dot(qh, cache.keys[kvh][t]));
           score[cold_count + t] = std::floor(raw);
           peak = std::max(peak, score[cold_count + t]);
           if (options.trace)
@@ -2113,9 +2116,8 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         for (std::size_t t = 0; t < cold_count; ++t)
           for (std::size_t j = 0; j < HD; ++j)
             attended[head * HD + j] += score[t] * cold_values[kvh][t][j];
-        for (std::size_t t = 0; t < cache.keys.size(); ++t) {
-          auto vv =
-              std::span<const float>(cache.values[t]).subspan(kvh * HD, HD);
+        for (std::size_t t = 0; t < cache.keys[kvh].size(); ++t) {
+          auto vv = std::span<const float>(cache.values[kvh][t]);
           for (std::size_t j = 0; j < HD; ++j)
             attended[head * HD + j] += score[cold_count + t] * vv[j];
         }
@@ -2278,22 +2280,26 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
           std::copy(kh.begin(), kh.end(), ka.begin() + head * HD);
           std::copy(vh.begin(), vh.end(), va.begin() + head * HD);
         }
-        cache.keys.push_back(ka); cache.values.push_back(va);
-        if (cache.keys.size() > 2048) {
-          cache.keys.erase(cache.keys.begin());
-          cache.values.erase(cache.values.begin());
+        for (std::size_t kvh = 0; kvh < NKV; ++kvh) {
+          std::array<float, HD> key{}, value{};
+          std::copy_n(ka.data() + kvh * HD, HD, key.data());
+          std::copy_n(va.data() + kvh * HD, HD, value.data());
+          cache.keys[kvh].push_back(key); cache.values[kvh].push_back(value);
+          if (cache.keys[kvh].size() > 2048) {
+            cache.keys[kvh].erase(cache.keys[kvh].begin());
+            cache.values[kvh].erase(cache.values[kvh].begin());
+          }
         }
         auto token_attended = std::span<float>(attended).subspan(token * NH * HD, NH * HD);
         for (std::size_t head = 0; head < NH; ++head) {
           const std::size_t kvh = head / (NH / NKV);
           auto qh = qs.subspan(head * HD, HD);
-          std::vector<float> scores(cache.keys.size());
+          std::vector<float> scores(cache.keys[kvh].size());
           float peak = -std::numeric_limits<float>::infinity();
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
           for (std::size_t t = 0; t < scores.size(); ++t) {
-            scores[t] = std::floor(aq * bfloat16_round(dot(
-                qh, std::span<const float>(cache.keys[t])
-                        .subspan(kvh * HD, HD))));
+            scores[t] = std::floor(
+                aq * bfloat16_round(dot(qh, cache.keys[kvh][t])));
             peak = std::max(peak, scores[t]);
           }
           float denom = 0;
@@ -2304,8 +2310,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
           for (float &score : scores)
             score = bfloat16_round(score / denom);
           for (std::size_t t = 0; t < scores.size(); ++t) {
-            auto vv = std::span<const float>(cache.values[t])
-                          .subspan(kvh * HD, HD);
+            auto vv = std::span<const float>(cache.values[kvh][t]);
             for (std::size_t j = 0; j < HD; ++j)
               token_attended[head * HD + j] += scores[t] * vv[j];
           }

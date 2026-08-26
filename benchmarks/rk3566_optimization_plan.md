@@ -244,3 +244,30 @@ host scheduling, and Snapdragon topology do not represent the four homogeneous A
 cores, and earlier WSL affinity tests increased variance. On-board qualification
 should compare unpinned versus CPUs 0-3 pinned, then individual 1/2/4-core masks,
 without combining affinity with another unqualified optimization.
+### Manual attention value NEON result
+
+An exact token-order-preserving NEON FMA loop for the 64-element attention value
+accumulation produced byte-identical logits but regressed decode throughput by
+4.8% at context 32, 3.1% at 512, and 2.3% at 2048. The compiler already handles
+the simple scalar inner loop effectively; explicit load/FMA/store did not help.
+The runtime switch and kernel were removed. The next attention experiment must
+change data layout or fuse score/value traversal rather than restating this loop
+with intrinsics.
+### Head-major KV cache result
+
+The exact KV cache layout changed from token-major `[token][kv-head][64]` to
+head-major `[kv-head][token][64]`. Attention scans one KV head across every token,
+so the new layout removes the unused other-head row between consecutive accesses.
+Token order and arithmetic are unchanged; context-512 logits were byte-identical
+against the pre-change binary. Alternating five-run exact measurements showed:
+
+| Context | Token-major | Head-major | Gain |
+| ---: | ---: | ---: | ---: |
+| 32 | 117.53 tok/s | 118.89 tok/s | +1.2% |
+| 512 | 67.09 tok/s | 70.56 tok/s | +5.2% |
+| 2048 | 35.16 tok/s | 39.88 tok/s | +13.4% |
+
+The gain grows with context as expected for a locality improvement. Retain the
+layout as an exact optimization and rerun it with Compact64 as the C integration
+control. Ring-buffer replacement remains separate future work for contexts that
+advance beyond the 2048-entry cap.

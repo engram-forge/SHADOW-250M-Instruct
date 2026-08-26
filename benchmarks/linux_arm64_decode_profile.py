@@ -22,9 +22,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--dotprod-group", choices=("compact64", "64", "128"))
     args = parser.parse_args()
     environment = {**os.environ, "SHADOW_THREADS": str(args.threads),
                    "SHADOW_FAST_LOGITS": "0"}
+    if args.dotprod_group:
+        environment["SHADOW_DOTPROD_FFN"] = args.dotprod_group
     command = [args.kernel, args.model, args.table, args.tokens,
                str(args.generate), "--profile"]
 
@@ -48,6 +51,7 @@ def main():
     attributed = sum(medians.values())
     payload = {"format": "shadow-linux-arm64-decode-profile-v1",
                "threads": args.threads, "warmup": args.warmup,
+               "dotprod_group": args.dotprod_group,
                "runs": rows, "decode_s_median": measured,
                "decode_steps_median": statistics.median(
                    row["decode_steps"] for row in rows),
