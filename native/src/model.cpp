@@ -327,6 +327,8 @@ std::size_t dotprod_ffn_group() {
     const char *value = std::getenv("SHADOW_DOTPROD_FFN");
     if (!value || !*value || std::string_view(value) == "0")
       return std::size_t{0};
+    if (std::string_view(value) == "compact64")
+      return std::size_t{64};
     const std::size_t parsed = std::stoul(value);
     if (parsed != 64 && parsed != 128)
       throw std::runtime_error("SHADOW_DOTPROD_FFN must be 64 or 128");
@@ -335,6 +337,15 @@ std::size_t dotprod_ffn_group() {
   return group;
 #else
   return 0;
+#endif
+}
+
+bool compact_dotprod_ffn() {
+#if defined(SHADOW_ARM_DOTPROD)
+  const char *value = std::getenv("SHADOW_DOTPROD_FFN");
+  return value && std::string_view(value) == "compact64";
+#else
+  return false;
 #endif
 }
 
@@ -362,6 +373,11 @@ std::size_t ternary_dotprod_offset(std::size_t row, std::size_t column,
                                    std::size_t input_width) {
   return ((row / 16) * (input_width / 4) + column / 4) * 64 +
          (row % 16) * 4 + column % 4;
+}
+
+std::size_t ternary_dotprod_compact_offset(std::size_t row, std::size_t column,
+                                           std::size_t input_width) {
+  return ((row / 16) * (input_width / 4) + column / 4) * 16 + row % 16;
 }
 
 #if defined(__aarch64__)
@@ -592,7 +608,8 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
   } else if (kind == WeightKind::ternary3) {
 #if defined(SHADOW_ARM_DOTPROD) && defined(__aarch64__)
     const std::size_t quant_group = dotprod_ffn_group();
-    if (quant_group && !ternary_dotprod.empty()) {
+    if (quant_group && (!ternary_dotprod.empty() ||
+                        !ternary_dotprod_compact.empty())) {
       std::vector<std::int8_t> quantized;
       std::vector<float> quant_scales;
       quantized.resize(in);
@@ -622,11 +639,38 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
               std::memcpy(&word, quantized.data() + column, sizeof(word));
               const int8x16_t activation =
                   vreinterpretq_s8_s32(vdupq_n_s32(word));
-              const auto *weights = ternary_dotprod.data() +
-                  ternary_dotprod_offset(row, column, in);
-              for (int lane = 0; lane < 4; ++lane)
-                sums[lane] = vdotq_s32(sums[lane],
-                                       vld1q_s8(weights + lane * 16), activation);
+              if (!ternary_dotprod_compact.empty()) {
+                const uint8x16_t packed = vld1q_u8(
+                    ternary_dotprod_compact.data() +
+                    ternary_dotprod_compact_offset(row, column, in));
+                const uint8x16_t mask = vdupq_n_u8(3), one = vdupq_n_u8(1);
+                const int8x16_t q0 = vreinterpretq_s8_u8(
+                    vsubq_u8(vandq_u8(packed, mask), one));
+                const int8x16_t q1 = vreinterpretq_s8_u8(vsubq_u8(
+                    vandq_u8(vshrq_n_u8(packed, 2), mask), one));
+                const int8x16_t q2 = vreinterpretq_s8_u8(vsubq_u8(
+                    vandq_u8(vshrq_n_u8(packed, 4), mask), one));
+                const int8x16_t q3 = vreinterpretq_s8_u8(
+                    vsubq_u8(vshrq_n_u8(packed, 6), one));
+                const auto z01 = vzipq_s8(q0, q1), z23 = vzipq_s8(q2, q3);
+                const auto rows0 = vzipq_s16(vreinterpretq_s16_s8(z01.val[0]),
+                                             vreinterpretq_s16_s8(z23.val[0]));
+                const auto rows1 = vzipq_s16(vreinterpretq_s16_s8(z01.val[1]),
+                                             vreinterpretq_s16_s8(z23.val[1]));
+                const int8x16_t tile[4] = {
+                    vreinterpretq_s8_s16(rows0.val[0]),
+                    vreinterpretq_s8_s16(rows0.val[1]),
+                    vreinterpretq_s8_s16(rows1.val[0]),
+                    vreinterpretq_s8_s16(rows1.val[1])};
+                for (int lane = 0; lane < 4; ++lane)
+                  sums[lane] = vdotq_s32(sums[lane], tile[lane], activation);
+              } else {
+                const auto *weights = ternary_dotprod.data() +
+                    ternary_dotprod_offset(row, column, in);
+                for (int lane = 0; lane < 4; ++lane)
+                  sums[lane] = vdotq_s32(
+                      sums[lane], vld1q_s8(weights + lane * 16), activation);
+              }
             }
             const float scale = quant_scales[begin / quant_group];
             for (int lane = 0; lane < 4; ++lane)
@@ -917,8 +961,10 @@ void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
   if (kind != WeightKind::ternary3 || other.kind != WeightKind::ternary3 ||
       in != other.in || out != other.out || x.size() != in || y.size() != out ||
       other_y.size() != out || ternary_reference_enabled() ||
-      (dotprod_ffn_group() && !ternary_dotprod.empty() &&
-       !other.ternary_dotprod.empty())) {
+      (dotprod_ffn_group() &&
+       ((!ternary_dotprod.empty() && !other.ternary_dotprod.empty()) ||
+        (!ternary_dotprod_compact.empty() &&
+         !other.ternary_dotprod_compact.empty())))) {
     matvec_into(x, y);
     other.matvec_into(x, other_y);
     return;
@@ -1498,12 +1544,23 @@ ModelFile::ModelFile(const std::filesystem::path &path) : path_(path) {
              t.name.ends_with(".dn"))) {
           if (t.in % 4 != 0)
             throw std::runtime_error("DotProd FFN input must be divisible by 4");
-          t.ternary_dotprod.resize(static_cast<std::size_t>(t.out) * t.in);
+          if (compact_dotprod_ffn())
+            t.ternary_dotprod_compact.resize(
+                static_cast<std::size_t>(t.out) * t.in / 4);
+          else
+            t.ternary_dotprod.resize(static_cast<std::size_t>(t.out) * t.in);
           for (std::size_t row = 0; row < t.out; ++row)
-            for (std::size_t column = 0; column < t.in; ++column)
-              t.ternary_dotprod[ternary_dotprod_offset(row, column, t.in)] =
-                  ternary3_table()[t.bytes[ternary3_offset(
-                      row, column / 5, stride)]][column % 5];
+            for (std::size_t column = 0; column < t.in; ++column) {
+              const auto value = ternary3_table()[t.bytes[ternary3_offset(
+                  row, column / 5, stride)]][column % 5];
+              if (compact_dotprod_ffn())
+                t.ternary_dotprod_compact[ternary_dotprod_compact_offset(
+                    row, column, t.in)] |=
+                    static_cast<std::uint8_t>(value + 1) << (2 * (column % 4));
+              else
+                t.ternary_dotprod[ternary_dotprod_offset(row, column, t.in)] =
+                    value;
+            }
         }
       }
       const auto sb = read_bytes(in, static_cast<std::size_t>(t.out) * 4);

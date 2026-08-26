@@ -31,6 +31,8 @@ def percentile(values, fraction):
 def run_once(args):
     environment = {**os.environ, "SHADOW_THREADS": str(args.threads),
                    "SHADOW_FAST_LOGITS": "1" if args.fast_logits else "0"}
+    if args.dotprod_group:
+        environment["SHADOW_DOTPROD_FFN"] = str(args.dotprod_group)
     command = [args.kernel, args.model, args.table, args.tokens, str(args.generate), "--bench"]
     started = time.perf_counter()
     result = subprocess.run(
@@ -59,6 +61,7 @@ def main():
     parser.add_argument("--generate", type=int, default=65); parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=3); parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--fast-logits", action="store_true"); parser.add_argument("--out", required=True)
+    parser.add_argument("--dotprod-group", choices=("64", "128", "compact64"))
     args = parser.parse_args()
     for _ in range(args.warmup): run_once(args)
     rows = [run_once(args) for _ in range(args.runs)]
@@ -75,6 +78,7 @@ def main():
         "kernel_sha256": sha256(args.kernel), "model_sha256": sha256(args.model),
         "table_sha256": sha256(args.table), "threads": args.threads,
         "fast_logits": args.fast_logits, "prompt_tokens": prompt_tokens,
+        "dotprod_group": args.dotprod_group,
         "requested_tokens": args.generate, "warmup": args.warmup, "runs": rows,
         "decode_measured": all(row["decode_measured"] for row in rows),
         "decode_tok_s_median": statistics.median(speeds),

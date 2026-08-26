@@ -1,0 +1,191 @@
+{
+  "format": "shadow-linux-arm64-benchmark-v1",
+  "machine": "aarch64",
+  "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-aarch64-with-glibc2.39",
+  "distribution": "Ubuntu 24.04.2 LTS",
+  "wsl": true,
+  "cpu_count": 8,
+  "compiler_comment": "[     0]  GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 [    2d]  Ubuntu clang version 18.1.3 (1ubuntu1)",
+  "kernel_sha256": "d732452e6255a7cc500d75baf3ad93262088e31d9b2cad4b5be15e7e83994dbf",
+  "model_sha256": "6e0ad7893e0b4b3b420d8ee5d8dd7a1b7dd499fc698ba1b3a3fa40a7a0d5b9ea",
+  "table_sha256": "efb7672a55e4998a8c0395cdec1c2207acf750e3ad1109088a61f66586da1d34",
+  "threads": 4,
+  "fast_logits": false,
+  "prompt_tokens": 4,
+  "dotprod_group": null,
+  "requested_tokens": 65,
+  "warmup": 3,
+  "runs": [
+    {
+      "decode_tok_s": 116.965258,
+      "decode_measured": true,
+      "prefill_s": 0.022716,
+      "wall_s": 0.8017131729866378,
+      "maximum_rss_kib": 175984,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 118.148186,
+      "decode_measured": true,
+      "prefill_s": 0.022966,
+      "wall_s": 0.7950524569605477,
+      "maximum_rss_kib": 176056,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 117.493853,
+      "decode_measured": true,
+      "prefill_s": 0.022381,
+      "wall_s": 0.80528176802909,
+      "maximum_rss_kib": 176132,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 117.042352,
+      "decode_measured": true,
+      "prefill_s": 0.024494,
+      "wall_s": 0.80452304094797,
+      "maximum_rss_kib": 176048,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 98.720463,
+      "decode_measured": true,
+      "prefill_s": 0.02395,
+      "wall_s": 0.9102856310200877,
+      "maximum_rss_kib": 176012,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 112.383858,
+      "decode_measured": true,
+      "prefill_s": 0.024485,
+      "wall_s": 0.8424341349746101,
+      "maximum_rss_kib": 176080,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 114.990088,
+      "decode_measured": true,
+      "prefill_s": 0.022142,
+      "wall_s": 0.8193338859709911,
+      "maximum_rss_kib": 175884,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 115.293764,
+      "decode_measured": true,
+      "prefill_s": 0.023898,
+      "wall_s": 0.8256612060358748,
+      "maximum_rss_kib": 175904,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 115.545055,
+      "decode_measured": true,
+      "prefill_s": 0.025695,
+      "wall_s": 0.8159378819982521,
+      "maximum_rss_kib": 176088,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 114.65065,
+      "decode_measured": true,
+      "prefill_s": 0.024339,
+      "wall_s": 0.8215556120267138,
+      "maximum_rss_kib": 175996,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 115.503823,
+      "decode_measured": true,
+      "prefill_s": 0.023393,
+      "wall_s": 0.818259300023783,
+      "maximum_rss_kib": 176116,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 114.241486,
+      "decode_measured": true,
+      "prefill_s": 0.025116,
+      "wall_s": 0.8208132719737478,
+      "maximum_rss_kib": 175884,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 112.623138,
+      "decode_measured": true,
+      "prefill_s": 0.022921,
+      "wall_s": 0.8294975329772569,
+      "maximum_rss_kib": 176124,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 114.300984,
+      "decode_measured": true,
+      "prefill_s": 0.023195,
+      "wall_s": 0.8236979930079542,
+      "maximum_rss_kib": 175884,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 113.561506,
+      "decode_measured": true,
+      "prefill_s": 0.025085,
+      "wall_s": 0.8301894390024245,
+      "maximum_rss_kib": 176116,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 110.643608,
+      "decode_measured": true,
+      "prefill_s": 0.024592,
+      "wall_s": 0.8431629840051755,
+      "maximum_rss_kib": 175932,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 110.500932,
+      "decode_measured": true,
+      "prefill_s": 0.024673,
+      "wall_s": 0.8600210010190494,
+      "maximum_rss_kib": 175904,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 110.702889,
+      "decode_measured": true,
+      "prefill_s": 0.024461,
+      "wall_s": 0.8481104680104181,
+      "maximum_rss_kib": 176004,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 109.998207,
+      "decode_measured": true,
+      "prefill_s": 0.023533,
+      "wall_s": 0.8535269739804789,
+      "maximum_rss_kib": 176012,
+      "output_tokens": 65
+    },
+    {
+      "decode_tok_s": 111.148162,
+      "decode_measured": true,
+      "prefill_s": 0.02473,
+      "wall_s": 0.8521544859977439,
+      "maximum_rss_kib": 175904,
+      "output_tokens": 65
+    }
+  ],
+  "decode_measured": true,
+  "decode_tok_s_median": 114.27123499999999,
+  "decode_tok_s_p05": 109.998207,
+  "decode_tok_s_p95": 118.148186,
+  "decode_tok_s_spread": 0.17001411597590593,
+  "prefill_s_median": 0.0241445,
+  "prefill_s_p95": 0.025695,
+  "prefill_tok_s_median": 165.6692000248504,
+  "time_to_first_token_s_median": 0.0241445,
+  "maximum_rss_kib_median": 176008.0,
+  "maximum_rss_kib_max": 176132
+}

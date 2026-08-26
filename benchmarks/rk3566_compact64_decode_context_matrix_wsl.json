@@ -1,0 +1,772 @@
+{
+  "format": "shadow-rk3566-decode-context-matrix-v1",
+  "generated_tokens": 17,
+  "measured_runs": 3,
+  "cells": [
+    {
+      "context_tokens": 32,
+      "threads": 1,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 33.781408,
+          "prefill_s_median": 0.629338,
+          "rss_kib_median": 175992,
+          "runs": [
+            {
+              "prefill_s": 0.613263,
+              "decode_tok_s": 33.86128,
+              "rss_kib": 176044
+            },
+            {
+              "prefill_s": 0.678293,
+              "decode_tok_s": 31.969455,
+              "rss_kib": 175904
+            },
+            {
+              "prefill_s": 0.629338,
+              "decode_tok_s": 33.781408,
+              "rss_kib": 175992
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 47.339935,
+          "prefill_s_median": 0.678746,
+          "rss_kib_median": 223732,
+          "runs": [
+            {
+              "prefill_s": 0.678746,
+              "decode_tok_s": 47.339935,
+              "rss_kib": 223588
+            },
+            {
+              "prefill_s": 0.643787,
+              "decode_tok_s": 50.887356,
+              "rss_kib": 223756
+            },
+            {
+              "prefill_s": 0.702079,
+              "decode_tok_s": 44.400031,
+              "rss_kib": 223732
+            }
+          ],
+          "decode_gain": 0.4013606241634451
+        }
+      }
+    },
+    {
+      "context_tokens": 32,
+      "threads": 2,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 60.219926,
+          "prefill_s_median": 0.331699,
+          "rss_kib_median": 176100,
+          "runs": [
+            {
+              "prefill_s": 0.349509,
+              "decode_tok_s": 60.219926,
+              "rss_kib": 176100
+            },
+            {
+              "prefill_s": 0.329667,
+              "decode_tok_s": 58.639625,
+              "rss_kib": 175940
+            },
+            {
+              "prefill_s": 0.331699,
+              "decode_tok_s": 63.756937,
+              "rss_kib": 176132
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 92.042495,
+          "prefill_s_median": 0.334353,
+          "rss_kib_median": 223668,
+          "runs": [
+            {
+              "prefill_s": 0.334353,
+              "decode_tok_s": 92.259024,
+              "rss_kib": 223596
+            },
+            {
+              "prefill_s": 0.332759,
+              "decode_tok_s": 92.042495,
+              "rss_kib": 223708
+            },
+            {
+              "prefill_s": 0.387505,
+              "decode_tok_s": 73.703138,
+              "rss_kib": 223668
+            }
+          ],
+          "decode_gain": 0.5284391913733006
+        }
+      }
+    },
+    {
+      "context_tokens": 32,
+      "threads": 4,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 117.125466,
+          "prefill_s_median": 0.181824,
+          "rss_kib_median": 176076,
+          "runs": [
+            {
+              "prefill_s": 0.1826,
+              "decode_tok_s": 117.125466,
+              "rss_kib": 176076
+            },
+            {
+              "prefill_s": 0.180156,
+              "decode_tok_s": 117.386469,
+              "rss_kib": 175988
+            },
+            {
+              "prefill_s": 0.181824,
+              "decode_tok_s": 116.163512,
+              "rss_kib": 176140
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 151.678542,
+          "prefill_s_median": 0.1941,
+          "rss_kib_median": 223664,
+          "runs": [
+            {
+              "prefill_s": 0.204971,
+              "decode_tok_s": 138.053025,
+              "rss_kib": 223664
+            },
+            {
+              "prefill_s": 0.189278,
+              "decode_tok_s": 166.484439,
+              "rss_kib": 223568
+            },
+            {
+              "prefill_s": 0.1941,
+              "decode_tok_s": 151.678542,
+              "rss_kib": 223720
+            }
+          ],
+          "decode_gain": 0.2950090802626988
+        }
+      }
+    },
+    {
+      "context_tokens": 128,
+      "threads": 1,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 33.868368,
+          "prefill_s_median": 2.500445,
+          "rss_kib_median": 176068,
+          "runs": [
+            {
+              "prefill_s": 2.484204,
+              "decode_tok_s": 33.430534,
+              "rss_kib": 176068
+            },
+            {
+              "prefill_s": 2.550683,
+              "decode_tok_s": 33.890702,
+              "rss_kib": 176052
+            },
+            {
+              "prefill_s": 2.500445,
+              "decode_tok_s": 33.868368,
+              "rss_kib": 176100
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 50.194072,
+          "prefill_s_median": 2.489129,
+          "rss_kib_median": 223732,
+          "runs": [
+            {
+              "prefill_s": 2.487715,
+              "decode_tok_s": 50.194072,
+              "rss_kib": 223728
+            },
+            {
+              "prefill_s": 2.489129,
+              "decode_tok_s": 50.954515,
+              "rss_kib": 223776
+            },
+            {
+              "prefill_s": 2.570948,
+              "decode_tok_s": 46.55022,
+              "rss_kib": 223732
+            }
+          ],
+          "decode_gain": 0.4820339734114145
+        }
+      }
+    },
+    {
+      "context_tokens": 128,
+      "threads": 2,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 60.490078,
+          "prefill_s_median": 1.350051,
+          "rss_kib_median": 176088,
+          "runs": [
+            {
+              "prefill_s": 1.333179,
+              "decode_tok_s": 58.980131,
+              "rss_kib": 176088
+            },
+            {
+              "prefill_s": 1.350051,
+              "decode_tok_s": 60.490078,
+              "rss_kib": 175924
+            },
+            {
+              "prefill_s": 1.35038,
+              "decode_tok_s": 61.890856,
+              "rss_kib": 176116
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 88.171102,
+          "prefill_s_median": 1.359698,
+          "rss_kib_median": 223644,
+          "runs": [
+            {
+              "prefill_s": 1.350572,
+              "decode_tok_s": 91.094755,
+              "rss_kib": 223756
+            },
+            {
+              "prefill_s": 1.361365,
+              "decode_tok_s": 83.727315,
+              "rss_kib": 223564
+            },
+            {
+              "prefill_s": 1.359698,
+              "decode_tok_s": 88.171102,
+              "rss_kib": 223644
+            }
+          ],
+          "decode_gain": 0.4576126352490404
+        }
+      }
+    },
+    {
+      "context_tokens": 128,
+      "threads": 4,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 106.685147,
+          "prefill_s_median": 0.763309,
+          "rss_kib_median": 176040,
+          "runs": [
+            {
+              "prefill_s": 0.76232,
+              "decode_tok_s": 108.145832,
+              "rss_kib": 176040
+            },
+            {
+              "prefill_s": 0.784086,
+              "decode_tok_s": 104.329376,
+              "rss_kib": 176060
+            },
+            {
+              "prefill_s": 0.763309,
+              "decode_tok_s": 106.685147,
+              "rss_kib": 176008
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 139.469537,
+          "prefill_s_median": 0.765876,
+          "rss_kib_median": 223636,
+          "runs": [
+            {
+              "prefill_s": 0.748808,
+              "decode_tok_s": 139.469537,
+              "rss_kib": 223692
+            },
+            {
+              "prefill_s": 0.772779,
+              "decode_tok_s": 133.806667,
+              "rss_kib": 223604
+            },
+            {
+              "prefill_s": 0.765876,
+              "decode_tok_s": 141.955107,
+              "rss_kib": 223636
+            }
+          ],
+          "decode_gain": 0.30730041549270215
+        }
+      }
+    },
+    {
+      "context_tokens": 512,
+      "threads": 1,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 23.776329,
+          "prefill_s_median": 12.028873,
+          "rss_kib_median": 184068,
+          "runs": [
+            {
+              "prefill_s": 11.576528,
+              "decode_tok_s": 23.776329,
+              "rss_kib": 184080
+            },
+            {
+              "prefill_s": 12.028873,
+              "decode_tok_s": 24.047142,
+              "rss_kib": 182888
+            },
+            {
+              "prefill_s": 13.449684,
+              "decode_tok_s": 23.354468,
+              "rss_kib": 184068
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 39.787953,
+          "prefill_s_median": 11.070713,
+          "rss_kib_median": 231720,
+          "runs": [
+            {
+              "prefill_s": 11.609584,
+              "decode_tok_s": 39.787953,
+              "rss_kib": 230532
+            },
+            {
+              "prefill_s": 11.070713,
+              "decode_tok_s": 35.788522,
+              "rss_kib": 232312
+            },
+            {
+              "prefill_s": 11.063405,
+              "decode_tok_s": 40.112167,
+              "rss_kib": 231720
+            }
+          ],
+          "decode_gain": 0.6734270879242965
+        }
+      }
+    },
+    {
+      "context_tokens": 512,
+      "threads": 2,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 47.400977,
+          "prefill_s_median": 6.321219,
+          "rss_kib_median": 184204,
+          "runs": [
+            {
+              "prefill_s": 6.495126,
+              "decode_tok_s": 42.297529,
+              "rss_kib": 184204
+            },
+            {
+              "prefill_s": 6.321219,
+              "decode_tok_s": 47.400977,
+              "rss_kib": 184200
+            },
+            {
+              "prefill_s": 6.198332,
+              "decode_tok_s": 50.476349,
+              "rss_kib": 184724
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 65.605096,
+          "prefill_s_median": 6.087178,
+          "rss_kib_median": 232112,
+          "runs": [
+            {
+              "prefill_s": 6.123408,
+              "decode_tok_s": 65.605096,
+              "rss_kib": 232112
+            },
+            {
+              "prefill_s": 6.087178,
+              "decode_tok_s": 64.52163,
+              "rss_kib": 231376
+            },
+            {
+              "prefill_s": 5.718152,
+              "decode_tok_s": 70.141544,
+              "rss_kib": 232640
+            }
+          ],
+          "decode_gain": 0.38404522759098425
+        }
+      }
+    },
+    {
+      "context_tokens": 512,
+      "threads": 4,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 78.648958,
+          "prefill_s_median": 3.589372,
+          "rss_kib_median": 184140,
+          "runs": [
+            {
+              "prefill_s": 3.547826,
+              "decode_tok_s": 83.574295,
+              "rss_kib": 183940
+            },
+            {
+              "prefill_s": 3.589372,
+              "decode_tok_s": 78.648958,
+              "rss_kib": 184140
+            },
+            {
+              "prefill_s": 4.417314,
+              "decode_tok_s": 68.440574,
+              "rss_kib": 184140
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 98.187549,
+          "prefill_s_median": 3.574236,
+          "rss_kib_median": 232640,
+          "runs": [
+            {
+              "prefill_s": 3.407735,
+              "decode_tok_s": 101.301765,
+              "rss_kib": 232640
+            },
+            {
+              "prefill_s": 3.574236,
+              "decode_tok_s": 98.187549,
+              "rss_kib": 231780
+            },
+            {
+              "prefill_s": 3.692462,
+              "decode_tok_s": 91.291915,
+              "rss_kib": 233820
+            }
+          ],
+          "decode_gain": 0.2484278431253979
+        }
+      }
+    },
+    {
+      "context_tokens": 1024,
+      "threads": 1,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 24.60038,
+          "prefill_s_median": 25.002148,
+          "rss_kib_median": 200500,
+          "runs": [
+            {
+              "prefill_s": 28.303855,
+              "decode_tok_s": 24.60038,
+              "rss_kib": 200500
+            },
+            {
+              "prefill_s": 25.002148,
+              "decode_tok_s": 23.471365,
+              "rss_kib": 201680
+            },
+            {
+              "prefill_s": 24.590032,
+              "decode_tok_s": 25.996845,
+              "rss_kib": 200248
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 34.341958,
+          "prefill_s_median": 23.676517,
+          "rss_kib_median": 249004,
+          "runs": [
+            {
+              "prefill_s": 23.755159,
+              "decode_tok_s": 33.316683,
+              "rss_kib": 249004
+            },
+            {
+              "prefill_s": 23.676517,
+              "decode_tok_s": 34.341958,
+              "rss_kib": 248152
+            },
+            {
+              "prefill_s": 23.148061,
+              "decode_tok_s": 36.249385,
+              "rss_kib": 249272
+            }
+          ],
+          "decode_gain": 0.3959929887261904
+        }
+      }
+    },
+    {
+      "context_tokens": 1024,
+      "threads": 2,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 38.177259,
+          "prefill_s_median": 14.338839,
+          "rss_kib_median": 201168,
+          "runs": [
+            {
+              "prefill_s": 13.709074,
+              "decode_tok_s": 39.856825,
+              "rss_kib": 201168
+            },
+            {
+              "prefill_s": 14.338839,
+              "decode_tok_s": 38.177259,
+              "rss_kib": 201556
+            },
+            {
+              "prefill_s": 15.748614,
+              "decode_tok_s": 36.199378,
+              "rss_kib": 200112
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 52.224885,
+          "prefill_s_median": 13.419287,
+          "rss_kib_median": 248728,
+          "runs": [
+            {
+              "prefill_s": 13.1788,
+              "decode_tok_s": 52.528471,
+              "rss_kib": 249136
+            },
+            {
+              "prefill_s": 13.419287,
+              "decode_tok_s": 52.224885,
+              "rss_kib": 248204
+            },
+            {
+              "prefill_s": 14.062651,
+              "decode_tok_s": 51.693616,
+              "rss_kib": 248728
+            }
+          ],
+          "decode_gain": 0.36795795109334595
+        }
+      }
+    },
+    {
+      "context_tokens": 1024,
+      "threads": 4,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 52.077208,
+          "prefill_s_median": 10.362363,
+          "rss_kib_median": 200564,
+          "runs": [
+            {
+              "prefill_s": 8.813019,
+              "decode_tok_s": 55.165833,
+              "rss_kib": 199772
+            },
+            {
+              "prefill_s": 11.719886,
+              "decode_tok_s": 48.351735,
+              "rss_kib": 200904
+            },
+            {
+              "prefill_s": 10.362363,
+              "decode_tok_s": 52.077208,
+              "rss_kib": 200564
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 60.685364,
+          "prefill_s_median": 9.035831,
+          "rss_kib_median": 248460,
+          "runs": [
+            {
+              "prefill_s": 8.423244,
+              "decode_tok_s": 72.533221,
+              "rss_kib": 247876
+            },
+            {
+              "prefill_s": 9.035831,
+              "decode_tok_s": 56.128587,
+              "rss_kib": 249008
+            },
+            {
+              "prefill_s": 9.691833,
+              "decode_tok_s": 60.685364,
+              "rss_kib": 248460
+            }
+          ],
+          "decode_gain": 0.16529603507161905
+        }
+      }
+    },
+    {
+      "context_tokens": 2048,
+      "threads": 1,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 19.189683,
+          "prefill_s_median": 54.705123,
+          "rss_kib_median": 233316,
+          "runs": [
+            {
+              "prefill_s": 63.302488,
+              "decode_tok_s": 17.764121,
+              "rss_kib": 233316
+            },
+            {
+              "prefill_s": 54.705123,
+              "decode_tok_s": 20.87957,
+              "rss_kib": 231932
+            },
+            {
+              "prefill_s": 53.828919,
+              "decode_tok_s": 19.189683,
+              "rss_kib": 233512
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 29.456439,
+          "prefill_s_median": 52.844965,
+          "rss_kib_median": 279904,
+          "runs": [
+            {
+              "prefill_s": 52.844965,
+              "decode_tok_s": 29.456439,
+              "rss_kib": 279904
+            },
+            {
+              "prefill_s": 53.518804,
+              "decode_tok_s": 25.490453,
+              "rss_kib": 279836
+            },
+            {
+              "prefill_s": 52.323074,
+              "decode_tok_s": 29.616707,
+              "rss_kib": 280692
+            }
+          ],
+          "decode_gain": 0.5350143616233787
+        }
+      }
+    },
+    {
+      "context_tokens": 2048,
+      "threads": 2,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 28.487634,
+          "prefill_s_median": 35.543555,
+          "rss_kib_median": 230740,
+          "runs": [
+            {
+              "prefill_s": 33.866201,
+              "decode_tok_s": 28.487634,
+              "rss_kib": 230740
+            },
+            {
+              "prefill_s": 42.195832,
+              "decode_tok_s": 23.963467,
+              "rss_kib": 230144
+            },
+            {
+              "prefill_s": 35.543555,
+              "decode_tok_s": 30.722212,
+              "rss_kib": 230740
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 31.465394,
+          "prefill_s_median": 38.288753,
+          "rss_kib_median": 279172,
+          "runs": [
+            {
+              "prefill_s": 35.984725,
+              "decode_tok_s": 34.647402,
+              "rss_kib": 279172
+            },
+            {
+              "prefill_s": 54.76317,
+              "decode_tok_s": 28.139316,
+              "rss_kib": 279168
+            },
+            {
+              "prefill_s": 38.288753,
+              "decode_tok_s": 31.465394,
+              "rss_kib": 286676
+            }
+          ],
+          "decode_gain": 0.10452816123655628
+        }
+      }
+    },
+    {
+      "context_tokens": 2048,
+      "threads": 4,
+      "summary": {
+        "exact": {
+          "decode_tok_s_median": 33.527733,
+          "prefill_s_median": 27.16222,
+          "rss_kib_median": 232852,
+          "runs": [
+            {
+              "prefill_s": 26.088872,
+              "decode_tok_s": 35.937028,
+              "rss_kib": 232256
+            },
+            {
+              "prefill_s": 27.387935,
+              "decode_tok_s": 31.7153,
+              "rss_kib": 232852
+            },
+            {
+              "prefill_s": 27.16222,
+              "decode_tok_s": 33.527733,
+              "rss_kib": 234100
+            }
+          ]
+        },
+        "compact64": {
+          "decode_tok_s_median": 38.100777,
+          "prefill_s_median": 25.885688,
+          "rss_kib_median": 280488,
+          "runs": [
+            {
+              "prefill_s": 25.885688,
+              "decode_tok_s": 38.100777,
+              "rss_kib": 280492
+            },
+            {
+              "prefill_s": 25.323623,
+              "decode_tok_s": 39.101494,
+              "rss_kib": 279896
+            },
+            {
+              "prefill_s": 26.824883,
+              "decode_tok_s": 33.071726,
+              "rss_kib": 280488
+            }
+          ],
+          "decode_gain": 0.13639586070433096
+        }
+      }
+    }
+  ]
+}

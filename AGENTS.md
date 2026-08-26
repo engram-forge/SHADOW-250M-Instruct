@@ -24,52 +24,39 @@ There is no dedicated unit-test suite or coverage threshold. For runtime changes
 
 ### Native Runtime Optimization Workflow
 
-Treat prefill and decode as separate performance products. Prefill reports prompt
-tokens per second and time-to-first-token; decode reports generated tokens per
-second after prefill. Never combine them into one throughput number. Keep WSL
-measurements labeled as development evidence rather than Radxa ZERO 3W claims.
-
-Develop each optimization incrementally:
-
-1. Propose the expected bottleneck, intended gain, correctness boundary, memory
-   cost, and Cortex-A55 compatibility constraints. Treat DotProd as an optional
-   path that requires an `asimddp` feature check on the production image.
-2. Break the proposal into the smallest independently measurable change. Change
-   one kernel, layout, scheduling decision, or compiler option at a time.
-3. Try the candidate behind a temporary same-binary control when practical.
-   Alternate control-first and candidate-first runs to reduce ordering and WSL
-   scheduler bias. Do not combine unqualified optimizations.
-4. Verify correctness before accepting performance results. Require existing
-   native and Python tests, strict scalar/NEON parity where applicable, and
-   byte-identical logits or seeded sampling for transformations intended to be
-   exact. Scan baseline artifacts against the Cortex-A55 boundary and DotProd
-   artifacts against ARMv8.2-A+DotProd; never use `-march=native`. Approximate
-   integer paths additionally require sequence-level generation evaluation.
-5. Verify stable performance with warmups, repeated raw measurements, medians,
-   spread, RSS, and identical inputs, threads, and sampling settings. Profile the
-   affected stage to confirm that any gain comes from the intended component.
-6. Commit a cohesive accepted improvement with its benchmark evidence. If the
-   candidate fails correctness, memory, stability, or performance gates, fully
-   revert its runtime code and temporary switches, document the rejection, and
-   commit only useful harness or report changes.
-
-Prefill qualification must cover prompt lengths 4, 16, 64, and 256 with 1, 2,
-and 4 threads. Compare sequential and batched paths, including prompts not
-divisible by the batch width. Record prefill median/p05/p95, prompt tok/s, TTFT,
-spread, RSS, final-logit parity, seeded-sampling parity, and a decode regression
-control. Use at least 3 warmups and 20 measured runs for 4/16-token prompts and
-at least 3 warmups and 10 measured runs for 64/256-token prompts when making a
-stable claim.
-
-Decode qualification must cover context lengths 32, 128, 512, 1024, and 2048.
-Report decode throughput separately at each length because attention, KV cache,
-and structural recurrence costs grow with context. Use at least 16 generated
-tokens after prefill, alternating candidate/control order, exact final-logit
-parity at every length, and stable repeated measurements. A candidate may be
-retained as a guarded context-dependent path only when it wins consistently
-above a documented threshold and repays its branch, code-size, and maintenance
-cost. Always rerun the 1/2/4-thread matrix on physical RK3566 hardware before
-making release-performance claims.
+- **Iteration:** Propose → isolate one variable → implement behind a control →
+  verify parity → measure performance/RSS → commit or fully revert. Do not combine
+  unqualified changes. State the bottleneck, expected gain, correctness boundary,
+  memory cost, and Cortex-A55 ISA requirement before implementation.
+- **Three-way isolation:** Evaluate every new optimization with group quantization
+  disabled first: (A) untouched exact FP32 baseline versus (B) exact candidate.
+  This attributes speed and output changes to the optimization alone. Only after B
+  passes should it be combined with DotProd group-64 as (C). Report B/A as the
+  exact optimization gain, C/B as the group-64 integration gain, and C/A as the
+  total deployable gain. Never compare only C/A or credit group-64's approximate
+  speedup to an unrelated optimization. Exact FP32 remains the correctness and
+  production baseline; group-64 is the approximate DotProd integration baseline.
+- **Correctness:** Run native and Python tests. Exact changes require strict
+  scalar/NEON and logit or seeded-sampling parity. Approximate paths require the
+  472-case sequence evaluation: first-token agreement, top-10 overlap, first-step
+  logit RMSE, matching-prefix length, complete-sequence equality, and task score.
+- **Measurement:** Use identical inputs, threads, sampling, warmups, and runs.
+  Alternate baseline/candidate order; report raw runs, median, p05/p95, spread,
+  RSS, and the affected profile share. WSL is development evidence, never an
+  RK3566 performance claim.
+- **Prefill gate:** Test lengths 4/16/64/256 with 1/2/4 threads, including batch
+  tails. Report prompt tok/s, TTFT, median/p05/p95, RSS, final-logit parity, and a
+  decode regression control. Use 3 warmups plus 20 runs for 4/16 and 10 runs for
+  64/256.
+- **Decode gate:** Test contexts 32/128/512/1024/2048 with 1/2/4 threads and at
+  least 16 generated tokens. Report each context separately. Retain a guarded
+  context-specific path only if it wins consistently after branch/code-size cost.
+- **ISA and release:** Never use `-march=native`. Scan the exact artifact against
+  Cortex-A55 and DotProd artifacts against ARMv8.2-A+DotProd. Require `asimddp`
+  on the production image. Rerun the full matrix on physical RK3566 hardware.
+- **Decision:** Commit one cohesive passing change with evidence. On correctness,
+  stability, memory, or performance failure, remove runtime code and temporary
+  switches; retain only useful benchmark or rejection documentation.
 
 ## Commit & Pull Request Guidelines
 
