@@ -11,6 +11,7 @@ finetune/ablation_data/
 finetune/ablation_run_*/
 data/oasst1_raw/
 data/neutral_sft/
+data/dolma/
 finetune/neutral_candidate_*/
 
 rsync.sh
