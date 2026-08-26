@@ -12,6 +12,7 @@ namespace {
 constexpr std::size_t rows=4224, columns=1536, stride=(columns+4)/5;
 std::size_t packed_offset(std::size_t row,std::size_t block){return ((row/8)*stride+block)*8+row%8;}
 std::size_t nibble_offset(std::size_t row,std::size_t column){return ((row/16)*columns+column)*8;}
+std::size_t bitplane_offset(std::size_t row,std::size_t column){return ((row/16)*columns+column)*4;}
 
 const auto& digits(){ static const auto value=[] {
   std::array<std::array<std::int8_t,5>,256> table{};
@@ -25,6 +26,30 @@ void expanded16(const float* x,const std::uint8_t* expanded,float* y){
       const int8x8_t bytes=vreinterpret_s8_u8(vld1_u8(expanded+nibble_offset(r,col)));
       const int8x16_t code=vcombine_s8(vshr_n_s8(vshl_n_s8(bytes,4),4),vshr_n_s8(bytes,4));
       const int16x8_t lo=vmovl_s8(vget_low_s8(code)),hi=vmovl_s8(vget_high_s8(code));
+      a=vfmaq_n_f32(a,vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),x[col]);
+      b=vfmaq_n_f32(b,vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),x[col]);
+      c=vfmaq_n_f32(c,vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),x[col]);
+      d=vfmaq_n_f32(d,vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))),x[col]);
+    }
+    vst1q_f32(y+r,a);vst1q_f32(y+r+4,b);vst1q_f32(y+r+8,c);vst1q_f32(y+r+12,d);
+  }
+}
+
+void bitplane16(const float* x,const std::uint8_t* planes,float* y){
+  const int16x8_t shifts={0,-1,-2,-3,-4,-5,-6,-7};
+  for(std::size_t r=0;r<rows;r+=16){
+    float32x4_t a=vdupq_n_f32(0),b=vdupq_n_f32(0),c=vdupq_n_f32(0),d=vdupq_n_f32(0);
+    for(std::size_t col=0;col<columns;++col){
+      const auto* p=planes+bitplane_offset(r,col);
+      const std::uint16_t positive=static_cast<std::uint16_t>(p[0]|(p[1]<<8));
+      const std::uint16_t negative=static_cast<std::uint16_t>(p[2]|(p[3]<<8));
+      const uint16x8_t one=vdupq_n_u16(1);
+      const uint16x8_t pl=vandq_u16(vshlq_u16(vdupq_n_u16(positive),shifts),one);
+      const uint16x8_t nl=vandq_u16(vshlq_u16(vdupq_n_u16(negative),shifts),one);
+      const uint16x8_t ph=vandq_u16(vshlq_u16(vdupq_n_u16(positive>>8),shifts),one);
+      const uint16x8_t nh=vandq_u16(vshlq_u16(vdupq_n_u16(negative>>8),shifts),one);
+      const int16x8_t lo=vsubq_s16(vreinterpretq_s16_u16(pl),vreinterpretq_s16_u16(nl));
+      const int16x8_t hi=vsubq_s16(vreinterpretq_s16_u16(ph),vreinterpretq_s16_u16(nh));
       a=vfmaq_n_f32(a,vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),x[col]);
       b=vfmaq_n_f32(b,vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),x[col]);
       c=vfmaq_n_f32(c,vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),x[col]);
@@ -150,11 +175,12 @@ int main(){
   std::mt19937 rng(250);std::uniform_real_distribution<float> f(-2,2);
   std::vector<float>x(columns),reference(rows),candidate(rows);for(auto&v:x)v=f(rng);
   std::vector<float>batch_x(4*columns),batch_reference(4*rows),batch_candidate(4*rows);for(auto&v:batch_x)v=f(rng);
-  std::vector<std::uint8_t> packed(rows*stride),expanded(rows/2*columns);
+  std::vector<std::uint8_t> packed(rows*stride),expanded(rows/2*columns),bitplanes(rows/4*columns);
   std::vector<std::int8_t> expanded_i8(rows*columns);
   for(std::size_t r=0;r<rows;++r)for(std::size_t b=0;b<stride;++b)packed[packed_offset(r,b)]=static_cast<std::uint8_t>(rng()%243);
-  for(std::size_t r=0;r<rows;r+=16)for(std::size_t c=0;c<columns;++c){auto* p=expanded.data()+nibble_offset(r,c);auto* p8=expanded_i8.data()+(r/16)*columns*16+c*16;for(std::size_t lane=0;lane<16;++lane){auto value=digits()[packed[packed_offset(r+lane,c/5)]][c%5];auto code=static_cast<std::uint8_t>(value)&15;p8[lane]=value;if(lane<8)p[lane]=code;else p[lane-8]|=code<<4;}}
+  for(std::size_t r=0;r<rows;r+=16)for(std::size_t c=0;c<columns;++c){auto* p=expanded.data()+nibble_offset(r,c);auto* bp=bitplanes.data()+bitplane_offset(r,c);auto* p8=expanded_i8.data()+(r/16)*columns*16+c*16;std::uint16_t positive=0,negative=0;for(std::size_t lane=0;lane<16;++lane){auto value=digits()[packed[packed_offset(r+lane,c/5)]][c%5];auto code=static_cast<std::uint8_t>(value)&15;p8[lane]=value;if(value>0)positive|=static_cast<std::uint16_t>(1u<<lane);else if(value<0)negative|=static_cast<std::uint16_t>(1u<<lane);if(lane<8)p[lane]=code;else p[lane-8]|=code<<4;}bp[0]=positive&255;bp[1]=positive>>8;bp[2]=negative&255;bp[3]=negative>>8;}
   expanded16(x.data(),expanded.data(),reference.data());
+  bitplane16(x.data(),bitplanes.data(),candidate.data());bool equal_bitplane=std::memcmp(reference.data(),candidate.data(),rows*sizeof(float))==0;
   expanded16_tiled<64,0>(x.data(),expanded.data(),candidate.data());bool equal64=std::memcmp(reference.data(),candidate.data(),rows*sizeof(float))==0;
   expanded16_tiled<128,0>(x.data(),expanded.data(),candidate.data());bool equal128=std::memcmp(reference.data(),candidate.data(),rows*sizeof(float))==0;
   expanded16_tiled<128,32>(x.data(),expanded.data(),candidate.data());bool equal_prefetch=std::memcmp(reference.data(),candidate.data(),rows*sizeof(float))==0;
@@ -163,6 +189,7 @@ int main(){
   compact8_tbl(x.data(),packed.data(),candidate.data());bool equal_compact=std::memcmp(reference.data(),candidate.data(),rows*sizeof(float))==0;
   expanded16_four_calls(batch_x.data(),expanded.data(),batch_reference.data());expanded16_batch4(batch_x.data(),expanded.data(),batch_candidate.data());bool equal_batch4=std::memcmp(batch_reference.data(),batch_candidate.data(),4*rows*sizeof(float))==0;
   const double base=measure(expanded16,x.data(),expanded.data(),reference.data());
+  const double bitplane=measure(bitplane16,x.data(),bitplanes.data(),candidate.data());
   const double tile64=measure(expanded16_tiled<64,0>,x.data(),expanded.data(),candidate.data());
   const double tile128=measure(expanded16_tiled<128,0>,x.data(),expanded.data(),candidate.data());
   const double prefetch=measure(expanded16_tiled<128,32>,x.data(),expanded.data(),candidate.data());
@@ -174,11 +201,11 @@ int main(){
   std::vector<std::uint8_t> expanded_b=expanded;for(auto& byte:expanded_b)byte^=0x11;std::vector<float> pair_a(4*rows),pair_b(4*rows);
   for(int i=0;i<5;++i)paired_four_calls(batch_x.data(),expanded.data(),expanded_b.data(),pair_a.data(),pair_b.data());auto ps=std::chrono::steady_clock::now();for(int i=0;i<100;++i)paired_four_calls(batch_x.data(),expanded.data(),expanded_b.data(),pair_a.data(),pair_b.data());const double paired_calls=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-ps).count()/100;
   for(int i=0;i<5;++i)paired_batch4(batch_x.data(),expanded.data(),expanded_b.data(),pair_a.data(),pair_b.data());ps=std::chrono::steady_clock::now();for(int i=0;i<100;++i)paired_batch4(batch_x.data(),expanded.data(),expanded_b.data(),pair_a.data(),pair_b.data());const double paired_batch=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-ps).count()/100;
-  std::cout<<std::boolalpha<<"equal64="<<equal64<<" equal128="<<equal128<<" equal_prefetch="<<equal_prefetch<<" equal_i8="<<equal_i8<<" equal_mask="<<equal_mask<<" equal_compact="<<equal_compact<<" equal_batch4="<<equal_batch4
-           <<" expanded16_us="<<std::fixed<<std::setprecision(3)<<base<<" tile64_us="<<tile64<<" tile128_us="<<tile128
+  std::cout<<std::boolalpha<<"equal_bitplane="<<equal_bitplane<<" equal64="<<equal64<<" equal128="<<equal128<<" equal_prefetch="<<equal_prefetch<<" equal_i8="<<equal_i8<<" equal_mask="<<equal_mask<<" equal_compact="<<equal_compact<<" equal_batch4="<<equal_batch4
+           <<" expanded16_us="<<std::fixed<<std::setprecision(3)<<base<<" bitplane16_us="<<bitplane<<" bitplane_gain="<<(base/bitplane-1)*100<<"% tile64_us="<<tile64<<" tile128_us="<<tile128
            <<" tile128_prefetch32_us="<<prefetch<<" expanded16_i8_us="<<i8<<" mask_us="<<mask<<" compact8_tbl_us="<<compact
            <<" four_calls_us="<<four_calls<<" batch4_us="<<batch4<<" batch4_gain="<<(four_calls/batch4-1)*100<<"%"
            <<" paired_four_us="<<paired_calls<<" paired_batch4_us="<<paired_batch<<" paired_gain="<<(paired_calls/paired_batch-1)*100<<"%"
-           <<" nibble_mib="<<(expanded.size()/1048576.0)<<" i8_mib="<<(expanded_i8.size()/1048576.0)<<"\n";
-  return equal64&&equal128&&equal_prefetch&&equal_i8&&equal_mask&&equal_compact&&equal_batch4?0:1;
+           <<" nibble_mib="<<(expanded.size()/1048576.0)<<" bitplane_mib="<<(bitplanes.size()/1048576.0)<<" i8_mib="<<(expanded_i8.size()/1048576.0)<<"\n";
+  return equal_bitplane&&equal64&&equal128&&equal_prefetch&&equal_i8&&equal_mask&&equal_compact&&equal_batch4?0:1;
 }

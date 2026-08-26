@@ -83,3 +83,19 @@ model computation rather than kernel syntax:
 
 Each route requires separate quality evaluation and the prefill/decode matrices
 defined in `AGENTS.md`.
+
+## Two-bitplane operator result
+
+The proposed operator was implemented in `shadow_ternary_microbench`. Separate
+positive and negative 16-row membership masks reduced the tested matrix's
+runtime weight storage from 3.094 MiB to 1.547 MiB and produced bit-identical
+FP32 output. Across five runs, however, the current signed-nibble kernel measured
+about 485--512 us while the bitplane kernel measured 749--786 us, a 32--38%
+regression. Baseline ARMv8.0-A NEON still has to broadcast masks, perform
+per-lane variable shifts, subtract positive/negative membership, widen twice,
+convert to FP32, and FMA. Halving streamed bytes does not repay that decode.
+
+The candidate fails the 1.5x operator gate before paired `up`/`gt`, `dn`, or
+batch-4 integration. No runtime representation or model-load path was changed.
+This closes the exact compact-bitplane route for Cortex-A53 unless a materially
+different arithmetic formulation is found.
