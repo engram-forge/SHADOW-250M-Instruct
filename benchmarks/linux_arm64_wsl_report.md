@@ -346,6 +346,15 @@ However, a serial same-binary alternating control reduced the apparent gain to
 path and its temporary control were therefore removed. The original 16-row,
 two-way-unrolled nibble kernel remains active.
 
+An exact sampling-compatible logits fusion was also rejected. It stored
+`dot * norm + bias` directly in the strict fingerprint kernel, then retained a
+read-only parallel argmax reduction. The candidate remained bitwise identical
+to scalar logits on pirate cases 001--003, but a four-thread 129-token suite
+fell to 82.59 tok/s with 66% spread. Generalizing the tight vectorized store
+through optional-bias helper logic inhibited the existing hot loop enough to
+overwhelm the saved 512 KiB read-modify-write pass. The implementation was
+removed; the original explicit bias/argmax pass remains active.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
