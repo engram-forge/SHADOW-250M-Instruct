@@ -46,3 +46,35 @@ jobs:
 
       - name: Check whitespace errors
         run: git diff --check HEAD
+
+  macos-native:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.5"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Build Apple Silicon runner
+        run: native/build_macos.sh build/macos/shadow
+
+      - name: Verify deployment target and capabilities
+        run: |
+          file build/macos/shadow | grep -q arm64
+          otool -l build/macos/shadow | grep -A6 LC_BUILD_VERSION
+          build/macos/shadow --capabilities
+
+      - name: Run native unit tests
+        run: |
+          xcrun clang++ -std=c++20 -O2 -arch arm64 -mmacosx-version-min=14.0 \
+            -Inative/include native/tests/native_tests.cpp native/src/model.cpp native/src/archive.cpp \
+            native/src/metal_archive_stub.cpp -o build/macos/shadow_native_tests
+          build/macos/shadow_native_tests
+
+      - name: Run Python tests
+        run: uv run python -m unittest discover -s tests -v
