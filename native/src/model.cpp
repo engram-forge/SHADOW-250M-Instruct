@@ -33,8 +33,33 @@ constexpr std::size_t D = 1536, L = 10, NH = 24, NKV = 2, HD = 64, FPD = 512;
 
 struct ProfileCounters {
   double dense = 0, rvq = 0, ternary = 0, logits = 0, attention = 0, other = 0;
+  double embedding = 0, qkv = 0, output = 0, ffn_up_gate = 0, ffn_down = 0;
+  double structural = 0, head = 0;
   std::uint64_t dense_calls = 0, rvq_calls = 0, ternary_calls = 0;
 };
+
+ProfileCounters operator-(const ProfileCounters &left,
+                          const ProfileCounters &right) {
+  ProfileCounters result;
+#define SHADOW_PROFILE_SUBTRACT(field) result.field = left.field - right.field
+  SHADOW_PROFILE_SUBTRACT(dense);
+  SHADOW_PROFILE_SUBTRACT(rvq);
+  SHADOW_PROFILE_SUBTRACT(ternary);
+  SHADOW_PROFILE_SUBTRACT(logits);
+  SHADOW_PROFILE_SUBTRACT(attention);
+  SHADOW_PROFILE_SUBTRACT(embedding);
+  SHADOW_PROFILE_SUBTRACT(qkv);
+  SHADOW_PROFILE_SUBTRACT(output);
+  SHADOW_PROFILE_SUBTRACT(ffn_up_gate);
+  SHADOW_PROFILE_SUBTRACT(ffn_down);
+  SHADOW_PROFILE_SUBTRACT(structural);
+  SHADOW_PROFILE_SUBTRACT(head);
+  SHADOW_PROFILE_SUBTRACT(dense_calls);
+  SHADOW_PROFILE_SUBTRACT(rvq_calls);
+  SHADOW_PROFILE_SUBTRACT(ternary_calls);
+#undef SHADOW_PROFILE_SUBTRACT
+  return result;
+}
 thread_local ProfileCounters *active_profile = nullptr;
 
 struct ProfileScope {
@@ -1775,11 +1800,23 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
 
   auto step = [&](std::uint32_t token, const float *transformer_output = nullptr) {
     auto &s = impl_->scratch;
+    auto timed = [&](double &counter, auto &&operation) {
+      if (!options.profile) {
+        operation();
+        return;
+      }
+      const auto started = std::chrono::steady_clock::now();
+      operation();
+      counter += std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - started)
+                     .count();
+    };
     if (transformer_output)
       std::copy_n(transformer_output, D, s.x.begin());
     else {
       table_.vector_into(token, s.input);
-      impl_->embedding->matvec_into(s.input, s.x);
+      timed(profile.embedding,
+            [&] { impl_->embedding->matvec_into(s.input, s.x); });
     }
     auto &x = s.x;
     if (options.trace)
@@ -1790,9 +1827,11 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       const auto &w = impl_->weights[layer];
       rms_into(x, *w.n1, s.z);
       auto &z = s.z;
-      w.q->matvec_into(z, s.q);
-      w.k->matvec_into(z, s.k);
-      w.v->matvec_into(z, s.v);
+      timed(profile.qkv, [&] {
+        w.q->matvec_into(z, s.q);
+        w.k->matvec_into(z, s.k);
+        w.v->matvec_into(z, s.v);
+      });
       auto &q = s.q;
       auto &k = s.k;
       auto &v = s.v;
@@ -1922,19 +1961,20 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       const auto gate = w.g->dense_f32();
       for (std::size_t i = 0; i < attended.size(); ++i)
         attended[i] *= 1.0f / (1.0f + std::exp(-gate[i]));
-      w.o->matvec_into(attended, s.projected);
+      timed(profile.output, [&] { w.o->matvec_into(attended, s.projected); });
       auto &projected = s.projected;
       add_inplace(x, projected);
       rms_into(x, *w.n2, s.h);
       auto &h = s.h;
-      w.up->matvec_pair_into(*w.gt, h, s.up, s.gt);
+      timed(profile.ffn_up_gate,
+            [&] { w.up->matvec_pair_into(*w.gt, h, s.up, s.gt); });
       auto &up = s.up;
       auto &gt = s.gt;
       if (options.trace && layer == 0)
         std::cerr << "TRACE l0ffnraw up " << up[0] << ' ' << up[1] << " gt "
                   << gt[0] << ' ' << gt[1] << '\n';
       silu_multiply_inplace(up, gt);
-      w.dn->matvec_into(up, s.down);
+      timed(profile.ffn_down, [&] { w.dn->matvec_into(up, s.down); });
       auto &down = s.down;
       add_inplace(x, down);
       if (options.trace && layer == 0)
@@ -1951,6 +1991,9 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
     impl_->trunk.push_back(trunk);
     if (impl_->trunk.size() > 2048)
       impl_->trunk.erase(impl_->trunk.begin());
+    const auto structural_started =
+        options.profile ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
     impl_->step_wq->matvec_into(x, s.sq);
     auto &sq = s.sq;
     s.score.assign(impl_->trunk.size(), 0.0f);
@@ -1981,11 +2024,17 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
     add_inplace(x, structural);
     rms_into(x, *impl_->step_nf, s.final);
     x.swap(s.final);
+    if (options.profile)
+      profile.structural += std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                structural_started)
+                                .count();
     if (options.trace)
       std::cerr << "TRACE struct " << x[0] << ' ' << x[1] << ' ' << dot(x, x)
                 << '\n';
     rms_into(x, *impl_->final_nf, s.final);
-    impl_->head->matvec_into(s.final, s.fingerprint);
+    timed(profile.head,
+          [&] { impl_->head->matvec_into(s.final, s.fingerprint); });
     const auto logits_started = options.profile
                                     ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -2132,6 +2181,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
   for (; prompt_index < prompt.size(); ++prompt_index)
     logits = step(prompt[prompt_index]);
   auto prefill_done = std::chrono::steady_clock::now();
+  const ProfileCounters prefill_profile = profile;
   for (std::size_t i = 0; i < options.tokens; ++i) {
     if (!options.dump_logits.empty())
       dumped_logits.push_back(*logits);
@@ -2154,19 +2204,23 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
   if (!options.dump_logits.empty())
     write_npy_logits(options.dump_logits, dumped_logits);
   if (options.profile) {
-    const double measured = stats.prefill_seconds + stats.decode_seconds;
-    const double known = profile.dense + profile.rvq + profile.ternary +
-                         profile.logits + profile.attention;
-    profile.other = std::max(0.0, measured - known);
-    std::cerr << "PROFILE {\"dense_s\":" << profile.dense
-              << ",\"rvq_s\":" << profile.rvq
-              << ",\"ternary_s\":" << profile.ternary
-              << ",\"logits_s\":" << profile.logits
-              << ",\"attention_s\":" << profile.attention
-              << ",\"other_s\":" << profile.other
-              << ",\"dense_calls\":" << profile.dense_calls
-              << ",\"rvq_calls\":" << profile.rvq_calls
-              << ",\"ternary_calls\":" << profile.ternary_calls << "}\n";
+    const ProfileCounters decode = profile - prefill_profile;
+    std::cerr << "PROFILE {\"decode_s\":" << stats.decode_seconds
+              << ",\"embedding_s\":" << decode.embedding
+              << ",\"qkv_s\":" << decode.qkv
+              << ",\"attention_s\":" << decode.attention
+              << ",\"output_s\":" << decode.output
+              << ",\"ffn_up_gate_s\":" << decode.ffn_up_gate
+              << ",\"ffn_down_s\":" << decode.ffn_down
+              << ",\"structural_s\":" << decode.structural
+              << ",\"head_s\":" << decode.head
+              << ",\"logits_s\":" << decode.logits
+              << ",\"format_dense_s\":" << decode.dense
+              << ",\"format_rvq_s\":" << decode.rvq
+              << ",\"format_ternary_s\":" << decode.ternary
+              << ",\"decode_steps\":"
+              << (stats.tokens.empty() ? 0 : stats.tokens.size() - 1)
+              << "}\n";
   }
   return stats;
 }

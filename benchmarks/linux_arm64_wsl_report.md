@@ -307,6 +307,27 @@ The physical H618 matrix remains the release-performance gate.
 
 ## Remaining hardware gates
 
+## Decode-only operator profile
+
+`benchmarks/linux_arm64_decode_profile.py` subtracts all prefill counters at the
+prefill/decode boundary and aggregates repeated decode-only stage timings. A
+three-run, 128-step WSL diagnostic profile measured:
+
+| Stage | 1 thread | 2 threads | 4 threads |
+| --- | ---: | ---: | ---: |
+| Paired FFN `up`/`gt` | 36.6% | 35.5% | 34.5% |
+| FFN `dn` | 18.3% | 18.3% | 17.8% |
+| Strict logits | 20.0% | 18.8% | 16.4% |
+| Q/K/V | 8.3% | 8.4% | 9.7% |
+| Output projection | 6.9% | 6.6% | 6.9% |
+| Structural recurrence | 6.5% | 6.6% | 7.1% |
+| Attention | 1.1% | 1.9% | 3.1% |
+
+The two ternary FFN stages account for approximately 52--55% of measured decode
+time at every thread count. The next decode kernel work therefore targets the
+single-token paired `up`/`gt` path first, followed by `dn`. These are WSL
+diagnostic shares; the H618 profile remains authoritative for board tuning.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
