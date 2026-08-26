@@ -158,3 +158,24 @@ the current exact path.
 7. To avoid FP32 weight-lane conversion entirely, activations must also move to an
    integer formulation. That is an approximate, training/evaluation-aware design,
    not a bit-exact representation swap.
+
+## Dynamic INT8 activation operator gate
+
+An ARMv8.0-A operator benchmark dynamically quantized each FP32 activation
+vector to symmetric signed INT8, accumulated ternary products in INT32, and
+dequantized the output to FP32. Quantization and output conversion are included
+in every measured iteration. The first kernel uses signed-INT8 expanded ternary
+weights to isolate the arithmetic opportunity.
+
+| Shape | FP32 operator | INT8 total | Speedup | Relative RMSE |
+| --- | ---: | ---: | ---: | ---: |
+| `up/gt` 4224 x 1536 | 490--502 us | 252--263 us | 1.87--1.97x | 0.403% |
+| `dn` 1536 x 4224 | 469--505 us | 258--266 us | 1.82--1.93x | 0.391% |
+
+This clears the 1.5x arithmetic operator gate but does **not** clear the runtime
+gate. It is approximate, and the tested kernel uses 8-bit expanded weights.
+That layout previously doubled model working memory and erased an isolated FP32
+operator gain in whole-runtime tests. The next required gate is therefore INT8
+activations with the current signed-nibble weights, or another compact integer
+weight decoder. Only after that succeeds should model-level calibration, logits
+quality, sampling, and the full context matrix be attempted.
