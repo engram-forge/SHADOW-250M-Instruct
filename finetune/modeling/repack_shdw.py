@@ -1,7 +1,8 @@
 import sys, struct, numpy as np
 src, dst = sys.argv[1], sys.argv[2]; FP16 = "--fp16" in sys.argv     
 f = open(src, "rb"); assert f.read(4) == b"SHDW"; ver, n = struct.unpack("<II", f.read(8))
-out = open(dst, "wb"); out.write(b"SHDW"); out.write(struct.pack("<II", 1, n))
+if ver not in (1, 2): raise SystemExit(f"unsupported SHDW version {ver}")
+out = open(dst, "wb"); out.write(b"SHDW"); out.write(struct.pack("<II", ver, n))
 tern_in = tern_out = dense_in = dense_out = 0
 for _ in range(n):
     nl, = struct.unpack("<I", f.read(4)); name = f.read(nl); kind, = struct.unpack("<I", f.read(4))
@@ -22,6 +23,14 @@ for _ in range(n):
         pad = (-i) % 5; c5 = np.concatenate([c4, np.ones((o, pad), np.uint8)], 1).reshape(o, -1, 5).astype(np.uint16)
         p5 = (c5[:, :, 0] + 3 * c5[:, :, 1] + 9 * c5[:, :, 2] + 27 * c5[:, :, 3] + 81 * c5[:, :, 4]).astype(np.uint8)
         out.write(struct.pack("<I", 4)); out.write(struct.pack("<II", o, i)); out.write(p5.tobytes()); out.write(rs); tern_out += p5.nbytes
+    elif kind == 4:
+        o, i = struct.unpack("<II", f.read(8)); size = o * ((i + 4) // 5)
+        packed = f.read(size); rs = f.read(o * 4)
+        out.write(struct.pack("<I", 4)); out.write(struct.pack("<II", o, i)); out.write(packed); out.write(rs)
+    elif kind == 5:
+        nd, = struct.unpack("<I", f.read(4)); dims = struct.unpack("<" + "I" * nd, f.read(4 * nd)); c = int(np.prod(dims))
+        data = f.read(2 * c)
+        out.write(struct.pack("<I", 5)); out.write(struct.pack("<I", nd)); out.write(struct.pack("<" + "I" * nd, *dims)); out.write(data); dense_out += 2 * c
     else: raise SystemExit(f"unknown kind {kind}")
 out.close()
 import os

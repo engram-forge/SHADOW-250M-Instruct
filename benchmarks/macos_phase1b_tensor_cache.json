@@ -1,0 +1,80 @@
+{
+  "format": "shadow-macos-benchmark-v1",
+  "machine": "arm64",
+  "platform": "macOS-26.3.1-arm64-arm-64bit",
+  "kernel_sha256": "cd26244bd9a48d7e8ffee4c1112d489846f56035e43e99ed60c3b1c0225f7289",
+  "model_sha256": "6e0ad7893e0b4b3b420d8ee5d8dd7a1b7dd499fc698ba1b3a3fa40a7a0d5b9ea",
+  "table_sha256": "efb7672a55e4998a8c0395cdec1c2207acf750e3ad1109088a61f66586da1d34",
+  "threads": 10,
+  "prompt_tokens": 1,
+  "requested_tokens": 33,
+  "warmup": 2,
+  "runs": [
+    {
+      "decode_tok_s": 11.543164,
+      "prefill_s": 0.089,
+      "wall_s": 2.8947661250003875,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.430364,
+      "prefill_s": 0.085,
+      "wall_s": 2.9175471250000555,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.520437,
+      "prefill_s": 0.095,
+      "wall_s": 2.907876290999411,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.453839,
+      "prefill_s": 0.086,
+      "wall_s": 2.912931249999019,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.419615,
+      "prefill_s": 0.106,
+      "wall_s": 2.940991458001008,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.221343,
+      "prefill_s": 0.098,
+      "wall_s": 2.9824037090002093,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.47958,
+      "prefill_s": 0.087,
+      "wall_s": 2.907538708001084,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.413455,
+      "prefill_s": 0.088,
+      "wall_s": 2.9252623749998747,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.469321,
+      "prefill_s": 0.087,
+      "wall_s": 2.9102966250011377,
+      "output_tokens": 33
+    },
+    {
+      "decode_tok_s": 11.495317,
+      "prefill_s": 0.087,
+      "wall_s": 2.904426584000248,
+      "output_tokens": 33
+    }
+  ],
+  "decode_tok_s_median": 11.461580000000001,
+  "decode_tok_s_p05": 11.413455,
+  "decode_tok_s_p95": 11.543164,
+  "decode_tok_s_spread": 0.028078240521813017,
+  "prefill_s_median": 0.0875,
+  "prefill_s_p95": 0.106
+}

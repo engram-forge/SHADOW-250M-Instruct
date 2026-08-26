@@ -18,8 +18,8 @@ The model is in this repository. Clone and chat:
     cd SHADOW-250M-Instruct
     python shadow_chat.py
 
-That picks the right prebuilt runtime for your system (Windows and Linux included, macOS
-on request) and starts the chat. No framework, no downloads beyond the clone.
+That picks the right prebuilt runtime for Windows, Linux, or Apple Silicon macOS
+and starts the chat. No framework or model download is required after cloning.
 
 **SHADOW 250M Instruct** is a 250 million parameter language model built from scratch,
 trained on 30 billion tokens of English text with about 0.7 billion further tokens of
@@ -138,7 +138,7 @@ Classic 300-dimension float word vectors reach about 0.65 to 0.70 on the same te
 | Attention window | 2,048 tokens + offline archive up to 100M |
 | Body weight precision | under 2 bits per weight |
 | Parameters | 250M |
-| Runtime | bundled CPU kernel (AVX2/AVX-512), no framework needed |
+| Runtime | bundled CPU kernel (AVX2/AVX-512 or Apple Silicon NEON), no framework needed |
 
 ![framework](framework.png)
 
@@ -210,7 +210,7 @@ and the before and after results is in [finetune/FINETUNING.md](finetune/FINETUN
     deployment/            the model: weights, vocabulary, and the runtime binaries
       shadow250m_instruct.shdw   52 MB weights
       fp131072.npy               8.4 MB vocabulary
-      bin/windows/  bin/linux/   prebuilt CPU runtimes (macOS on request)
+      bin/windows/  bin/linux/  bin/macos/   prebuilt CPU runtimes
     tokenizer/             3 files, 5 MB
     finetune/              master weights, training script, exporter, guide, worked example
     benchmarks/            results, report, harness
@@ -229,6 +229,15 @@ Chat directly with the binary, no Python needed. Windows:
 Linux:
 
     deployment/bin/linux/shadow deployment/shadow250m_instruct.shdw deployment/fp131072.npy --chat
+
+Apple Silicon macOS:
+
+    deployment/bin/macos/shadow deployment/shadow250m_instruct.shdw deployment/fp131072.npy "2" 16
+
+The macOS runner is an independently reconstructed implementation because the
+historical x86 kernel source is not distributed. Its native build, Metal cold-KV
+archive format, current validation boundary, and benchmark commands are documented
+in [native/README.md](native/README.md).
 
 Add --status to either for a live memory panel. Ask a question against an archive (a folder
 holding a tokens.u32 stream):

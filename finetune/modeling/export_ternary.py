@@ -11,7 +11,8 @@ from common import RVQ, requant
 from model_250m import Shadow250M
 from export_rvq import rvq_pack
 
-CK, OUT = sys.argv[1], sys.argv[2]; COMPACT = "--compact" in sys.argv      
+CK, OUT = sys.argv[1], sys.argv[2]; COMPACT = "--compact" in sys.argv
+WITH_CODECS = "--with-codecs" in sys.argv
 ck = torch.load(CK, map_location="cpu", weights_only=False)
 V, FPD = ck.get("cfg", {}).get("V", 131072), 512
 model = Shadow250M(torch.zeros(V, FPD), torch.zeros(V, FPD), V)
@@ -56,11 +57,17 @@ for name, p in wrap.named_parameters():
     if COMPACT and a.ndim >= 1 and a.size >= 4096: recs.append((name, 5, a.astype(np.float16))); dense_bytes += a.size * 2
     else: recs.append((name, 0, a)); dense_bytes += a.nbytes
 for name, b in wrap.named_buffers():
-    if any(x in name for x in ("cent", "cb", "initialized", "sign", "mu", "ctv", "low", "high", "updates", "inv")): continue
+    codec_state = WITH_CODECS and (".kcodec." in name or ".vcodec." in name) and name.rsplit(".", 1)[-1] in {
+        "sign", "mu", "ctv", "low", "high", "initialized"
+    }
+    if not codec_state and any(x in name for x in ("cent", "cb", "initialized", "sign", "mu", "ctv", "low", "high", "updates", "inv")): continue
     a = b.detach().float().numpy(); recs.append((name, 0, a)); dense_bytes += a.nbytes
 
 with open(OUT, "wb") as f:
-    f.write(b"SHDW"); f.write(struct.pack("<II", 1, len(recs)))
+    # v2 adds calibrated per-layer 1-bit K/V codec records. All existing record
+    # encodings are unchanged, so v1 readers can reject cleanly and v2 readers
+    # can continue loading old v1 chat models.
+    f.write(b"SHDW"); f.write(struct.pack("<II", 2 if WITH_CODECS else 1, len(recs)))
     for name, kind, pay in recs:
         nb = name.encode(); f.write(struct.pack("<I", len(nb))); f.write(nb); f.write(struct.pack("<I", kind))
         if kind == 0:

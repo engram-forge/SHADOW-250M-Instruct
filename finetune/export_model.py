@@ -9,8 +9,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "modeling"))
 import subprocess
 src, dst = sys.argv[1], sys.argv[2]
+with_codecs = "--with-codecs" in sys.argv
 tmp = dst + ".full"
-r = subprocess.run([sys.executable, str(HERE / "modeling" / "export_ternary.py"), src, tmp],
+export_args = [sys.executable, str(HERE / "modeling" / "export_ternary.py"), src, tmp]
+if with_codecs: export_args.append("--with-codecs")
+r = subprocess.run(export_args,
                    env={**os.environ, "PYTHONPATH": str(HERE / "modeling")})
 if r.returncode: sys.exit(r.returncode)
 r = subprocess.run([sys.executable, str(HERE / "modeling" / "repack_shdw.py"), tmp, dst, "--fp16"])

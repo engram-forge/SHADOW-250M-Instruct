@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERE))
 from retriever import Inverted, load_archive, enc, _dec
 from answer_engine import Engine as _Extractor, ABSTAIN
 from prompt import EOT
+from .platform import bundled_kernel, ensure_executable
 
 BOS, SOT, EOS = 2, 8, 1
 
@@ -45,20 +46,31 @@ def guarded_result(text):
             "looped": loop_start is not None or (len(ids) >= 48 and ratio > 0.35)}
 
 class Engine:
-    def __init__(s, model, table, archive=None, kernel=None, threads=None):
+    def __init__(s, model, table, archive=None, kernel=None, threads=None,
+                 kv_archive=None, archive_backend="auto", archive_top_k=32):
         s.model = str(pathlib.Path(model).resolve()); s.table = str(pathlib.Path(table).resolve())
-        s.kernel = str(pathlib.Path(kernel).resolve()) if kernel else str((HERE.parent / "deployment" / "bin" / ("windows/shadow.exe" if os.name == "nt" else "linux/shadow")).resolve())
-        if os.name != "nt": pathlib.Path(s.kernel).chmod(0o755)
+        selected = pathlib.Path(kernel) if kernel else bundled_kernel(HERE.parent)
+        if not selected.exists():
+            raise FileNotFoundError(f"bundled runtime is missing: {selected}; build it with native/build_macos.sh")
+        s.kernel = str(ensure_executable(selected).resolve())
         s.env = dict(os.environ)
         if threads: s.env["SHADOW_THREADS"] = str(threads)
+        if sys.platform == "darwin": s.env.setdefault("SHADOW_FAST_LOGITS", "1")
+        s.kernel_extra = ()
+        if kv_archive:
+            s.kernel_extra = ("--archive", str(pathlib.Path(kv_archive).resolve()),
+                              "--archive-backend", archive_backend,
+                              "--archive-topk", str(archive_top_k))
         s.ext = None
         if archive:
             tok, meta, _bank = load_archive(str(archive))
             inv = Inverted(tok)
             s.ext = _Extractor(tok, inv, model_ask=s.chat)
     def _gen(s, ids, n=140, extra=()):
-        r = subprocess.run([s.kernel, s.model, s.table, " ".join(map(str, ids)), str(n), *extra],
+        r = subprocess.run([s.kernel, s.model, s.table, " ".join(map(str, ids)), str(n), *extra, *s.kernel_extra],
                            capture_output=True, text=True, env=s.env)
+        if r.returncode:
+            raise RuntimeError(r.stderr.strip() or f"SHADOW kernel exited with status {r.returncode}")
         out = [int(x) for x in r.stdout.split()]
         for stop in (EOT, EOS):
             if stop in out: out = out[:out.index(stop)]
