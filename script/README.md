@@ -92,6 +92,7 @@ arguments to it. Common environment overrides are:
 | `SHADOW_FFN_ACT_WARMUP_TOKENS` | `100000000` |
 | `SHADOW_MTP_HORIZON` | `2` (base plus one MTP proposal) |
 | `SHADOW_MTP_LOSS_WEIGHT` | `0.3` |
+| `SHADOW_MTP_LOSS_WARMUP_TOKENS` | `100000000` |
 | `SHADOW_DATA_DIR` | compressed Dolma sample path |
 | `SHADOW_RUN_DIR` | `pretrain_runs/dolma-8b` |
 | `SHADOW_PYTHON_BIN` | existing project virtualenv |

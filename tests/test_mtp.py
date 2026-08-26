@@ -51,6 +51,7 @@ class MultiTokenPredictionTest(unittest.TestCase):
         self.assertEqual(tuple(model.mtp.up.weight.shape),(4,2))
         logits=model.mtp_logits(torch.randn(1,1,4),torch.tensor([[1]]))
         self.assertEqual(tuple(logits.shape),(1,1,4))
+        self.assertLess(float(model.mtp.up.weight.detach().std()),0.01)
 
     def test_weighted_loss_matches_offset_losses_and_trains_mtp(self):
         torch.manual_seed(7); model=tiny_model(2)
@@ -67,6 +68,18 @@ class MultiTokenPredictionTest(unittest.TestCase):
         self.assertIsNotNone(model.mtp.up.weight.grad)
         self.assertTrue(bool((model.mtp.down.weight.grad!=0).any()))
         self.assertTrue(bool((model.mtp.up.weight.grad!=0).any()))
+
+    def test_metrics_report_losses_accuracy_and_token_counts(self):
+        model=tiny_model(2); hidden=torch.randn(1,4,4)
+        targets=torch.tensor([[0,1,2,-1]]); conditioning=torch.tensor([[1,2,3]])
+        metrics=model.language_model_metrics(hidden,targets,0.3,chunk=2,
+                                              conditioning_ids=conditioning)
+        self.assertEqual(metrics["base_tokens"],3)
+        self.assertEqual(metrics["mtp_tokens"],2)
+        self.assertTrue(0<=float(metrics["base_accuracy"])<=1)
+        self.assertTrue(0<=float(metrics["mtp_accuracy"])<=1)
+        self.assertTrue(torch.allclose(metrics["loss"],
+                                      metrics["base_loss"]+0.3*metrics["mtp_loss"]))
 
     def test_horizon_one_matches_main_head_loss(self):
         torch.manual_seed(11); model=tiny_model(1)

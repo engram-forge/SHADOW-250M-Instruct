@@ -79,4 +79,5 @@ exec "${runner[@]}" -m pretrain.train train \
   --ffn-act-warmup-tokens "${SHADOW_FFN_ACT_WARMUP_TOKENS:-100000000}" \
   --mtp-horizon "${SHADOW_MTP_HORIZON:-2}" \
   --mtp-loss-weight "${SHADOW_MTP_LOSS_WEIGHT:-0.3}" \
+  --mtp-loss-warmup-tokens "${SHADOW_MTP_LOSS_WARMUP_TOKENS:-100000000}" \
   "$@"

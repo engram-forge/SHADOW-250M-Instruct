@@ -60,6 +60,8 @@ def get_args():
                     help="inherit the checkpoint alphabet or explicitly select it")
     ap.add_argument("--mtp-loss-weight",type=float,default=None,
                     help="auxiliary loss per future head; defaults to checkpoint value")
+    ap.add_argument("--mtp-loss-warmup-steps",type=int,default=0,
+                    help="linearly introduce MTP loss during this fine-tune")
     ap.add_argument("--amp-dtype", choices=("bf16", "fp16", "fp32"), default="bf16",
                     help="CUDA compute dtype; parameters and AdamW state remain FP32")
     return ap.parse_args()
@@ -226,6 +228,7 @@ def main():
                      (a.device=="auto" and torch.cuda.is_available()) else "cpu")
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
     if a.ffn_act_warmup_steps<0: raise SystemExit("--ffn-act-warmup-steps must be nonnegative")
+    if a.mtp_loss_warmup_steps<0: raise SystemExit("--mtp-loss-warmup-steps must be nonnegative")
     if a.val_batches<1: raise SystemExit("--val-batches must be positive")
     ck = torch.load(a.init, map_location=dev, weights_only=False)
     mtp_horizon=int(ck.get("cfg",{}).get("mtp_horizon",1))
@@ -253,13 +256,15 @@ def main():
     data = Packer(a.data, a.ctx, rng, a.val_frac, a.repeat_policy, a.overlength,
                   a.recovery_ratio, a.audit_report, a.val_data)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
-    def loss_of(x, y, include_ul=True):
+    def loss_of(x,y,mtp_weight,include_ul=True,return_metrics=False):
         h,_=model.trunk(x)
-        mle=model.language_model_loss(h,y,mtp_loss_weight,chunk=8192,
-                                     conditioning_ids=x[:,1:])
-        if not include_ul or a.ul_alpha == 0: return mle
+        metrics=model.language_model_metrics(h,y,mtp_weight,chunk=8192,
+                                             conditioning_ids=x[:,1:])
+        mle=metrics["loss"]
+        if not include_ul or a.ul_alpha == 0:
+            return (mle,metrics) if return_metrics else mle
         pairs = unlikelihood_pairs(x, y, a.ul_window, a.ul_ngram)
-        if not pairs: return mle
+        if not pairs: return (mle,metrics) if return_metrics else mle
         positions = torch.tensor([p for p, _ in pairs], device=x.device)
         negatives = torch.tensor([c for _, c in pairs], device=x.device)
         all_ph = model.head(h).float().reshape(-1, 512)
@@ -270,7 +275,8 @@ def main():
             probs = logits.softmax(-1).gather(1, neg_chunk[:, None]).squeeze(1)
             ul_sum = ul_sum - torch.log1p(-probs.clamp(max=1 - 1e-6)).sum()
         ul = ul_sum / len(pairs)
-        return mle + a.ul_alpha * ul
+        total=mle+a.ul_alpha*ul
+        return (total,metrics) if return_metrics else total
     @torch.no_grad()
     def val():
         training_strength=common.FFN_ACT_QAT_STRENGTH
@@ -280,7 +286,7 @@ def main():
             for _ in range(a.val_batches):
                 x, y = data.pack(a.micro_batch, val=True)
                 with torch.autocast(dev.type,dtype=amp_dtype,enabled=amp_enabled):
-                    tot += float(loss_of(x.to(dev), y.to(dev), include_ul=False))
+                    tot += float(loss_of(x.to(dev),y.to(dev),mtp_loss_weight,include_ul=False))
         finally:
             model.train()
             for md in model.modules():
@@ -295,23 +301,35 @@ def main():
         lr = a.lr * min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * step / a.steps)))
         for g in opt.param_groups: g["lr"] = lr
         opt.zero_grad(set_to_none=True)
+        current_mtp_weight=(mtp_loss_weight if a.mtp_loss_warmup_steps<=0 else
+                            mtp_loss_weight*min(1.0,step/a.mtp_loss_warmup_steps))
+        latest_metrics=None
         for _ in range(a.accum):
             x, y = data.pack(a.micro_batch)
             with torch.autocast(dev.type,dtype=amp_dtype,enabled=amp_enabled):
-                loss=loss_of(x.to(dev), y.to(dev)) / a.accum
+                total,latest_metrics=loss_of(x.to(dev),y.to(dev),current_mtp_weight,
+                                             return_metrics=True)
+                loss=total/a.accum
             scaler.scale(loss).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt); scaler.update(); requant(model)
         if step % a.log_every == 0:
             el = time.time() - t0
-            print(f"step {step:>4}  lr {lr:.2e}  {el/step:.1f}s/step  eta {(a.steps-step)*el/step/60:.0f}min", flush=True)
+            print(json.dumps({"step":step,"lr":lr,"seconds_per_step":el/step,
+                "eta_minutes":(a.steps-step)*el/step/60,
+                "base_loss":float(latest_metrics["base_loss"]),
+                "base_accuracy":float(latest_metrics["base_accuracy"]),
+                "mtp_loss":float(latest_metrics["mtp_loss"]),
+                "mtp_accuracy":float(latest_metrics["mtp_accuracy"]),
+                "mtp_loss_weight":current_mtp_weight}),flush=True)
     v1 = val()
     common.set_ffn_activation_qat_strength(1.0 if a.ffn_act_qat else 0.0)
     torch.save({"model": model.state_dict(),"cfg":{
         "V":cent.shape[0],**qat_cfg,"training_amp_dtype":a.amp_dtype,
         "parameter_dtype":"float32","ffn_act_warmup_steps":a.ffn_act_warmup_steps,
-        "mtp_horizon":mtp_horizon,"mtp_loss_weight":mtp_loss_weight}},out/"finetuned.pt")
+        "mtp_horizon":mtp_horizon,"mtp_loss_weight":mtp_loss_weight,
+        "mtp_loss_warmup_steps":a.mtp_loss_warmup_steps}},out/"finetuned.pt")
     print(f"done  val loss {v0:.4f} -> {v1:.4f}  saved {out/'finetuned.pt'}")
 
 if __name__ == "__main__":

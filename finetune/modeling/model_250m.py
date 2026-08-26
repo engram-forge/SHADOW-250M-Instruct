@@ -19,6 +19,8 @@ class MTPModule(nn.Module):
         s.norm=RMS(dim)
         s.down=RVQ(dim,hidden,32,1)
         s.up=RVQ(hidden,dim,32,1)
+        # Keep the initial residual perturbation small without blocking gradients.
+        nn.init.normal_(s.up.weight,mean=0.0,std=1e-3)
     def forward(s,state,previous_token_embedding):
         mixed=s.norm(state+previous_token_embedding)
         hidden=F.silu(s.down(ffn_activation(mixed)))
@@ -55,15 +57,20 @@ class Shadow250M(nn.Module):
         x,conf=s.struct(x)                                       
         return s.nf(x), conf
     def logits(s,x): return (s.head(x).float()@s.cent_n.T)+s.tied_bias      
-    def _vocab_loss(s,hidden,targets,head,chunk):
+    def _vocab_metrics(s,hidden,targets,head,chunk):
         projected=head(hidden).float().reshape(-1,FPD); flat=targets.reshape(-1); valid=flat>=0
         projected,flat=projected[valid],flat[valid]
-        if not flat.numel(): return hidden.float().sum()*0
-        total=hidden.float().new_zeros(())
+        if not flat.numel():
+            zero=hidden.float().sum()*0
+            return zero,zero.detach(),0
+        total=hidden.float().new_zeros(()); correct=hidden.new_zeros((),dtype=torch.long)
         for start in range(0,len(flat),chunk):
             logits=projected[start:start+chunk]@s.cent_n.T+s.tied_bias
             total+=F.cross_entropy(logits,flat[start:start+chunk],reduction="sum")
-        return total/len(flat)
+            correct+=logits.argmax(-1).eq(flat[start:start+chunk]).sum()
+        return total/len(flat),correct.float()/len(flat),len(flat)
+    def _vocab_loss(s,hidden,targets,head,chunk):
+        return s._vocab_metrics(hidden,targets,head,chunk)[0]
     def mtp_hidden(s,hidden,previous_token_ids):
         if s.mtp is None: raise RuntimeError("model has no MTP module")
         if bool((previous_token_ids<0).any()):
@@ -84,13 +91,34 @@ class Shadow250M(nn.Module):
             future=s.mtp_hidden(state,previous)
             losses.append(s._vocab_loss(future,target,s.head,chunk))
         return losses
+    def language_model_metrics(s,hidden,targets,mtp_loss_weight=0.0,chunk=2048,
+                               conditioning_ids=None):
+        if mtp_loss_weight<0: raise ValueError("MTP loss weight must be nonnegative")
+        base_loss,base_accuracy,base_tokens=s._vocab_metrics(
+            hidden,targets,s.head,chunk)
+        result={"loss":base_loss,"base_loss":base_loss,
+                "base_accuracy":base_accuracy,"base_tokens":base_tokens,
+                "mtp_loss_weight":float(mtp_loss_weight)}
+        if s.mtp_horizon==2 and hidden.shape[1]>1:
+            state=hidden[:,:-1]; target=targets[:,1:]
+            previous=(targets[:,:-1] if conditioning_ids is None
+                      else conditioning_ids[:,:state.shape[1]])
+            future=s.mtp_hidden(state,previous)
+            mtp_loss,mtp_accuracy,mtp_tokens=s._vocab_metrics(
+                future,target,s.head,chunk)
+            result.update(mtp_loss=mtp_loss,mtp_accuracy=mtp_accuracy,
+                          mtp_tokens=mtp_tokens)
+            result["loss"]=base_loss+mtp_loss_weight*mtp_loss
+        else:
+            zero=base_loss.detach()*0
+            result.update(mtp_loss=zero,mtp_accuracy=zero,mtp_tokens=0)
+        return result
     def language_model_loss(s,hidden,targets,mtp_loss_weight=0.0,chunk=2048,
                             conditioning_ids=None):
-        if mtp_loss_weight<0: raise ValueError("MTP loss weight must be nonnegative")
         if mtp_loss_weight==0:
             return s._vocab_loss(hidden,targets,s.head,chunk)
-        losses=s.language_model_losses(hidden,targets,conditioning_ids,chunk)
-        return losses[0]+mtp_loss_weight*sum(losses[1:])
+        return s.language_model_metrics(
+            hidden,targets,mtp_loss_weight,chunk,conditioning_ids)["loss"]
     def forward(s,idx,ys=None):
         x,conf=s.trunk(idx)
         if ys is None: return s.logits(x)

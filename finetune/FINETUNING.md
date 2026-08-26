@@ -37,6 +37,9 @@ alphabet. `--ffn-act-warmup-steps N` linearly introduces activation QAT during a
 If the source checkpoint contains MTP heads, fine-tuning preserves and trains them with the
 checkpoint's auxiliary loss weight. Override that weight with `--mtp-loss-weight`; old checkpoints
 without MTP metadata remain horizon-one compatible.
+Use `--mtp-loss-warmup-steps N` to introduce the auxiliary objective gradually. Training logs report
+Base and MTP loss/accuracy independently. Base perplexity remains the primary evaluation metric;
+add `--evaluate-mtp` to `evaluate_loss.py` for offset-two loss and top-1 accuracy.
 
 An activation-QAT export writes an adjacent `.a55.json` execution manifest. Its `.shdw` weight
 payload remains usable for kernel development, but exact inference requires the planned integer

@@ -17,7 +17,8 @@ if weight_dtype not in {"ternary","int4_row"}: raise SystemExit(f"unsupported FF
 mtp_horizon=int(cfg.get("mtp_horizon",1))
 if mtp_horizon not in (1,2): raise SystemExit(f"invalid checkpoint MTP horizon {mtp_horizon}")
 manifest = {
-    "version": 1,
+    "version": 2,
+    "architecture_version":2,
     "target": "armv8.2-a-dotprod-cortex-a55",
     "architecture": "swiglu",
     "mtp": {"horizon":mtp_horizon,
@@ -26,6 +27,8 @@ manifest = {
             "deepseek_exact":False,
             "module_type":"token_conditioned_residual_mlp" if mtp_horizon==2 else "none",
             "hidden_width":int(os.environ["SHADOW_D"])//2 if mtp_horizon==2 else 0,
+            "conditioning":"previous_token_embedding" if mtp_horizon==2 else "none",
+            "verification":"causal_greedy_reference",
             "vocabulary_projection":"shared_base_head_fingerprint_table_and_tied_bias",
             "training_loss_weight":float(cfg.get("mtp_loss_weight",0.0))},
     "ffn_weight": {"dtype":weight_dtype,"scale":"per_output_row_fp32",
@@ -57,6 +60,8 @@ try:
 finally:
     if os.path.exists(tmp): os.remove(tmp)
 pathlib.Path(dst + ".a55.json").write_text(json.dumps(manifest, indent=2) + "\n")
+from validate_export import validate_export
+validate_export(pathlib.Path(dst),manifest,int(os.environ["SHADOW_D"]))
 if not manifest["compatible_with_bundled_engine"]:
     print("warning: this checkpoint requires the planned A55 DotProd FFN engine; "
           "the bundled ternary/FP32-activation binary is not deployment-exact")

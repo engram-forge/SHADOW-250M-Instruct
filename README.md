@@ -124,6 +124,14 @@ Classic 300-dimension float word vectors reach about 0.65 to 0.70 on the same te
 
 ## Architecture
 
+The bundled release model and binaries remain the original K=1 runtime. New A55-oriented
+pretraining can optionally use K=2 multi-token prediction: one token-conditioned residual MLP
+proposes a second greedy token while sharing the embedding and output head. Fine-tuning and `.shdw`
+export preserve this module in row-ternary or row-INT4 form. The bundled native engine does not yet
+verify or execute MTP exports, so no speculative speedup is claimed until RK3566 acceptance and
+verification latency have been measured. See `PRETRAINING.md` for training and the exact PyTorch
+acceptance reference.
+
 | Hyperparameter | Value |
 |---|---|
 | Hidden size | 1536 |
@@ -213,6 +221,7 @@ and the before and after results is in [finetune/FINETUNING.md](finetune/FINETUN
       bin/windows/  bin/linux/   prebuilt CPU runtimes (macOS on request)
     tokenizer/             3 files, 5 MB
     finetune/              master weights, training script, exporter, guide, worked example
+    pretrain/              Dolma trainer, K=1-to-K=2 checkpoint upgrade
     benchmarks/            results, report, harness
     shadow_runtime/        archive question answering (Python)
 

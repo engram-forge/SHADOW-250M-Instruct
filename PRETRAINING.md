@@ -70,8 +70,25 @@ auxiliary loss has weight `0.3`. Both settings are part of the strict resume con
 
 ```bash
 uv run python -m pretrain.train train --data DATA --out RUN \
-  --mtp-horizon 2 --mtp-loss-weight 0.3
+  --mtp-horizon 2 --mtp-loss-weight 0.3 \
+  --mtp-loss-warmup-tokens 100000000
 ```
+
+The MTP residual output starts with a small initialization, and its loss ramps linearly from zero
+over the configured warm-up. `metrics.jsonl` reports `base_loss`, `base_accuracy`, `mtp_loss`,
+`mtp_accuracy`, and the current `mtp_loss_weight` separately.
+
+Legacy K=1 checkpoints cannot resume as K=2 because their optimizer and architecture differ. Make
+the transition explicit as a new model-only warm start:
+
+```bash
+python pretrain/upgrade_checkpoint.py --input OLD.pt --output K2_INIT.pt
+python -m pretrain.train train --data DATA --out NEW_RUN \
+  --init-checkpoint K2_INIT.pt --mtp-horizon 2
+```
+
+The upgrade records the source SHA-256 and deliberately discards optimizer/data/RNG continuation.
+`--init-checkpoint` and `--resume` are mutually exclusive.
 
 The MTP heads train candidate proposals only. Actual speculative decode still requires causal
 verification, acceptance/rejection, and KV-cache commit/rollback support in the native engine.

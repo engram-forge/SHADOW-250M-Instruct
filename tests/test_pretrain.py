@@ -69,7 +69,7 @@ class DiagnosticsTest(unittest.TestCase):
         class Args:
             ctx=8; micro_batch=1; accum=1; seed=7; ffn_act_qat=True
             ffn_weight_dtype="ternary"; ffn_act_warmup_tokens=100; amp_dtype="bf16"
-            mtp_horizon=2; mtp_loss_weight=0.3
+            mtp_horizon=2; mtp_loss_weight=0.3; mtp_loss_warmup_tokens=1000
         first=training_contract(Args)
         Args.ffn_weight_dtype="int4_row"
         second=training_contract(Args)
@@ -79,7 +79,7 @@ class DiagnosticsTest(unittest.TestCase):
         class Args:
             ctx=8; micro_batch=1; accum=1; seed=7; ffn_act_qat=True
             ffn_weight_dtype="ternary"; ffn_act_warmup_tokens=100; amp_dtype="bf16"
-            mtp_horizon=2; mtp_loss_weight=0.3
+            mtp_horizon=2; mtp_loss_weight=0.3; mtp_loss_warmup_tokens=1000
         first=training_contract(Args)
         Args.mtp_horizon=1
         self.assertNotEqual(first,training_contract(Args))

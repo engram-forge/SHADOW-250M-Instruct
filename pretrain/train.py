@@ -46,6 +46,8 @@ def arguments():
     parser.add_argument("--tokenizer", type=Path, default=ROOT / "tokenizer/tokenizer.model")
     parser.add_argument("--remap", type=Path, default=ROOT / "tokenizer/new2old.u32")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init-checkpoint",type=Path,
+                        help="model-only warm start; optimizer/data/RNG begin a new run")
     parser.add_argument("--device",choices=("auto","cuda","cpu"),default="auto")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--ctx", type=int, default=2048)
@@ -65,6 +67,8 @@ def arguments():
                         help="total prediction horizon including the normal next-token head")
     parser.add_argument("--mtp-loss-weight",type=float,default=0.3,
                         help="weight for each auxiliary future-token loss")
+    parser.add_argument("--mtp-loss-warmup-tokens",type=int,default=100_000_000,
+                        help="linearly introduce the MTP auxiliary loss")
     parser.add_argument("--val-every", type=int, default=100_000_000)
     parser.add_argument("--checkpoint-every", type=int, default=500_000_000)
     parser.add_argument("--val-batches", type=int, default=8)
@@ -81,14 +85,16 @@ def qat_config(args):
     return {**arm_qat.contract(args.ffn_act_qat,args.ffn_weight_dtype),
             "ffn_act_warmup_tokens":args.ffn_act_warmup_tokens,
             "training_amp_dtype":args.amp_dtype,"parameter_dtype":"float32",
-            "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight}
+            "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight,
+            "mtp_loss_warmup_tokens":args.mtp_loss_warmup_tokens}
 
 
 def training_contract(args):
     return {"ctx":args.ctx,"micro_batch":args.micro_batch,"accum":args.accum,
             "seed":args.seed,"qat":arm_qat.checkpoint_contract(qat_config(args)),
             "ffn_act_warmup_tokens":args.ffn_act_warmup_tokens,"amp_dtype":args.amp_dtype,
-            "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight}
+            "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight,
+            "mtp_loss_warmup_tokens":args.mtp_loss_warmup_tokens}
 
 
 def corpus_files(directory):
@@ -140,10 +146,20 @@ def make_model(args, device):
     return model
 
 
-def causal_loss(model,inputs,targets,mtp_loss_weight=0.0):
+def causal_metrics(model,inputs,targets,mtp_loss_weight=0.0):
     hidden, _ = model.trunk(inputs)
-    return model.language_model_loss(hidden,targets,mtp_loss_weight,chunk=2048,
-                                     conditioning_ids=inputs[:,1:])
+    return model.language_model_metrics(hidden,targets,mtp_loss_weight,chunk=2048,
+                                        conditioning_ids=inputs[:,1:])
+
+
+def causal_loss(model,inputs,targets,mtp_loss_weight=0.0):
+    return causal_metrics(model,inputs,targets,mtp_loss_weight)["loss"]
+
+
+def mtp_loss_weight(args,consumed):
+    if args.mtp_horizon==1: return 0.0
+    if args.mtp_loss_warmup_tokens<=0: return args.mtp_loss_weight
+    return args.mtp_loss_weight*min(1.0,max(0.0,consumed/args.mtp_loss_warmup_tokens))
 
 
 def learning_rate(args, consumed):
@@ -197,21 +213,24 @@ def validate(args, model, shards, device):
     packer = make_packer(args, shards, seed=args.seed + 1, workers=max(1, args.workers // 2))
     old_strength=common.FFN_ACT_QAT_STRENGTH
     common.set_ffn_activation_qat_strength(1.0 if args.ffn_act_qat else 0.0); model.eval()
-    total = 0.0
+    totals={"loss":0.0,"base_loss":0.0,"base_accuracy":0.0,
+            "mtp_loss":0.0,"mtp_accuracy":0.0}
     count = 0
     dtype,enabled,_=arm_qat.autocast_and_scaler(device,args.amp_dtype)
     try:
         for _ in range(args.val_batches):
             inputs, targets = packer.next_batch(args.micro_batch)
             with torch.autocast(device.type,dtype=dtype,enabled=enabled):
-                total += float(causal_loss(model,inputs.to(device),targets.to(device),args.mtp_loss_weight))
+                metrics=causal_metrics(model,inputs.to(device),targets.to(device),
+                                       args.mtp_loss_weight)
+                for key in totals: totals[key]+=float(metrics[key])
             count += 1
     except StopIteration:
         pass
     finally:
         packer.close()
         model.train(); common.set_ffn_activation_qat_strength(old_strength)
-    return total / max(1, count)
+    return {key:value/max(1,count) for key,value in totals.items()}
 
 
 def run_scan(args, files, identity):
@@ -264,7 +283,9 @@ def run_benchmark(args, train_shards, device):
         optimizer.zero_grad(set_to_none=True)
         common.set_ffn_activation_qat_strength(1.0 if args.ffn_act_qat else 0.0)
         with torch.autocast(device.type,dtype=amp_dtype,enabled=amp_enabled):
-            loss=causal_loss(model,inputs.to(device),targets.to(device),args.mtp_loss_weight)
+            metrics=causal_metrics(model,inputs.to(device),targets.to(device),
+                                   mtp_loss_weight(args,step*args.micro_batch*args.ctx))
+            loss=metrics["loss"]
         scaler.scale(loss).backward(); scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer); scaler.update()
@@ -275,7 +296,8 @@ def run_benchmark(args, train_shards, device):
             samples.append((input_seconds, compute_seconds))
         print(
             f"step={step} input={input_seconds:.3f}s compute={compute_seconds:.3f}s "
-            f"loss={loss.item():.4f}", flush=True,
+            f"loss={loss.item():.4f} base={metrics['base_loss'].item():.4f} "
+            f"mtp={metrics['mtp_loss'].item():.4f}", flush=True,
         )
     packer.close()
     input_total = sum(item[0] for item in samples)
@@ -307,6 +329,15 @@ def run_train(args, train_shards, val_shards, identity, device):
     )
     update = consumed = 0
     amp_dtype,amp_enabled,scaler=arm_qat.autocast_and_scaler(device,args.amp_dtype)
+    if args.init_checkpoint:
+        initial=torch.load(args.init_checkpoint,map_location=device,weights_only=False)
+        initial_cfg=initial.get("cfg",{})
+        for key,expected in (("mtp_horizon",args.mtp_horizon),
+                             ("ffn_weight_dtype",args.ffn_weight_dtype)):
+            if key in initial_cfg and initial_cfg[key]!=expected:
+                raise SystemExit(f"initial checkpoint {key}={initial_cfg[key]!r}, requested {expected!r}")
+        model.load_state_dict(initial["model"],strict=True); common.requant(model)
+        print(f"warm-started model from {args.init_checkpoint}; optimizer and data start fresh")
     if args.resume:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         if saved["corpus_sha256"] != identity["sha256"]:
@@ -339,16 +370,22 @@ def run_train(args, train_shards, val_shards, identity, device):
         common.set_ffn_activation_qat_strength(arm_qat.activation_qat_strength(
             consumed,args.ffn_act_warmup_tokens,args.ffn_act_qat))
         optimizer.zero_grad(set_to_none=True)
-        loss_sum = 0.0
+        metric_sums={key:0.0 for key in ("loss","base_loss","base_accuracy",
+                                         "mtp_loss","mtp_accuracy")}
         actual_accum = 0
+        current_mtp_weight=mtp_loss_weight(args,consumed)
         try:
             for _ in range(args.accum):
                 if consumed + (actual_accum + 1) * args.micro_batch * args.ctx > args.max_tokens:
                     break
                 inputs, targets = packer.next_batch(args.micro_batch)
                 with torch.autocast(device.type,dtype=amp_dtype,enabled=amp_enabled):
-                    loss=causal_loss(model,inputs.to(device),targets.to(device),args.mtp_loss_weight)/args.accum
-                scaler.scale(loss).backward(); loss_sum += float(loss.detach()) * args.accum; actual_accum += 1
+                    batch_metrics=causal_metrics(model,inputs.to(device),targets.to(device),
+                                                 current_mtp_weight)
+                    loss=batch_metrics["loss"]/args.accum
+                scaler.scale(loss).backward()
+                for key in metric_sums: metric_sums[key]+=float(batch_metrics[key].detach())
+                actual_accum += 1
         except StopIteration:
             if not actual_accum:
                 break
@@ -382,7 +419,9 @@ def run_train(args, train_shards, val_shards, identity, device):
                 stream.write(json.dumps(diagnostic) + "\n")
         elapsed = time.time() - started
         metrics = {
-            "update": update, "tokens": consumed, "loss": loss_sum / actual_accum,
+            "update": update, "tokens": consumed,
+            **{key:value/actual_accum for key,value in metric_sums.items()},
+            "mtp_loss_weight":current_mtp_weight,
             "lr": lr, "tokens_per_second": max(0, consumed - (0 if not args.resume else saved["consumed_tokens"])) / elapsed,
             "elapsed_seconds": elapsed,
             "peak_vram_gib": torch.cuda.max_memory_allocated() / 2**30 if device.type=="cuda" else 0.0,
@@ -393,7 +432,8 @@ def run_train(args, train_shards, val_shards, identity, device):
             stream.write(json.dumps(metrics) + "\n")
         print(json.dumps(metrics), flush=True)
         if consumed >= next_val:
-            print(json.dumps({"tokens": consumed, "validation_loss": validate(args, model, val_shards, device)}), flush=True)
+            print(json.dumps({"tokens":consumed,"validation":validate(
+                args,model,val_shards,device)}),flush=True)
             next_val += args.val_every
         if consumed >= next_checkpoint:
             path = args.out / "checkpoints" / f"tokens-{consumed:012d}.pt"
@@ -415,8 +455,10 @@ def run_train(args, train_shards, val_shards, identity, device):
 
 def main():
     args = arguments()
+    if args.resume and args.init_checkpoint: raise SystemExit("--resume and --init-checkpoint are mutually exclusive")
     if args.ffn_act_warmup_tokens<0: raise SystemExit("--ffn-act-warmup-tokens must be nonnegative")
     if args.mtp_loss_weight<0: raise SystemExit("--mtp-loss-weight must be nonnegative")
+    if args.mtp_loss_warmup_tokens<0: raise SystemExit("--mtp-loss-warmup-tokens must be nonnegative")
     if args.device=="cuda" and not torch.cuda.is_available(): raise SystemExit("CUDA is unavailable")
     files = corpus_files(args.data)
     identity = corpus_identity(files, args.tokenizer, args.remap, args.seed)

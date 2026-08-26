@@ -11,11 +11,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from finetune.modeling.weight_formats import (int4_row_pack,int4_row_unpack,
-                                              ternary_pack,ternary_unpack_compact)
-
-
+import sys
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/"finetune"/"modeling"))
+from weight_formats import (int4_row_pack,int4_row_unpack,ternary_pack,
+                            ternary_unpack_compact)
+from validate_export import validate_export
+
+
 PYTHON=Path("/home/dlisuser/quanwen/SHADOW-250M-Instruct/.venv/bin/python")
 TINY_ENV={"SHADOW_D":"64","SHADOW_NL":"1","SHADOW_NH":"1",
           "SHADOW_NKV":"1","SHADOW_HD":"64","SHADOW_FFNH":"128",
@@ -158,6 +161,8 @@ class TrainingExportIntegrationTest(unittest.TestCase):
                     self.assertEqual(by_name["mtp.up"],(expected_kind,(64,32)))
                     self.assertEqual(by_name["mtp.norm.w"],(0,(64,)))
                     manifest=json.loads(Path(str(shdw)+".a55.json").read_text())
+                    validate_export(shdw,manifest,hidden_size=64)
+                    self.assertEqual(manifest["architecture_version"],2)
                     self.assertEqual(manifest["ffn_weight"]["dtype"],dtype)
                     self.assertEqual(manifest["mtp"]["horizon"],2)
                     self.assertEqual(manifest["mtp"]["auxiliary_heads"],1)
@@ -224,6 +229,7 @@ class TrainingExportIntegrationTest(unittest.TestCase):
             self.assertFalse(any(name.startswith("mtp.") for name,_,_ in records(shdw)))
             manifest=json.loads(Path(str(shdw)+".a55.json").read_text())
             self.assertEqual(manifest["mtp"]["horizon"],1)
+            validate_export(shdw,manifest,hidden_size=64)
 
 
 if __name__=="__main__": unittest.main()
