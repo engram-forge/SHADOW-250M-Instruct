@@ -23,3 +23,15 @@ These generative checks are not substitutes for canonical PIQA or ARC likelihood
 `anti_repetition_prompts.json`. The final retained anti-repetition model results, training
 recipe, qualification gates, and artifact hashes are consolidated in
 `anti_repetition_report.md`; intermediate experiment reports are not retained.
+
+`decode_bench.py` measures native autoregressive decode throughput. It uses each assistant
+turn's preceding conversation as the prompt and its token length as the generation budget.
+The kernel's `--bench` timing excludes model loading and prompt prefill. On WSL, keep the
+repository on a mounted Windows drive so Windows interop can execute the bundled `.exe`:
+
+    cd /mnt/c/src/SHADOW-250M-Instruct
+    python benchmarks/decode_bench.py --threads 8 --limit 50 \
+      --out benchmarks/decode_windows.json
+
+Use `--limit 0` for all assistant turns and `--max-tokens` to control the maximum decode
+length. Run the same command with `--kernel deployment/bin/linux/shadow` for a Linux binary.
