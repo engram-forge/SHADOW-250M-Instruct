@@ -13,6 +13,21 @@ int main() {
     std::array<std::uint8_t, 64> a{}, b{}; b[0] = 0xff; b[63] = 3;
     assert(shadowrt::popcount_xor(a, b) == 10);
 
+    // Runtime batch-4 API must exactly match four ordinary RVQ calls.
+    shadowrt::Tensor rvq; rvq.name="test.rvq"; rvq.kind=shadowrt::WeightKind::rvq;
+    rvq.in=4; rvq.out=64; rvq.padded_out=64; rvq.group=4; rvq.stages=1;
+    rvq.bytes.resize(4*16*sizeof(float)+32); rvq.scales.assign(64,1.0f);
+    auto* codebook=reinterpret_cast<float*>(rvq.bytes.data());
+    for(std::size_t i=0;i<4*16;++i)codebook[i]=static_cast<float>(static_cast<int>(i%9)-4)/8.0f;
+    for(std::size_t i=4*16*sizeof(float);i<rvq.bytes.size();++i)rvq.bytes[i]=static_cast<std::uint8_t>(i*13);
+    std::array<float,16> batch_input{};for(std::size_t i=0;i<batch_input.size();++i)batch_input[i]=static_cast<float>(i-7)/5.0f;
+    std::array<float,256> batch_output{},sequential_output{};
+    rvq.matvec_batch4_into(batch_input,batch_output);
+    for(std::size_t token=0;token<4;++token)rvq.matvec_into(
+        std::span<const float>(batch_input).subspan(token*4,4),
+        std::span<float>(sequential_output).subspan(token*64,64));
+    assert(std::memcmp(batch_output.data(),sequential_output.data(),sizeof(batch_output))==0);
+
     const auto archive = std::filesystem::temp_directory_path() / "shadow-native-test.shkv";
     shadowrt::ArchiveHeader header{};
     std::memcpy(header.magic, "SHARKV1", 7);

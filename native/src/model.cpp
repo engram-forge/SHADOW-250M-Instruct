@@ -954,6 +954,72 @@ void Tensor::matvec_batch4_into(std::span<const float> x,
                                 std::span<float> y) const {
   if (x.size() != 4 * in || y.size() != 4 * out)
     throw std::runtime_error(name + " batch4 matvec shape mismatch");
+  if (kind == WeightKind::rvq) {
+    const auto started = active_profile ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+    const std::size_t groups = in / group, chunks = padded_out / 64;
+    const auto *codebook = reinterpret_cast<const float *>(bytes.data());
+    const std::size_t codebook_floats = static_cast<std::size_t>(stages) * group * 16;
+    const auto *indices = bytes.data() + codebook_floats * sizeof(float);
+    const std::size_t lookup_size = static_cast<std::size_t>(stages) * groups * 16;
+    thread_local std::vector<float> batch_lookup_storage;
+    batch_lookup_storage.resize(4 * lookup_size);
+    float *const lookup = batch_lookup_storage.data();
+    for (std::size_t stage = 0; stage < stages; ++stage)
+      for (std::size_t g = 0; g < groups; ++g) {
+#if defined(__aarch64__)
+        float32x4_t sums[4][4];
+        for (auto &token_sums : sums)
+          for (auto &sum : token_sums) sum = vdupq_n_f32(0);
+        for (std::size_t column = 0; column < group; ++column) {
+          const float *codes = codebook + (stage * group + column) * 16;
+          const float32x4_t weights[4] = {vld1q_f32(codes), vld1q_f32(codes + 4),
+                                         vld1q_f32(codes + 8), vld1q_f32(codes + 12)};
+          for (std::size_t token = 0; token < 4; ++token)
+            for (std::size_t lane = 0; lane < 4; ++lane)
+              sums[token][lane] = vfmaq_n_f32(
+                  sums[token][lane], weights[lane],
+                  x[token * in + g * group + column]);
+        }
+        for (std::size_t token = 0; token < 4; ++token)
+          for (std::size_t lane = 0; lane < 4; ++lane)
+            vst1q_f32(lookup + token * lookup_size +
+                          (stage * groups + g) * 16 + lane * 4,
+                      sums[token][lane]);
+#else
+        for (std::size_t token = 0; token < 4; ++token)
+          for (std::size_t code = 0; code < 16; ++code) {
+            float sum = 0;
+            for (std::size_t column = 0; column < group; ++column)
+              sum += x[token * in + g * group + column] *
+                     codebook[(stage * group + column) * 16 + code];
+            lookup[token * lookup_size + (stage * groups + g) * 16 + code] = sum;
+          }
+#endif
+      }
+    parallel_rows(out, [&](std::size_t begin, std::size_t end) {
+      for (std::size_t row = begin; row < end; ++row) {
+        float sums[4]{};
+        const std::size_t chunk = row / 64, half = (row % 64) / 32, lane = row % 32;
+        for (std::size_t stage = 0; stage < stages; ++stage)
+          for (std::size_t g = 0; g < groups; ++g) {
+            const auto packed = indices[((stage * chunks + chunk) * groups + g) * 32 + lane];
+            const std::size_t code = half ? packed >> 4 : packed & 15;
+            for (std::size_t token = 0; token < 4; ++token)
+              sums[token] += lookup[token * lookup_size +
+                                    (stage * groups + g) * 16 + code];
+          }
+        for (std::size_t token = 0; token < 4; ++token)
+          y[token * out + row] = sums[token] * scales[row];
+      }
+    });
+    if (active_profile) {
+      active_profile->rvq += std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - started).count();
+      active_profile->rvq_calls += 4;
+    }
+    return;
+  }
   if (kind != WeightKind::ternary3 || ternary_reference_enabled()) {
     for (std::size_t token = 0; token < 4; ++token)
       matvec_into(x.subspan(token * in, in), y.subspan(token * out, out));
