@@ -274,6 +274,16 @@ bool fast_logits_enabled() {
   return enabled;
 }
 
+void silu_inplace(std::span<float> values) {
+  for (float &value : values)
+    value = value / (1.0f + std::exp(-value));
+}
+
+void silu_multiply_inplace(std::span<float> values, std::span<const float> gate) {
+  for (std::size_t i = 0; i < values.size(); ++i)
+    values[i] *= gate[i] / (1.0f + std::exp(-gate[i]));
+}
+
 std::size_t ternary3_offset(std::size_t row, std::size_t block,
                             std::size_t stride) {
   return ((row / 8) * stride + block) * 8 + row % 8;
@@ -560,7 +570,9 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
       for (; r + 16 <= end; r += 16) {
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
                     b0 = vdupq_n_f32(0), b1 = vdupq_n_f32(0);
+#if defined(__clang__)
 #pragma clang loop unroll_count(2)
+#endif
         for (std::size_t column = 0; column < in; ++column) {
           const int8x16_t codes = unpack_ternary_nibbles(
               expanded_weights + ternary_nibble_offset(r, column, in));
@@ -688,7 +700,10 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
     // Every row selects one of the same 16 codebook vectors for each input
     // group. Compute those 16 dot products once, then rows only perform
     // byte decode and lookup. This is the essential compressed RVQ kernel.
-    std::vector<float> lookup(static_cast<std::size_t>(stages) * G * 16);
+    thread_local std::vector<float> lookup_storage;
+    const std::size_t lookup_size = static_cast<std::size_t>(stages) * G * 16;
+    lookup_storage.resize(lookup_size);
+    std::span<float> lookup(lookup_storage.data(), lookup_size);
     for (std::size_t stage = 0; stage < stages; ++stage)
       for (std::size_t g = 0; g < G; ++g) {
 #if defined(__aarch64__)
@@ -821,7 +836,9 @@ void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
                   a3 = vdupq_n_f32(0);
       float32x4_t b0 = vdupq_n_f32(0), b1 = vdupq_n_f32(0), b2 = vdupq_n_f32(0),
                   b3 = vdupq_n_f32(0);
+#if defined(__clang__)
 #pragma clang loop unroll_count(2)
+#endif
       for (std::size_t column = 0; column < in; ++column) {
         const int8x16_t ca = unpack_ternary_nibbles(
             ternary_nibbles.data() + ternary_nibble_offset(base, column, in));
@@ -932,6 +949,263 @@ void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
     active_profile->ternary_calls += 2;
   }
 }
+
+void Tensor::matvec_batch4_into(std::span<const float> x,
+                                std::span<float> y) const {
+  if (x.size() != 4 * in || y.size() != 4 * out)
+    throw std::runtime_error(name + " batch4 matvec shape mismatch");
+  if (kind != WeightKind::ternary3 || ternary_reference_enabled()) {
+    for (std::size_t token = 0; token < 4; ++token)
+      matvec_into(x.subspan(token * in, in), y.subspan(token * out, out));
+    return;
+  }
+  const auto started = active_profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+  std::fill(y.begin(), y.end(), 0.0f);
+  parallel_rows(out, [&](std::size_t begin, std::size_t end) {
+    std::size_t row = begin;
+    for (; row < end && row % 16 != 0; ++row) {
+      for (std::size_t token = 0; token < 4; ++token) {
+        float sum = 0.0f;
+        const std::size_t stride = (in + 4) / 5;
+        for (std::size_t column = 0; column < in; ++column) {
+          const auto &codes = ternary3_table()[
+              bytes[ternary3_offset(row, column / 5, stride)]];
+          sum += x[token * in + column] * codes[column % 5];
+        }
+        y[token * out + row] = sum * scales[row];
+      }
+    }
+#if defined(__aarch64__)
+    for (; row + 16 <= end; row += 16) {
+      float32x4_t sums[4][4];
+      for (auto &token_sums : sums)
+        for (auto &sum : token_sums) sum = vdupq_n_f32(0);
+#if defined(__clang__)
+#pragma clang loop unroll_count(2)
+#endif
+      for (std::size_t column = 0; column < in; ++column) {
+        const int8x16_t codes = unpack_ternary_nibbles(
+            ternary_nibbles.data() + ternary_nibble_offset(row, column, in));
+        const int16x8_t lo = vmovl_s8(vget_low_s8(codes));
+        const int16x8_t hi = vmovl_s8(vget_high_s8(codes));
+        const float32x4_t weights[4] = {
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)))};
+        for (std::size_t token = 0; token < 4; ++token)
+          for (std::size_t lane = 0; lane < 4; ++lane)
+            sums[token][lane] = vfmaq_n_f32(
+                sums[token][lane], weights[lane], x[token * in + column]);
+      }
+      for (std::size_t token = 0; token < 4; ++token) {
+        float raw[16];
+        for (std::size_t lane = 0; lane < 4; ++lane)
+          vst1q_f32(raw + lane * 4, sums[token][lane]);
+        for (std::size_t lane = 0; lane < 16; ++lane)
+          y[token * out + row + lane] = raw[lane] * scales[row + lane];
+      }
+    }
+#endif
+    for (; row < end; ++row) {
+      const std::size_t stride = (in + 4) / 5;
+      for (std::size_t token = 0; token < 4; ++token) {
+        float sum = 0.0f;
+        for (std::size_t column = 0; column < in; ++column) {
+          const auto &codes = ternary3_table()[
+              bytes[ternary3_offset(row, column / 5, stride)]];
+          sum += x[token * in + column] * codes[column % 5];
+        }
+        y[token * out + row] = sum * scales[row];
+      }
+    }
+  });
+  if (active_profile) {
+    active_profile->ternary += std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - started)
+                                   .count();
+    active_profile->ternary_calls += 4;
+  }
+}
+
+#if 0 // rejected scheduling experiments; results live in the benchmark report
+/* Rejected K/V shared-dispatch experiment retained only in benchmark records.
+void Tensor::rvq_pair_into(const Tensor &other, std::span<const float> x,
+                           std::span<float> y, std::span<float> other_y) const {
+  if (kind != WeightKind::rvq || other.kind != WeightKind::rvq ||
+      in != other.in || out != other.out || group != other.group ||
+      stages != other.stages || x.size() != in || y.size() != out ||
+      other_y.size() != other.out) {
+    matvec_into(x, y); other.matvec_into(x, other_y); return;
+  }
+  const auto started = active_profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+  const std::size_t groups=in/group, lookup_size=static_cast<std::size_t>(stages)*groups*16;
+  thread_local std::vector<float> pair_lookup_storage;
+  pair_lookup_storage.resize(lookup_size*2);
+  float *const pair_lookup = pair_lookup_storage.data();
+  const Tensor* weights[2]={this,&other};
+  std::span<float> outputs[2]={y,other_y};
+  for(std::size_t matrix=0;matrix<2;++matrix){
+    const auto* codebook=reinterpret_cast<const float*>(weights[matrix]->bytes.data());
+    float* lookup=pair_lookup+matrix*lookup_size;
+    for(std::size_t stage=0;stage<stages;++stage)for(std::size_t g=0;g<groups;++g){
+#if defined(__aarch64__)
+      float32x4_t a=vdupq_n_f32(0),b=vdupq_n_f32(0),c=vdupq_n_f32(0),d=vdupq_n_f32(0);
+      for(std::size_t j=0;j<group;++j){const float* codes=codebook+(stage*group+j)*16;const float value=x[g*group+j];a=vfmaq_n_f32(a,vld1q_f32(codes),value);b=vfmaq_n_f32(b,vld1q_f32(codes+4),value);c=vfmaq_n_f32(c,vld1q_f32(codes+8),value);d=vfmaq_n_f32(d,vld1q_f32(codes+12),value);}
+      float* dst=lookup+(stage*groups+g)*16;vst1q_f32(dst,a);vst1q_f32(dst+4,b);vst1q_f32(dst+8,c);vst1q_f32(dst+12,d);
+#else
+      for(std::size_t code=0;code<16;++code){float sum=0;for(std::size_t j=0;j<group;++j)sum+=x[g*group+j]*codebook[(stage*group+j)*16+code];lookup[(stage*groups+g)*16+code]=sum;}
+#endif
+    }
+  }
+  parallel_rows(out,[&](std::size_t begin,std::size_t end){
+    for(std::size_t matrix=0;matrix<2;++matrix){
+      const Tensor& weight=*weights[matrix];auto output=outputs[matrix];
+      const std::size_t chunks=weight.padded_out/64,cb_floats=static_cast<std::size_t>(stages)*group*16;
+      const auto* indices=weight.bytes.data()+cb_floats*sizeof(float);const float* lookup=pair_lookup+matrix*lookup_size;
+      std::size_t row=begin;
+      for(;row<end&&row%8;++row){const std::size_t chunk=row/64,half=(row%64)/32,lane=row%32;float sum=0;for(std::size_t stage=0;stage<stages;++stage)for(std::size_t g=0;g<groups;++g){const auto packed=indices[((stage*chunks+chunk)*groups+g)*32+lane];sum+=lookup[(stage*groups+g)*16+(half?packed>>4:packed&15)];}output[row]=sum*weight.scales[row];}
+      for(;row+8<=end;row+=8){float sums[8]{};for(std::size_t stage=0;stage<stages;++stage)for(std::size_t g=0;g<groups;++g){const float* values=lookup+(stage*groups+g)*16;for(std::size_t lane=0;lane<8;++lane){const std::size_t current=row+lane,chunk=current/64,packed_row=current%32;const auto packed=indices[((stage*chunks+chunk)*groups+g)*32+packed_row];sums[lane]+=values[(current%64)>=32?packed>>4:packed&15];}}for(std::size_t lane=0;lane<8;++lane)output[row+lane]=sums[lane]*weight.scales[row+lane];}
+      for(;row<end;++row){const std::size_t chunk=row/64,half=(row%64)/32,lane=row%32;float sum=0;for(std::size_t stage=0;stage<stages;++stage)for(std::size_t g=0;g<groups;++g){const auto packed=indices[((stage*chunks+chunk)*groups+g)*32+lane];sum+=lookup[(stage*groups+g)*16+(half?packed>>4:packed&15)];}output[row]=sum*weight.scales[row];}
+    }
+  });
+  if(active_profile){active_profile->rvq+=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();active_profile->rvq_calls+=2;}
+}
+*/
+
+/* Rejected Q/K/V shared-dispatch experiment removed after paired benchmarking. */
+void Tensor::matvec_triple_into(const Tensor &second, const Tensor &third,
+                                std::span<const float> x, std::span<float> y,
+                                std::span<float> second_y,
+                                std::span<float> third_y) const {
+  const Tensor *weights[3] = {this, &second, &third};
+  std::span<float> outputs[3] = {y, second_y, third_y};
+  bool compatible = x.size() == in;
+  for (std::size_t matrix = 0; matrix < 3; ++matrix)
+    compatible = compatible && weights[matrix]->kind == WeightKind::rvq &&
+                 weights[matrix]->in == in &&
+                 outputs[matrix].size() == weights[matrix]->out;
+  if (!compatible) {
+    matvec_into(x, y);
+    second.matvec_into(x, second_y);
+    third.matvec_into(x, third_y);
+    return;
+  }
+
+  const auto started = active_profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+  std::size_t lookup_offsets[3]{}, lookup_total = 0;
+  for (std::size_t matrix = 0; matrix < 3; ++matrix) {
+    lookup_offsets[matrix] = lookup_total;
+    lookup_total += static_cast<std::size_t>(weights[matrix]->stages) *
+                    (in / weights[matrix]->group) * 16;
+    std::fill(outputs[matrix].begin(), outputs[matrix].end(), 0.0f);
+  }
+  thread_local std::vector<float> triple_lookup_storage;
+  triple_lookup_storage.resize(lookup_total);
+  float *const triple_lookup = triple_lookup_storage.data();
+
+  for (std::size_t matrix = 0; matrix < 3; ++matrix) {
+    const Tensor &weight = *weights[matrix];
+    const std::size_t groups = in / weight.group;
+    const auto *codebook = reinterpret_cast<const float *>(weight.bytes.data());
+    float *lookup = triple_lookup + lookup_offsets[matrix];
+    for (std::size_t stage = 0; stage < weight.stages; ++stage)
+      for (std::size_t group_index = 0; group_index < groups; ++group_index) {
+#if defined(__aarch64__)
+        float32x4_t a = vdupq_n_f32(0), b = vdupq_n_f32(0);
+        float32x4_t c = vdupq_n_f32(0), d = vdupq_n_f32(0);
+        for (std::size_t column = 0; column < weight.group; ++column) {
+          const float *codes =
+              codebook + (stage * weight.group + column) * 16;
+          const float value = x[group_index * weight.group + column];
+          a = vfmaq_n_f32(a, vld1q_f32(codes), value);
+          b = vfmaq_n_f32(b, vld1q_f32(codes + 4), value);
+          c = vfmaq_n_f32(c, vld1q_f32(codes + 8), value);
+          d = vfmaq_n_f32(d, vld1q_f32(codes + 12), value);
+        }
+        float *destination = lookup + (stage * groups + group_index) * 16;
+        vst1q_f32(destination, a); vst1q_f32(destination + 4, b);
+        vst1q_f32(destination + 8, c); vst1q_f32(destination + 12, d);
+#else
+        for (std::size_t code = 0; code < 16; ++code) {
+          float sum = 0;
+          for (std::size_t column = 0; column < weight.group; ++column)
+            sum += x[group_index * weight.group + column] *
+                   codebook[(stage * weight.group + column) * 16 + code];
+          lookup[(stage * groups + group_index) * 16 + code] = sum;
+        }
+#endif
+      }
+  }
+
+  const std::size_t offsets[4] = {0, y.size(), y.size() + second_y.size(),
+                                  y.size() + second_y.size() + third_y.size()};
+  parallel_rows(offsets[3], [&](std::size_t begin, std::size_t end) {
+    for (std::size_t matrix = 0; matrix < 3; ++matrix) {
+      const std::size_t local_begin = begin > offsets[matrix]
+                                          ? begin - offsets[matrix] : 0;
+      const std::size_t local_end =
+          std::min(end, offsets[matrix + 1]) > offsets[matrix]
+              ? std::min(end, offsets[matrix + 1]) - offsets[matrix] : 0;
+      if (local_begin >= local_end) continue;
+      const Tensor &weight = *weights[matrix];
+      const std::size_t groups = in / weight.group, chunks = weight.padded_out / 64;
+      const std::size_t codebook_floats =
+          static_cast<std::size_t>(weight.stages) * weight.group * 16;
+      const auto *indices = weight.bytes.data() + codebook_floats * sizeof(float);
+      const float *lookup = triple_lookup + lookup_offsets[matrix];
+      auto output = outputs[matrix];
+      std::size_t row = local_begin;
+      for (; row < local_end && row % 8; ++row) {
+        const std::size_t chunk = row / 64, half = (row % 64) / 32, lane = row % 32;
+        float sum = 0;
+        for (std::size_t stage = 0; stage < weight.stages; ++stage)
+          for (std::size_t group_index = 0; group_index < groups; ++group_index) {
+            const auto packed = indices[((stage * chunks + chunk) * groups + group_index) * 32 + lane];
+            sum += lookup[(stage * groups + group_index) * 16 +
+                          (half ? packed >> 4 : packed & 15)];
+          }
+        output[row] = sum * weight.scales[row];
+      }
+      for (; row + 8 <= local_end; row += 8) {
+        float sums[8]{};
+        for (std::size_t stage = 0; stage < weight.stages; ++stage)
+          for (std::size_t group_index = 0; group_index < groups; ++group_index) {
+            const float *values = lookup + (stage * groups + group_index) * 16;
+            for (std::size_t lane = 0; lane < 8; ++lane) {
+              const std::size_t current = row + lane, chunk = current / 64;
+              const std::size_t packed_row = current % 32;
+              const auto packed = indices[((stage * chunks + chunk) * groups + group_index) * 32 + packed_row];
+              sums[lane] += values[(current % 64) >= 32 ? packed >> 4 : packed & 15];
+            }
+          }
+        for (std::size_t lane = 0; lane < 8; ++lane)
+          output[row + lane] = sums[lane] * weight.scales[row + lane];
+      }
+      for (; row < local_end; ++row) {
+        const std::size_t chunk = row / 64, half = (row % 64) / 32, lane = row % 32;
+        float sum = 0;
+        for (std::size_t stage = 0; stage < weight.stages; ++stage)
+          for (std::size_t group_index = 0; group_index < groups; ++group_index) {
+            const auto packed = indices[((stage * chunks + chunk) * groups + group_index) * 32 + lane];
+            sum += lookup[(stage * groups + group_index) * 16 +
+                          (half ? packed >> 4 : packed & 15)];
+          }
+        output[row] = sum * weight.scales[row];
+      }
+    }
+  });
+  if (active_profile) {
+    active_profile->rvq += std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started).count();
+    active_profile->rvq_calls += 3;
+  }
+}
+#endif
+
 
 ModelFile::ModelFile(const std::filesystem::path &path) : path_(path) {
   std::ifstream in(path, std::ios::binary);
@@ -1295,16 +1569,10 @@ void FingerprintTable::logits_into(std::span<const float> projected,
        bias.bytes.size() != result.size() * sizeof(std::uint16_t)))
     throw std::runtime_error("unsupported logits bias");
   const auto dense = bias.kind == WeightKind::dense_f32
-                         ? bias.dense_f32()
-                         : std::span<const float>{};
-  const auto *half =
-      bias.kind == WeightKind::dense_f16
-          ? reinterpret_cast<const std::uint16_t *>(bias.bytes.data())
-          : nullptr;
-  struct Candidate {
-    float value;
-    std::size_t index;
-  };
+                         ? bias.dense_f32() : std::span<const float>{};
+  const auto *half = bias.kind == WeightKind::dense_f16
+      ? reinterpret_cast<const std::uint16_t *>(bias.bytes.data()) : nullptr;
+  struct Candidate { float value; std::size_t index; };
   std::array<Candidate, 32> candidates{};
   std::atomic<std::size_t> candidate_count{0};
   parallel_rows(result.size(), [&](std::size_t begin, std::size_t end) {
@@ -1312,14 +1580,9 @@ void FingerprintTable::logits_into(std::span<const float> projected,
     std::size_t local_index = begin;
     for (std::size_t i = begin; i < end; ++i) {
       result[i] += half ? half_to_float(half[i]) : dense[i];
-      if (argmax && result[i] > local_peak) {
-        local_peak = result[i];
-        local_index = i;
-      }
+      if (argmax && result[i] > local_peak) { local_peak=result[i]; local_index=i; }
     }
-    if (argmax)
-      candidates[candidate_count.fetch_add(1, std::memory_order_relaxed)] = {
-          local_peak, local_index};
+    if (argmax) candidates[candidate_count.fetch_add(1,std::memory_order_relaxed)]={local_peak,local_index};
   });
   if (argmax) {
     Candidate best{-std::numeric_limits<float>::infinity(), 0};
@@ -1585,8 +1848,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       if (options.trace && layer == 0)
         std::cerr << "TRACE l0ffnraw up " << up[0] << ' ' << up[1] << " gt "
                   << gt[0] << ' ' << gt[1] << '\n';
-      for (std::size_t i = 0; i < up.size(); ++i)
-        up[i] *= gt[i] / (1.0f + std::exp(-gt[i]));
+      silu_multiply_inplace(up, gt);
       w.dn->matvec_into(up, s.down);
       auto &down = s.down;
       add_inplace(x, down);
@@ -1628,8 +1890,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
     std::copy(recalled.begin(), recalled.end(), joined.begin() + D);
     impl_->step_cin->matvec_into(joined, s.hidden);
     auto &hidden = s.hidden;
-    for (float &value : hidden)
-      value = value / (1.0f + std::exp(-value));
+    silu_inplace(hidden);
     impl_->step_cout->matvec_into(hidden, s.structural);
     auto &structural = s.structural;
     add_inplace(x, structural);

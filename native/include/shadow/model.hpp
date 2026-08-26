@@ -32,6 +32,8 @@ struct Tensor {
   void matvec_into(std::span<const float> x, std::span<float> y) const;
   void matvec_pair_into(const Tensor &other, std::span<const float> x,
                         std::span<float> y, std::span<float> other_y) const;
+  void matvec_batch4_into(std::span<const float> x,
+                          std::span<float> y) const;
   std::span<const float> dense_f32() const;
 };
 
