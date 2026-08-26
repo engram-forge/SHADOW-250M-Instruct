@@ -336,6 +336,16 @@ as two independent optimized kernels measured 113.83 tok/s; its lower register
 pressure did not repay the extra complete weight traversal and dispatch. All
 experiments were removed, retaining the paired nibble kernel unchanged.
 
+The single-matrix `dn` kernel was audited next. Increasing Clang's inner-loop
+unroll from two to four reduced a four-thread median from 106.68 to 101.50
+tok/s; disabling unrolling measured 106.43 tok/s with worse spread. A 32-row
+tile that shared each activation load across two adjacent 16-row weight blocks
+was bitwise exact on pirate cases 001--003 and initially measured 111.17 tok/s.
+However, a serial same-binary alternating control reduced the apparent gain to
+108.75 versus 107.37 tok/s (+1.3%), inside observed WSL variance. The 32-row
+path and its temporary control were therefore removed. The original 16-row,
+two-way-unrolled nibble kernel remains active.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
