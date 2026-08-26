@@ -328,6 +328,14 @@ time at every thread count. The next decode kernel work therefore targets the
 single-token paired `up`/`gt` path first, followed by `dn`. These are WSL
 diagnostic shares; the H618 profile remains authoritative for board tuning.
 
+Three low-memory paired-kernel variations were subsequently rejected. Adding
+software prefetch 16 columns ahead reduced a 10-run four-thread median from
+116.88 to 112.34 tok/s and increased spread. Disabling Clang's forced two-way
+inner-loop unroll fell further to 106.37 tok/s. Finally, executing `up` and `gt`
+as two independent optimized kernels measured 113.83 tok/s; its lower register
+pressure did not repay the extra complete weight traversal and dispatch. All
+experiments were removed, retaining the paired nibble kernel unchanged.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
