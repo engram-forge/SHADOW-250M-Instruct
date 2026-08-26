@@ -227,6 +227,38 @@ table-reconstruction cost larger than the saved scalar indexed loads.
   completes the high-cost operator gates required before implementing the exact
   layer-major causal prefill scheduler.
 
+## Batch-prefill qualification matrix
+
+Prefill and decode are separate performance products and must not be combined
+into one tokens/second number. Prefill reports prompt tokens per second and
+time-to-first-token (TTFT); decode reports generated tokens per second after the
+prompt. Decode is a regression control because batch-4 is never used for a
+single generated token. All comparisons use identical token IDs, sampling
+options, thread count, warmups, and measured-run count.
+
+| Suite | Prompt tokens | Generated tokens | Threads | Primary metrics | Purpose |
+| --- | ---: | ---: | ---: | --- | --- |
+| Operator ternary | 4 vectors | 0 | 1 | us/batch, bitwise equality | Weight-reuse gate |
+| Operator RVQ | 4 vectors | 0 | 1 | us/batch, bitwise equality | Index/codebook gate |
+| Short prefill | 4 | 1 | 1/2/4 | TTFT, prefill tok/s | Batch boundary |
+| Interactive prefill | 16 | 1 | 1/2/4 | median/p05/p95 TTFT and tok/s | Typical prompt |
+| Medium prefill | 64 | 1 | 1/2/4 | median/p05/p95 TTFT and tok/s, RSS | Stability |
+| Large prefill | 256 | 1 | 1/2/4 | median/p05/p95 TTFT and tok/s, RSS | Sustained/cache behavior |
+| Decode control | 16 | 129 | 1/2/4/8 WSL | median/p05/p95 decode tok/s | No decode regression |
+| Sampling control | 16 | 129 | 4 | output/logit parity, seeded sampling | Preserve general sampling |
+
+Use at least 3 warmups and 20 measured runs for 4/16-token suites, and at least
+3 warmups and 10 measured runs for 64/256-token suites. Report coefficient-like
+spread `(max-min)/median` and retain raw JSON for accepted baseline/candidate
+pairs. WSL results qualify implementation stability only; the same 1/2/4-thread
+matrix must be rerun on the physical H618 with temperature and throttling data.
+
+Current results are operator-only; normal runtime prefill is still sequential.
+Therefore no end-to-end prefill speedup is claimed yet. The accepted operator
+results are: ternary 2.25--2.33x, RVQ row decode about 1.4x, and paired
+`up`/`gt` 2.18--2.47x. Existing decode performance remains the regression
+baseline, not evidence of batch-prefill acceleration.
+
 ## Remaining hardware gates
 
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.

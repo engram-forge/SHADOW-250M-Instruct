@@ -39,9 +39,10 @@ def run_once(args):
     )
     wall = time.perf_counter() - started
     speed = SPEED.search(result.stderr); prefill = PREFILL.search(result.stderr); rss = RSS.search(result.stderr)
-    if not speed or not prefill or not rss:
+    if not prefill or not rss:
         raise RuntimeError(f"cannot parse benchmark output: {result.stderr}")
-    return {"decode_tok_s": float(speed.group(1)), "prefill_s": float(prefill.group(1)),
+    return {"decode_tok_s": float(speed.group(1)) if speed else 0.0,
+            "decode_measured": speed is not None, "prefill_s": float(prefill.group(1)),
             "wall_s": wall, "maximum_rss_kib": int(rss.group(1)),
             "output_tokens": len(result.stdout.split())}
 
@@ -64,6 +65,8 @@ def main():
     speeds = [row["decode_tok_s"] for row in rows]; prefills = [row["prefill_s"] for row in rows]
     rss = [row["maximum_rss_kib"] for row in rows]
     release = platform.freedesktop_os_release()
+    prompt_tokens = len(args.tokens.split())
+    prefill_median = statistics.median(prefills)
     payload = {
         "format": "shadow-linux-arm64-benchmark-v1", "machine": platform.machine(),
         "platform": platform.platform(), "distribution": release.get("PRETTY_NAME"),
@@ -71,12 +74,16 @@ def main():
         "compiler_comment": compiler_note(args.kernel),
         "kernel_sha256": sha256(args.kernel), "model_sha256": sha256(args.model),
         "table_sha256": sha256(args.table), "threads": args.threads,
-        "fast_logits": args.fast_logits, "prompt_tokens": len(args.tokens.split()),
+        "fast_logits": args.fast_logits, "prompt_tokens": prompt_tokens,
         "requested_tokens": args.generate, "warmup": args.warmup, "runs": rows,
+        "decode_measured": all(row["decode_measured"] for row in rows),
         "decode_tok_s_median": statistics.median(speeds),
         "decode_tok_s_p05": percentile(speeds, 0.05), "decode_tok_s_p95": percentile(speeds, 0.95),
-        "decode_tok_s_spread": (max(speeds) - min(speeds)) / statistics.median(speeds),
-        "prefill_s_median": statistics.median(prefills), "prefill_s_p95": percentile(prefills, 0.95),
+        "decode_tok_s_spread": ((max(speeds) - min(speeds)) / statistics.median(speeds)
+                                  if statistics.median(speeds) else 0.0),
+        "prefill_s_median": prefill_median, "prefill_s_p95": percentile(prefills, 0.95),
+        "prefill_tok_s_median": prompt_tokens / prefill_median if prefill_median else 0.0,
+        "time_to_first_token_s_median": prefill_median,
         "maximum_rss_kib_median": statistics.median(rss), "maximum_rss_kib_max": max(rss),
     }
     path = pathlib.Path(args.out); path.parent.mkdir(parents=True, exist_ok=True)

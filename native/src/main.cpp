@@ -117,7 +117,7 @@ int main(int argc, char** argv) try {
         const auto decode_steps = stats.tokens.empty() ? 0 : stats.tokens.size() - 1;
         const double speed = stats.decode_seconds > 0 ? decode_steps / stats.decode_seconds : 0;
         std::cerr << "SHADOW arm64 runtime | SHDW v" << runtime.model_version()
-                  << " | prefill " << std::fixed << std::setprecision(3) << stats.prefill_seconds << "s"
+                  << " | prefill " << std::fixed << std::setprecision(6) << stats.prefill_seconds << "s"
                   << " | decode " << (decode_steps ? std::to_string(speed) + " tok/s" : "n/a (no decode step)") << '\n';
     }
     return 0;
