@@ -12,6 +12,10 @@ finetune/ablation_run_*/
 data/oasst1_raw/
 data/neutral_sft/
 data/dolma/
+pretrain_runs/
 finetune/neutral_candidate_*/
 
 rsync.sh
+kernels/a53/ternary_gemv
+kernels/a55/ternary_dotprod
+kernels/a55/ternary_dotprod.s

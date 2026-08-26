@@ -22,6 +22,10 @@ for _ in range(n):
         pad = (-i) % 5; c5 = np.concatenate([c4, np.ones((o, pad), np.uint8)], 1).reshape(o, -1, 5).astype(np.uint16)
         p5 = (c5[:, :, 0] + 3 * c5[:, :, 1] + 9 * c5[:, :, 2] + 27 * c5[:, :, 3] + 81 * c5[:, :, 4]).astype(np.uint8)
         out.write(struct.pack("<I", 4)); out.write(struct.pack("<II", o, i)); out.write(p5.tobytes()); out.write(rs); tern_out += p5.nbytes
+    elif kind in (4,6):
+        o,i=struct.unpack("<II",f.read(8)); size=o*((i+4)//5 if kind==4 else (i+1)//2)
+        packed=f.read(size); rs=f.read(o*4)
+        out.write(struct.pack("<I",kind)); out.write(struct.pack("<II",o,i)); out.write(packed); out.write(rs)
     else: raise SystemExit(f"unknown kind {kind}")
 out.close()
 import os

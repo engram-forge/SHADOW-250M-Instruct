@@ -23,21 +23,13 @@ def main():
     parser.add_argument("--table", default=str(ROOT / "deployment" / "fp131072.npy")); parser.add_argument("--ctx", type=int, default=2048)
     parser.add_argument("--batches", type=int, default=16); parser.add_argument("--micro-batch", type=int, default=2); parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args(); device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    original_forward = common.RVQ.forward
-    def ternary_forward(module, value):
-        if module.g == 32:
-            weight = module.weight; scale = 1.0 / weight.abs().mean(dim=1, keepdim=True).clamp_(min=1e-5)
-            quantized = weight + ((weight * scale).round().clamp(-1, 1) / scale - weight).detach()
-            return F.linear(value, quantized.to(value.dtype))
-        return original_forward(module, value)
-    common.RVQ.forward = ternary_forward
-    original_encode = common.RVQ.enc
-    def encode(module):
-        if module.g != 32: original_encode(module)
-    common.RVQ.enc = encode
     fp = np.unpackbits(np.load(args.table), axis=1)[:, :512]; cent = torch.tensor(fp.astype(np.float32) * 2 - 1, device=device)
-    model = Shadow250M(cent, F.normalize(cent, dim=-1), cent.shape[0]).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    cfg=checkpoint.get("cfg", {})
+    model=Shadow250M(cent,F.normalize(cent,dim=-1),cent.shape[0],
+                     mtp_horizon=cfg.get("mtp_horizon",1)).to(device)
+    common.set_ffn_qat(cfg.get("ffn_weight_dtype","ternary"),
+                       cfg.get("ffn_act_qat",False),1.0)
     model.load_state_dict({k: v.float() if v.is_floating_point() else v for k,v in checkpoint["model"].items()}); requant(model); model.eval()
     rng = random.Random(args.seed); packer = Packer(args.data, args.ctx, rng, 0.02, recovery_ratio=0.0)
     # Evaluate the full file as a dedicated pool, independent of Packer's fallback split.

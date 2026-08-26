@@ -20,6 +20,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE / "modeling")); sys.path.insert(0, str(ROOT / "shadow_runtime"))
 import numpy as np, torch, torch.nn.functional as F
 import common
+import arm_qat
 from common import requant
 from model_250m import Shadow250M
 from retriever import enc
@@ -33,6 +34,7 @@ def get_args():
     ap.add_argument("--init", default=str(HERE / "shadow250m_instruct.pt"))
     ap.add_argument("--table", default=str(ROOT / "deployment" / "fp131072.npy"))
     ap.add_argument("--out", default="finetuned")
+    ap.add_argument("--device",choices=("auto","cuda","cpu"),default="auto")
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--ctx", type=int, default=2048)
@@ -40,6 +42,7 @@ def get_args():
     ap.add_argument("--accum", type=int, default=8)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--val-batches",type=int,default=4)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ul-alpha", type=float, default=0.2)
@@ -49,6 +52,16 @@ def get_args():
     ap.add_argument("--repeat-policy", choices=("error", "drop", "warn"), default="warn")
     ap.add_argument("--overlength", choices=("error", "truncate"), default="error")
     ap.add_argument("--audit-report")
+    ap.add_argument("--ffn-act-qat", action=argparse.BooleanOptionalAction, default=True,
+                    help="fake-quantize both FFN activation boundaries to per-token INT8")
+    ap.add_argument("--ffn-act-warmup-steps",type=int,default=0,
+                    help="linearly introduce activation QAT over this many optimizer steps")
+    ap.add_argument("--ffn-weight-dtype",choices=("auto","ternary","int4_row"),default="auto",
+                    help="inherit the checkpoint alphabet or explicitly select it")
+    ap.add_argument("--mtp-loss-weight",type=float,default=None,
+                    help="auxiliary loss per future head; defaults to checkpoint value")
+    ap.add_argument("--amp-dtype", choices=("bf16", "fp16", "fp32"), default="bf16",
+                    help="CUDA compute dtype; parameters and AdamW state remain FP32")
     return ap.parse_args()
 
 def build_ids(messages):
@@ -208,24 +221,28 @@ def unlikelihood_pairs(x, y, window=64, ngram=3):
 
 def main():
     a = get_args(); rng = random.Random(a.seed); torch.manual_seed(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if a.device=="cuda" and not torch.cuda.is_available(): raise SystemExit("CUDA is unavailable")
+    dev=torch.device("cuda" if a.device=="cuda" or
+                     (a.device=="auto" and torch.cuda.is_available()) else "cpu")
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    _of = common.RVQ.forward
-    def _tern(s, x):
-        if s.g == 32:
-            w = s.weight; sc = 1.0 / w.abs().mean(dim=1, keepdim=True).clamp_(min=1e-5)
-            return F.linear(x, (w + ((w * sc).round().clamp(-1, 1) / sc - w).detach()).to(x.dtype))
-        return _of(s, x)
-    common.RVQ.forward = _tern
-    _oenc = common.RVQ.enc
-    def _enc2(s):
-        if s.g == 32: return
-        _oenc(s)
-    common.RVQ.enc = _enc2
+    if a.ffn_act_warmup_steps<0: raise SystemExit("--ffn-act-warmup-steps must be nonnegative")
+    if a.val_batches<1: raise SystemExit("--val-batches must be positive")
+    ck = torch.load(a.init, map_location=dev, weights_only=False)
+    mtp_horizon=int(ck.get("cfg",{}).get("mtp_horizon",1))
+    if mtp_horizon not in (1,2): raise SystemExit(f"invalid checkpoint MTP horizon {mtp_horizon}")
+    mtp_loss_weight=(float(ck.get("cfg",{}).get("mtp_loss_weight",0.3))
+                     if a.mtp_loss_weight is None else a.mtp_loss_weight)
+    if mtp_loss_weight<0: raise SystemExit("--mtp-loss-weight must be nonnegative")
+    checkpoint_weight=ck.get("cfg",{}).get("ffn_weight_dtype","ternary")
+    weight_dtype=checkpoint_weight if a.ffn_weight_dtype=="auto" else a.ffn_weight_dtype
+    if a.ffn_weight_dtype!="auto" and "ffn_weight_dtype" in ck.get("cfg",{}) and weight_dtype!=checkpoint_weight:
+        raise SystemExit(f"checkpoint FFN dtype is {checkpoint_weight}, requested {weight_dtype}")
+    initial_strength=arm_qat.activation_qat_strength(0,a.ffn_act_warmup_steps,a.ffn_act_qat)
+    qat_cfg=arm_qat.configure(a.ffn_act_qat,weight_dtype,initial_strength)
+    amp_dtype,amp_enabled,scaler=arm_qat.autocast_and_scaler(dev,a.amp_dtype)
     fp = np.unpackbits(np.load(a.table), axis=1)[:, :512]
     cent = torch.tensor(fp.astype(np.float32) * 2 - 1, device=dev); cent_n = F.normalize(cent, dim=-1)
-    model = Shadow250M(cent, cent_n, cent.shape[0]).to(dev)
-    ck = torch.load(a.init, map_location=dev, weights_only=False)
+    model=Shadow250M(cent,cent_n,cent.shape[0],mtp_horizon=mtp_horizon).to(dev)
     sd = {k: v.float() if v.is_floating_point() else v for k, v in ck["model"].items()}
     model.load_state_dict(sd); requant(model)
     for md in model.modules():
@@ -237,13 +254,9 @@ def main():
                   a.recovery_ratio, a.audit_report, a.val_data)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     def loss_of(x, y, include_ul=True):
-        h, _ = model.trunk(x); ph = model.head(h).float().reshape(-1, 512)
-        yf = y.reshape(-1); v = yf >= 0; ph = ph[v]; yf = yf[v]
-        ce = 0.0
-        for i in range(0, ph.shape[0], 8192):
-            lg = ph[i:i + 8192] @ model.cent_n.T + model.tied_bias
-            ce = ce + F.cross_entropy(lg, yf[i:i + 8192], reduction="sum")
-        mle = ce / max(1, int(v.sum()))
+        h,_=model.trunk(x)
+        mle=model.language_model_loss(h,y,mtp_loss_weight,chunk=8192,
+                                     conditioning_ids=x[:,1:])
         if not include_ul or a.ul_alpha == 0: return mle
         pairs = unlikelihood_pairs(x, y, a.ul_window, a.ul_ngram)
         if not pairs: return mle
@@ -260,32 +273,45 @@ def main():
         return mle + a.ul_alpha * ul
     @torch.no_grad()
     def val():
+        training_strength=common.FFN_ACT_QAT_STRENGTH
+        common.set_ffn_activation_qat_strength(1.0 if a.ffn_act_qat else 0.0)
         model.eval(); tot = 0.0
-        for _ in range(4):
-            x, y = data.pack(a.micro_batch, val=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                tot += float(loss_of(x.to(dev), y.to(dev), include_ul=False))
-        model.train()
-        for md in model.modules():
-            if isinstance(md, common.KVCodec1): md.eval()
-        return tot / 4
+        try:
+            for _ in range(a.val_batches):
+                x, y = data.pack(a.micro_batch, val=True)
+                with torch.autocast(dev.type,dtype=amp_dtype,enabled=amp_enabled):
+                    tot += float(loss_of(x.to(dev), y.to(dev), include_ul=False))
+        finally:
+            model.train()
+            for md in model.modules():
+                if isinstance(md, common.KVCodec1): md.eval()
+            common.set_ffn_activation_qat_strength(training_strength)
+        return tot / max(1,a.val_batches)
     v0 = val(); print(f"step 0  val loss {v0:.4f}")
     t0 = time.time()
     for step in range(1, a.steps + 1):
+        common.set_ffn_activation_qat_strength(arm_qat.activation_qat_strength(
+            step,a.ffn_act_warmup_steps,a.ffn_act_qat))
         lr = a.lr * min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * step / a.steps)))
         for g in opt.param_groups: g["lr"] = lr
         opt.zero_grad(set_to_none=True)
         for _ in range(a.accum):
             x, y = data.pack(a.micro_batch)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                (loss_of(x.to(dev), y.to(dev)) / a.accum).backward()
+            with torch.autocast(dev.type,dtype=amp_dtype,enabled=amp_enabled):
+                loss=loss_of(x.to(dev), y.to(dev)) / a.accum
+            scaler.scale(loss).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step(); requant(model)
+        scaler.step(opt); scaler.update(); requant(model)
         if step % a.log_every == 0:
             el = time.time() - t0
             print(f"step {step:>4}  lr {lr:.2e}  {el/step:.1f}s/step  eta {(a.steps-step)*el/step/60:.0f}min", flush=True)
     v1 = val()
-    torch.save({"model": model.state_dict()}, out / "finetuned.pt")
+    common.set_ffn_activation_qat_strength(1.0 if a.ffn_act_qat else 0.0)
+    torch.save({"model": model.state_dict(),"cfg":{
+        "V":cent.shape[0],**qat_cfg,"training_amp_dtype":a.amp_dtype,
+        "parameter_dtype":"float32","ffn_act_warmup_steps":a.ffn_act_warmup_steps,
+        "mtp_horizon":mtp_horizon,"mtp_loss_weight":mtp_loss_weight}},out/"finetuned.pt")
     print(f"done  val loss {v0:.4f} -> {v1:.4f}  saved {out/'finetuned.pt'}")
 
 if __name__ == "__main__":

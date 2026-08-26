@@ -1,6 +1,28 @@
 import os, math, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import common
-from common import D,NL,NH,NKV,HD,FFNH,FPD, RMS,RVQ,Block,StructStep, requant, cs
+from common import D,NL,NH,NKV,HD,FFNH,FPD, RMS,RVQ,Block,StructStep, requant, cs,ffn_activation
+
+
+def mtp_slices(hidden,targets,horizon):
+    """Return base and K=2 conditional-MTP alignment slices."""
+    if horizon not in (1,2): raise ValueError("MTP horizon must be 1 or 2")
+    pairs=[(hidden,targets)]
+    if horizon==2 and hidden.shape[1]>1:
+        pairs.append((hidden[:,:-1],targets[:,:-1],targets[:,1:]))
+    return pairs
+
+
+class MTPModule(nn.Module):
+    """One token-conditioned residual MLP for the second-token proposal."""
+    def __init__(s,dim):
+        super().__init__(); hidden=dim//2
+        s.norm=RMS(dim)
+        s.down=RVQ(dim,hidden,32,1)
+        s.up=RVQ(hidden,dim,32,1)
+    def forward(s,state,previous_token_embedding):
+        mixed=s.norm(state+previous_token_embedding)
+        hidden=F.silu(s.down(ffn_activation(mixed)))
+        return state+s.up(ffn_activation(hidden))
 
 
 def load_vocab(fp_path,dev):
@@ -9,8 +31,9 @@ def load_vocab(fp_path,dev):
     return cent, F.normalize(cent,dim=-1), cent.shape[0]
 
 class Shadow250M(nn.Module):
-    def __init__(s,cent,cent_n,V,use_memory=False):
+    def __init__(s,cent,cent_n,V,use_memory=False,mtp_horizon=1):
         super().__init__()
+        if int(mtp_horizon) not in (1,2): raise ValueError("MTP horizon must be 1 or 2")
 
 
         s.register_buffer("cent",cent,persistent=False)
@@ -19,6 +42,8 @@ class Shadow250M(nn.Module):
         s.b=nn.ModuleList([Block(i) for i in range(NL)])         
         s.struct=StructStep()                                    
         s.nf=RMS(D); s.head=nn.Linear(D,FPD,bias=False)          
+        s.mtp_horizon=int(mtp_horizon)
+        s.mtp=MTPModule(D) if s.mtp_horizon==2 else None
         s.tied_bias=nn.Parameter(torch.zeros(V))
 
 
@@ -30,12 +55,46 @@ class Shadow250M(nn.Module):
         x,conf=s.struct(x)                                       
         return s.nf(x), conf
     def logits(s,x): return (s.head(x).float()@s.cent_n.T)+s.tied_bias      
+    def _vocab_loss(s,hidden,targets,head,chunk):
+        projected=head(hidden).float().reshape(-1,FPD); flat=targets.reshape(-1); valid=flat>=0
+        projected,flat=projected[valid],flat[valid]
+        if not flat.numel(): return hidden.float().sum()*0
+        total=hidden.float().new_zeros(())
+        for start in range(0,len(flat),chunk):
+            logits=projected[start:start+chunk]@s.cent_n.T+s.tied_bias
+            total+=F.cross_entropy(logits,flat[start:start+chunk],reduction="sum")
+        return total/len(flat)
+    def mtp_hidden(s,hidden,previous_token_ids):
+        if s.mtp is None: raise RuntimeError("model has no MTP module")
+        if bool((previous_token_ids<0).any()):
+            raise ValueError("MTP conditioning token IDs must be unmasked")
+        token_embedding=s.inp(s.cent[previous_token_ids])
+        return s.mtp(hidden,token_embedding)
+    def mtp_logits(s,hidden,previous_token_ids):
+        """Score the K=2 proposal conditioned on the accepted first token."""
+        return s.logits(s.mtp_hidden(hidden,previous_token_ids))
+    def language_model_losses(s,hidden,targets,conditioning_ids=None,chunk=2048):
+        """Return one independently normalized loss for each available offset."""
+        pairs=mtp_slices(hidden,targets,s.mtp_horizon)
+        losses=[s._vocab_loss(pairs[0][0],pairs[0][1],s.head,chunk)]
+        if len(pairs)>1:
+            state,masked_previous,target=pairs[1]
+            previous=(masked_previous if conditioning_ids is None
+                      else conditioning_ids[:,:state.shape[1]])
+            future=s.mtp_hidden(state,previous)
+            losses.append(s._vocab_loss(future,target,s.head,chunk))
+        return losses
+    def language_model_loss(s,hidden,targets,mtp_loss_weight=0.0,chunk=2048,
+                            conditioning_ids=None):
+        if mtp_loss_weight<0: raise ValueError("MTP loss weight must be nonnegative")
+        if mtp_loss_weight==0:
+            return s._vocab_loss(hidden,targets,s.head,chunk)
+        losses=s.language_model_losses(hidden,targets,conditioning_ids,chunk)
+        return losses[0]+mtp_loss_weight*sum(losses[1:])
     def forward(s,idx,ys=None):
         x,conf=s.trunk(idx)
         if ys is None: return s.logits(x)
-
-        ph=s.head(x).float().reshape(-1,FPD); yf=ys.reshape(-1); Nn=ph.shape[0]; CH=2048
-        return sum(F.cross_entropy(ph[i:i+CH]@s.cent_n.T+s.tied_bias,yf[i:i+CH],reduction="sum") for i in range(0,Nn,CH))/Nn
+        return s.language_model_loss(x,ys,conditioning_ids=idx[:,1:])
 
     @torch.no_grad()
     def prefill_cached(s,idx,max_ctx=2048,exact_shiftmax=True,

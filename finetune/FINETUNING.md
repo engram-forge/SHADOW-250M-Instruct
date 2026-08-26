@@ -26,6 +26,21 @@ A few hundred conversations are enough for a style change. A few thousand for a 
 Defaults: learning rate 1e-5 with cosine decay, loss only on assistant tokens, batch of
 32,768 tokens per step, quantisation kept in the loop so the exported model matches the
 trained one. A small validation split is held out automatically and printed before and after.
+On the Cortex-A55 development branch, FFN activation QAT is enabled by default at the shared
+`up`/`gate` input and the `down` input. Disable it for compatibility with the bundled
+FP32-activation engine using `--no-ffn-act-qat`. The default training compute type is BF16 while
+parameters and AdamW state remain FP32. `--amp-dtype fp16` enables dynamic loss scaling; saving
+an FP16-only model and converting it to FP32 later does not restore lost precision.
+The FFN alphabet is inherited from checkpoint metadata. New pretraining checkpoints may use
+`ternary` or row-scaled symmetric `int4_row`; pass `--ffn-weight-dtype` only to assert the expected
+alphabet. `--ffn-act-warmup-steps N` linearly introduces activation QAT during adaptation.
+If the source checkpoint contains MTP heads, fine-tuning preserves and trains them with the
+checkpoint's auxiliary loss weight. Override that weight with `--mtp-loss-weight`; old checkpoints
+without MTP metadata remain horizon-one compatible.
+
+An activation-QAT export writes an adjacent `.a55.json` execution manifest. Its `.shdw` weight
+payload remains usable for kernel development, but exact inference requires the planned integer
+FFN engine; `export_model.py` prints this warning explicitly.
 The trainer also audits pathological repetition, mixes 10 percent recovery examples, and
 uses repetition-completion unlikelihood loss with weight 0.2. Disable both additions with
 `--recovery-ratio 0 --ul-alpha 0` for an MLE baseline.

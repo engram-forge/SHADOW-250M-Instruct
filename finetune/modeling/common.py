@@ -19,6 +19,9 @@ TRAIN_EXACT_KV=bool(int(__import__('os').environ.get(
 KV_BITS=_e("SHADOW_KV_BITS",1)             
 KV_TWO_TIER=bool(int(_os.environ.get("SHADOW_KV_TWO_TIER","0")))   
 KV_COLD_MASK=None                          
+FFN_ACT_QAT=bool(int(_os.environ.get("SHADOW_FFN_ACT_QAT","0")))
+FFN_ACT_QAT_STRENGTH=float(_os.environ.get("SHADOW_FFN_ACT_QAT_STRENGTH","1"))
+FFN_WEIGHT_DTYPE=_os.environ.get("SHADOW_FFN_WEIGHT_DTYPE","ternary")
 
 
 class _ExactSTE(torch.autograd.Function):
@@ -30,6 +33,70 @@ class _ExactSTE(torch.autograd.Function):
         return grad,None
 
 def ste(x,q): return _ExactSTE.apply(x,q)
+def mask_min(x): return torch.finfo(x.dtype).min if x.is_floating_point() else -1e9
+
+def ternary_values(weight):
+    """Return deployment trits, row scales, and the reconstructed weight."""
+    wf=weight.float()
+    scale=wf.abs().mean(-1,keepdim=True).clamp_min(1e-5)
+    trits=(wf/scale).round().clamp(-1,1)
+    return trits.to(torch.int8),scale,trits*scale
+
+def ternary_ste(weight):
+    """Deployment-exact row-scaled ternary forward with identity STE backward."""
+    _,_,quantized=ternary_values(weight)
+    return ste(weight,quantized.to(weight.dtype))
+
+def int4_row_values(weight):
+    """Return symmetric signed INT4 codes, row scales, and reconstructed weights."""
+    wf=weight.float()
+    scale=(wf.abs().amax(-1,keepdim=True)/7.0).clamp_min(1e-8)
+    code=(wf/scale).round().clamp(-7,7)
+    return code.to(torch.int8),scale,code*scale
+
+def int4_row_ste(weight):
+    """Row-scaled symmetric INT4 forward with identity STE backward."""
+    _,_,quantized=int4_row_values(weight)
+    return ste(weight,quantized.to(weight.dtype))
+
+def int8_pot_values(x):
+    """Return per-vector signed INT8 codes, power-of-two scales, and dequantized values."""
+    xf=x.float(); qmax=127.0
+    maximum=xf.abs().amax(-1,keepdim=True).clamp_min(1e-12)
+    scale=torch.exp2(torch.ceil(torch.log2(maximum/qmax)))
+    code=(xf/scale).round().clamp(-qmax,qmax).to(torch.int8)
+    return code,scale,(code.float()*scale).to(x.dtype)
+
+def int8_pot_ste(x):
+    """Per-token INT8 activation quantization with an identity STE backward."""
+    _,_,quantized=int8_pot_values(x)
+    return ste(x,quantized)
+
+def set_ffn_qat(weight_dtype="ternary",activation_enabled=True,activation_strength=1.0):
+    global FFN_WEIGHT_DTYPE,FFN_ACT_QAT,FFN_ACT_QAT_STRENGTH
+    if weight_dtype not in {"ternary","int4_row"}:
+        raise ValueError(f"unsupported FFN weight dtype {weight_dtype!r}")
+    if not 0.0<=activation_strength<=1.0:
+        raise ValueError("FFN activation QAT strength must be in [0, 1]")
+    FFN_WEIGHT_DTYPE=weight_dtype
+    FFN_ACT_QAT=bool(activation_enabled)
+    FFN_ACT_QAT_STRENGTH=float(activation_strength)
+
+def set_ffn_activation_qat(enabled):
+    set_ffn_qat(FFN_WEIGHT_DTYPE,enabled,FFN_ACT_QAT_STRENGTH)
+
+def set_ffn_activation_qat_strength(strength):
+    set_ffn_qat(FFN_WEIGHT_DTYPE,FFN_ACT_QAT,strength)
+
+def ffn_weight(weight):
+    return ternary_ste(weight) if FFN_WEIGHT_DTYPE=="ternary" else int4_row_ste(weight)
+
+def ffn_activation(x):
+    if not FFN_ACT_QAT or FFN_ACT_QAT_STRENGTH==0.0: return x
+    _,_,quantized=int8_pot_values(x)
+    target=x.float().lerp(quantized.float(),FFN_ACT_QAT_STRENGTH).to(x.dtype)
+    return ste(x,target)
+
 def pot(x):                                   
     m=x.abs().amax(-1,keepdim=True).clamp_min(1e-6); s=torch.exp2(torch.ceil(torch.log2(m/127.)))
     return ste(x,(x/s).round().clamp(-127,127)*s)
@@ -371,6 +438,7 @@ class RVQ(nn.Module):
             idx=torch.cdist(r/rms,s.cb[t]).argmin(1); r=r-s.cb[t][idx]*rms
         s.cb_init.fill_(True)
     def enc(s):
+        if s.g==32: return
         if not bool(s.cb_init): s._fit()
         with torch.no_grad():
             sc=s.weight.detach().abs().mean(1,keepdim=True).clamp_min(1e-8); r=(s.weight.detach()/sc).reshape(-1,s.g); acc=torch.zeros_like(r)
@@ -391,7 +459,9 @@ class RVQ(nn.Module):
 
         if s._q is None or s._q.device!=s.weight.device: s.enc()
         return ste(s.weight,s._q)
-    def forward(s,x): return F.linear(x,s.qw().to(x.dtype))
+    def forward(s,x):
+        weight=ffn_weight(s.weight) if s.g==32 else s.qw()
+        return F.linear(x,weight.to(x.dtype))
     def bits(s): return s.st*math.log2(s.c)/s.g
 def requant(m):
     for md in m.modules():
@@ -411,7 +481,7 @@ def shiftmax(dot,alpha,Ts,device):
     e=aq*dot                                                  
     e=ste(e,e.floor())
     cm=torch.ones(Ts,Ts,dtype=torch.bool,device=device).tril()
-    e=e.masked_fill(~cm,-1e9)
+    e=e.masked_fill(~cm,mask_min(e))
     w=torch.exp2((e-e.amax(-1,keepdim=True)).clamp_min(-15))
     return w/w.sum(-1,keepdim=True)
 
@@ -425,6 +495,11 @@ class Block(nn.Module):
         s.kv_bits=KV_BITS
         s.kcodec=KVCodec1(NKV,HD,seed=1000+int(layer_idx))
         s.vcodec=KVCodec1(NKV,HD,seed=2000+int(layer_idx))
+    def _ffn(s,h):
+        h=ffn_activation(s.n2(h))
+        # up and gate deliberately share one quantized input and its per-token scale.
+        hidden=F.silu(s.gt(h))*s.up(h)
+        return s.dn(ffn_activation(hidden))
     def forward(s,x,cos,sin):
         z=s.n1(x); Bs,Ts,_=z.shape
         q=s.qn(s.q(z).view(Bs,Ts,NH,HD)).transpose(1,2); k=s.kn(s.k(z).view(Bs,Ts,NKV,HD)).transpose(1,2); v=s.v(z).view(Bs,Ts,NKV,HD).transpose(1,2)
@@ -465,7 +540,7 @@ class Block(nn.Module):
             w=shiftmax(q@k.transpose(-1,-2),s.alpha,Ts,x.device)
             y=(w.to(v.dtype)@v).transpose(1,2).reshape(Bs,Ts,NH*HD)  
 
-        x=x+s.o(y*torch.sigmoid(s.g)); h=s.n2(x); return x+s.dn(F.silu(s.gt(h))*s.up(h))
+        x=x+s.o(y*torch.sigmoid(s.g)); return x+s._ffn(x)
 
     def _qkv(s,z,cos,sin):
         Bs,Ts,_=z.shape
@@ -486,15 +561,14 @@ class Block(nn.Module):
 
             cm=torch.arange(tk,device=x.device)[None,:] <= (
                 torch.arange(tq,device=x.device)[:,None]+tk-tq)
-            e=e.masked_fill(~cm[None,None],-1e9)
+            e=e.masked_fill(~cm[None,None],mask_min(e))
         if exact:
             w=torch.exp2((e-e.amax(-1,keepdim=True)).clamp_min(-15))
             w=w/w.sum(-1,keepdim=True)
         else:
             w=torch.softmax(e,-1)
         y=(w.to(vr.dtype)@vr).transpose(1,2).reshape(x.shape[0],x.shape[1],NH*HD)
-        x=x+s.o(y*torch.sigmoid(s.g)); h=s.n2(x)
-        return x+s.dn(F.silu(s.gt(h))*s.up(h))
+        x=x+s.o(y*torch.sigmoid(s.g)); return x+s._ffn(x)
 
     @staticmethod
     def _popcount_bytes(x):
@@ -632,7 +706,7 @@ class StructStep(nn.Module):
         Bs,Ts,_=h.shape; q=s.Wq(h)
         att=(q@h.transpose(-1,-2))/math.sqrt(D)
         cm=torch.ones(Ts,Ts,dtype=torch.bool,device=h.device).tril()
-        att=torch.softmax(att.masked_fill(~cm,-1e9),-1)
+        att=torch.softmax(att.masked_fill(~cm,mask_min(att)),-1)
         r=att@h                                                                       
         h=s.nf(h+s.cout(F.silu(s.cin(torch.cat([h,r],-1)))))                          
         return h, torch.sigmoid(s.verify(h)).squeeze(-1)                              
@@ -645,7 +719,7 @@ class StructStep(nn.Module):
             tq,tk=att.shape[-2:]
             cm=torch.arange(tk,device=h_new.device)[None,:] <= (
                 torch.arange(tq,device=h_new.device)[:,None]+tk-tq)
-            att=att.masked_fill(~cm[None],-1e9)
+            att=att.masked_fill(~cm[None],mask_min(att))
         w=torch.softmax(att,-1); r=w@h_context
         h=s.nf(h_new+s.cout(F.silu(s.cin(torch.cat([h_new,r],-1)))))
         return h,torch.sigmoid(s.verify(h)).squeeze(-1)
