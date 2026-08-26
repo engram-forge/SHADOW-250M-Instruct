@@ -289,6 +289,22 @@ reverse-order decode control measured 97.82 tok/s after batch prefill and 93.02
 tok/s after sequential prefill; decode differences across paired suites remain
 within high WSL scheduling variance, and no decode code path was changed.
 
+The repeatable matrix driver is `benchmarks/linux_arm64_prefill_matrix.py`. It
+alternates sequential-first and batch-first execution to reduce ordering bias,
+records raw timing and RSS for both paths, and requires byte-identical final
+logits before accepting a row. A short three-run WSL smoke matrix produced:
+
+| Threads | Prompt | Sequential tok/s | Batch-4 tok/s | Gain | Logits |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 4 / 16 / 64 / 256 | 24 / 22 / 24 / 23 | 42 / 34 / 36 / 34 | +72% / +53% / +52% / +48% | exact |
+| 2 | 4 / 16 / 64 / 256 | 49 / 37 / 44 / 39 | 72 / 55 / 66 / 65 | +48% / +45% / +50% / +66% | exact |
+| 4 | 4 / 16 / 64 / 256 | 107 / 108 / 108 / 84 | 160 / 172 / 170 / 121 | +49% / +59% / +57% / +43% | exact |
+
+These short results verify the harness and direction only; use the documented
+10/20-run counts for stable claims. Tail prompts of 5, 7, 15, and 17 tokens also
+passed byte-exact parity, exercising the sequential remainder after each batch.
+The physical H618 matrix remains the release-performance gate.
+
 ## Remaining hardware gates
 
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
