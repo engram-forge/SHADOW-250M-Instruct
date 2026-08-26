@@ -365,6 +365,22 @@ The experiment should only be reconsidered near the 2,048-token context limit,
 where trunk work is sixteen times larger and requires a separate long-context
 performance gate.
 
+The long-context follow-up confirmed why decode candidates must be qualified by
+context length. With 17 generated tokens and exact final-logit parity, the
+four-thread WSL medians were:
+
+| Context | Baseline | Parallel score | Parallel recall | Both |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 97.21 | 94.53 | 93.20 | 94.57 |
+| 1024 | 57.08 | 58.39 | 56.39 | 56.94 |
+| 2048 | 33.51 | 34.25 | 29.49 | 26.93 |
+
+Score parallelism crosses over around 1,024 tokens, but its 2.2--2.3% gain does
+not repay a guarded path. Recall parallelism becomes materially worse as context
+grows because its dimension-major traversal loses the contiguous token-major
+trunk access pattern. Both runtime switches were removed. Future decode work uses
+the standard 32/128/512/1024/2048 context matrix defined in `AGENTS.md`.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
