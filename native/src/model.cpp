@@ -1773,15 +1773,20 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
   std::vector<std::vector<float>> dumped_logits;
   std::mt19937_64 rng(options.seed);
 
-  auto step = [&](std::uint32_t token) {
+  auto step = [&](std::uint32_t token, const float *transformer_output = nullptr) {
     auto &s = impl_->scratch;
-    table_.vector_into(token, s.input);
-    impl_->embedding->matvec_into(s.input, s.x);
+    if (transformer_output)
+      std::copy_n(transformer_output, D, s.x.begin());
+    else {
+      table_.vector_into(token, s.input);
+      impl_->embedding->matvec_into(s.input, s.x);
+    }
     auto &x = s.x;
     if (options.trace)
       std::cerr << "TRACE emb " << x[0] << ' ' << x[1] << ' ' << dot(x, x)
                 << '\n';
-    for (std::size_t layer = 0; layer < L; ++layer) {
+    if (!transformer_output)
+      for (std::size_t layer = 0; layer < L; ++layer) {
       const auto &w = impl_->weights[layer];
       rms_into(x, *w.n1, s.z);
       auto &z = s.z;
@@ -2004,10 +2009,128 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
     return &logits;
   };
 
+  auto transformer_block4 = [&](std::span<const std::uint32_t, 4> tokens,
+                                std::span<float> states) {
+    std::vector<float> inputs(4 * FPD), normalized(4 * D), q(4 * NH * HD),
+        k(4 * NKV * HD), v(4 * NKV * HD), attended(4 * NH * HD),
+        projected(4 * D), hidden(4 * D), up(4 * 4224), gate(4 * 4224),
+        down(4 * D);
+    for (std::size_t token = 0; token < 4; ++token)
+      table_.vector_into(tokens[token],
+          std::span<float>(inputs).subspan(token * FPD, FPD));
+    impl_->embedding->matvec_batch4_into(inputs, states);
+    const std::uint64_t block_position = impl_->position;
+    for (std::size_t layer = 0; layer < L; ++layer) {
+      const auto &w = impl_->weights[layer];
+      for (std::size_t token = 0; token < 4; ++token)
+        rms_into(std::span<const float>(states).subspan(token * D, D), *w.n1,
+                 std::span<float>(normalized).subspan(token * D, D));
+      w.q->matvec_batch4_into(normalized, q);
+      w.k->matvec_batch4_into(normalized, k);
+      w.v->matvec_batch4_into(normalized, v);
+      std::fill(attended.begin(), attended.end(), 0.0f);
+      auto &cache = impl_->cache[layer];
+      const auto alpha = w.alpha->dense_f32();
+      const auto output_gate = w.g->dense_f32();
+      for (std::size_t token = 0; token < 4; ++token) {
+        auto qs = std::span<float>(q).subspan(token * NH * HD, NH * HD);
+        auto ks = std::span<float>(k).subspan(token * NKV * HD, NKV * HD);
+        auto vs = std::span<float>(v).subspan(token * NKV * HD, NKV * HD);
+        for (std::size_t head = 0; head < NH; ++head) {
+          auto qh = qs.subspan(head * HD, HD);
+          rms_into(qh, *w.qn, impl_->scratch.normalized);
+          std::copy(impl_->scratch.normalized.begin(), impl_->scratch.normalized.end(), qh.begin());
+          rope_inplace(qh, block_position + token);
+          pot_inplace(qh);
+          bfloat16_round_inplace(qh);
+        }
+        std::array<float, NKV * HD> ka{}, va{};
+        for (std::size_t head = 0; head < NKV; ++head) {
+          auto kh = ks.subspan(head * HD, HD);
+          rms_into(kh, *w.kn, impl_->scratch.normalized);
+          std::copy(impl_->scratch.normalized.begin(), impl_->scratch.normalized.end(), kh.begin());
+          rope_inplace(kh, block_position + token);
+          pot_inplace(kh);
+          bfloat16_round_inplace(kh);
+          auto vh = vs.subspan(head * HD, HD);
+          pot_inplace(vh);
+          bfloat16_round_inplace(vh);
+          std::copy(kh.begin(), kh.end(), ka.begin() + head * HD);
+          std::copy(vh.begin(), vh.end(), va.begin() + head * HD);
+        }
+        cache.keys.push_back(ka); cache.values.push_back(va);
+        if (cache.keys.size() > 2048) {
+          cache.keys.erase(cache.keys.begin());
+          cache.values.erase(cache.values.begin());
+        }
+        auto token_attended = std::span<float>(attended).subspan(token * NH * HD, NH * HD);
+        for (std::size_t head = 0; head < NH; ++head) {
+          const std::size_t kvh = head / (NH / NKV);
+          auto qh = qs.subspan(head * HD, HD);
+          std::vector<float> scores(cache.keys.size());
+          float peak = -std::numeric_limits<float>::infinity();
+          const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
+          for (std::size_t t = 0; t < scores.size(); ++t) {
+            scores[t] = std::floor(aq * bfloat16_round(dot(
+                qh, std::span<const float>(cache.keys[t])
+                        .subspan(kvh * HD, HD))));
+            peak = std::max(peak, scores[t]);
+          }
+          float denom = 0;
+          for (float &score : scores) {
+            score = std::exp2(std::max(score - peak, -15.0f));
+            denom += score;
+          }
+          for (float &score : scores)
+            score = bfloat16_round(score / denom);
+          for (std::size_t t = 0; t < scores.size(); ++t) {
+            auto vv = std::span<const float>(cache.values[t])
+                          .subspan(kvh * HD, HD);
+            for (std::size_t j = 0; j < HD; ++j)
+              token_attended[head * HD + j] += scores[t] * vv[j];
+          }
+          for (std::size_t j = 0; j < HD; ++j)
+            token_attended[head * HD + j] =
+                bfloat16_round(token_attended[head * HD + j]);
+        }
+        for (std::size_t i = 0; i < NH * HD; ++i)
+          token_attended[i] *=
+              1.0f / (1.0f + std::exp(-output_gate[i]));
+      }
+      w.o->matvec_batch4_into(attended, projected);
+      for (std::size_t i = 0; i < states.size(); ++i)
+        states[i] += projected[i];
+      for (std::size_t token = 0; token < 4; ++token)
+        rms_into(std::span<const float>(states).subspan(token * D, D),
+                 *w.n2,
+                 std::span<float>(hidden).subspan(token * D, D));
+      w.up->matvec_pair_batch4_into(*w.gt, hidden, up, gate);
+      silu_multiply_inplace(up, gate);
+      w.dn->matvec_batch4_into(up, down);
+      for (std::size_t i = 0; i < states.size(); ++i)
+        states[i] += down[i];
+    }
+  };
+
   auto start = std::chrono::steady_clock::now();
   std::vector<float> *logits = nullptr;
-  for (auto token : prompt)
-    logits = step(token);
+  std::size_t prompt_index = 0;
+  std::vector<float> block_states(4 * D);
+  const char *batch_value = std::getenv("SHADOW_BATCH_PREFILL");
+  const bool use_batch_prefill =
+      options.archive.empty() && !options.trace &&
+      (!batch_value || std::string_view(batch_value) != "0");
+  for (; use_batch_prefill && prompt_index + 4 <= prompt.size();
+       prompt_index += 4) {
+    std::array<std::uint32_t, 4> tokens{
+        prompt[prompt_index], prompt[prompt_index + 1],
+        prompt[prompt_index + 2], prompt[prompt_index + 3]};
+    transformer_block4(tokens, block_states);
+    for (std::size_t token = 0; token < 4; ++token)
+      logits = step(tokens[token], block_states.data() + token * D);
+  }
+  for (; prompt_index < prompt.size(); ++prompt_index)
+    logits = step(prompt[prompt_index]);
   auto prefill_done = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < options.tokens; ++i) {
     if (!options.dump_logits.empty())

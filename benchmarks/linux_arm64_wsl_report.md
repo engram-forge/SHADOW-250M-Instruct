@@ -265,6 +265,30 @@ Batch setup and copies exceeded the single embedding RVQ saving, confirming that
 batching must cover the complete transformer matrix pipeline before it is
 enabled. The partial runtime path was removed.
 
+### End-to-end exact batch-4 prefill
+
+The layer-major causal scheduler is now enabled for ordinary prompts. It batches
+embedding, Q/K/V, output projection, `up`/`gt`, and `dn` matrix work across four
+known prompt positions. RoPE, KV insertion, and attention remain position-ordered
+inside every layer; structural trunk recurrence and logits remain token-ordered.
+Generated-token decode is unchanged. Archive retrieval and trace mode deliberately
+fall back to sequential prefill pending separate side-effect qualification. Set
+`SHADOW_BATCH_PREFILL=0` for a same-binary sequential control.
+
+| Prompt | Sequential tok/s | Batch-4 tok/s | Gain | Sequential TTFT | Batch TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 112.33 | 128.53 | +14.4% | 142.4 ms | 124.5 ms |
+| 64 | 89.95 | 149.71 | +66.4% | 711.5 ms | 427.5 ms |
+| 256 | 88.47 | 134.30 | +51.8% | 2.894 s | 1.906 s |
+
+These are four-thread WSL development results, not H618 claims. Median RSS stayed
+near 172 MiB. A same-binary 16-token final-logit dump was byte-identical between
+sequential and batch prefill. Seeded sampling with temperature 0.8, top-k 40, and
+repetition penalty 1.1 also produced byte-identical token output. The 64-token
+reverse-order decode control measured 97.82 tok/s after batch prefill and 93.02
+tok/s after sequential prefill; decode differences across paired suites remain
+within high WSL scheduling variance, and no decode code path was changed.
+
 ## Remaining hardware gates
 
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
