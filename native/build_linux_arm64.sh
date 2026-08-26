@@ -3,6 +3,8 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 output=${1:-"$root/build/linux-arm64/shadow"}
+target_cpu=${SHADOW_ARM_CPU:-cortex-a55}
+dotprod=${SHADOW_ARM_DOTPROD:-OFF}
 build_dir=$(dirname "$output")
 compiler=${CXX:-}
 if [[ -z "$compiler" ]]; then
@@ -19,7 +21,8 @@ case "$(uname -m)" in
 esac
 
 cmake -S "$root/native" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release \
-  -DSHADOW_H618=ON -DCMAKE_CXX_COMPILER="$compiler"
+  -DSHADOW_ARM_CPU="$target_cpu" -DSHADOW_ARM_DOTPROD="$dotprod" \
+  -DCMAKE_CXX_COMPILER="$compiler"
 cmake --build "$build_dir" --parallel
 ctest --test-dir "$build_dir" --output-on-failure
 if [[ "$output" != "$build_dir/shadow" ]]; then
@@ -28,6 +31,7 @@ fi
 
 file "$output"
 echo "compiler: $compiler"
+echo "target CPU: $target_cpu; DotProd: $dotprod"
 "$output" --capabilities
 
 if command -v readelf >/dev/null; then

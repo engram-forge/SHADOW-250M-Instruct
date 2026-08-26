@@ -1,15 +1,15 @@
 # Native ARM64 runtimes
 
 The shared C++20 core runs the existing compressed `.shdw` model on Apple
-Silicon and Linux ARM64. Orange Pi H618 uses the Linux CPU path: Cortex-A53
-compatible ARMv8-A NEON for inference and exact CPU Hamming search for cold-KV
+Silicon and Linux ARM64. Radxa ZERO 3W uses the Linux CPU path: Cortex-A55 NEON
+for inference and exact CPU Hamming search for cold-KV
 archives. Metal remains a macOS-only archive accelerator.
 
-## Orange Pi H618 / Linux ARM64
+## Radxa ZERO 3W / RK3566 Linux ARM64
 
 The primary workflow uses the owner's current ARM64 WSL2 environment—Ubuntu
 24.04 (Noble), running natively as `aarch64`—followed by deployment and final
-qualification on the owner's Orange Pi H618. Install CMake, a C++ compiler,
+qualification on the owner's Radxa ZERO 3W. Install CMake, a C++ compiler,
 and Ninja if desired, then build in WSL with:
 
     native/build_linux_arm64.sh
@@ -18,11 +18,12 @@ The script prefers `clang++-18`, whose code generation is substantially faster
 for the current compressed NEON kernels, and falls back to the system C++
 compiler. Set `CXX` explicitly to override this selection.
 
-The CMake default on Linux ARM64 enables `SHADOW_H618`, which compiles with
-`-mcpu=cortex-a53`. Do not add `-march=native`: newer development machines may
-otherwise emit DotProd, I8MM, SVE, or SVE2 instructions unavailable on H618.
+The default compiles with `-mcpu=cortex-a55`. Do not add `-march=native`. An
+optional `SHADOW_ARM_DOTPROD=ON` build adds `-march=armv8.2-a+simd+dotprod`; use
+it only after the production image reports `asimddp`. DotProd benefits integer
+activation kernels, not the current FP32 activation kernel automatically.
 The build script prints the newest referenced glibc symbol. A binary built in
-this Ubuntu 24.04 WSL environment must run on an Orange Pi image providing that
+this Ubuntu 24.04 WSL environment must run on a Radxa image providing that
 glibc version or newer. If the board image is older, rebuild natively on the
 board or in a matching ARM64 userspace; instruction compatibility and userspace
 ABI compatibility are separate requirements.
@@ -37,10 +38,10 @@ Linux supports `--archive-backend auto` and `cpu`; both select the exact CPU
 scanner. Requesting `metal` fails explicitly. A QEMU user-mode smoke test must
 use a sysroot matching the binary's build userspace, for example Ubuntu 24.04:
 
-    qemu-aarch64 -cpu cortex-a53 -L /path/to/noble-arm64-sysroot build/linux-arm64/shadow --capabilities
+    qemu-aarch64 -cpu cortex-a55 -L /path/to/noble-arm64-sysroot build/linux-arm64/shadow --capabilities
 
 Static disassembly checks for newer instructions are useful safeguards, but
-the owner's Orange Pi H618 is the compatibility and performance authority. Record
+the owner's Radxa ZERO 3W is the compatibility and performance authority. Record
 median/p95 decode speed, RSS, temperature, and throttling with 1, 2, and 4
 threads before selecting a default.
 
@@ -64,7 +65,7 @@ Pre-board parity and performance qualification on the current WSL host uses:
 Use `benchmarks/verify_macos_logits.py` with this Linux kernel to compare strict
 and fast logits. Pass `--limit 25` for a representative interactive run; omit
 the limit for the full 472-case unattended qualification. WSL measurements are
-development records and must not be presented as H618 performance.
+development records and must not be presented as RK3566 performance.
 Current WSL findings and raw-result links are summarized in
 [`benchmarks/linux_arm64_wsl_report.md`](../benchmarks/linux_arm64_wsl_report.md).
 

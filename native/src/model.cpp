@@ -87,6 +87,28 @@ std::vector<std::uint8_t> read_bytes(std::istream &in, std::size_t n) {
   return result;
 }
 
+void dump_ffn_activation(std::string_view stage, std::size_t layer,
+                         std::span<const float> values) {
+  const char *path = std::getenv("SHADOW_DUMP_FFN_ACTIVATIONS");
+  if (!path || !*path)
+    return;
+  static std::mutex mutex;
+  std::lock_guard lock(mutex);
+  std::ofstream out(path, std::ios::binary | std::ios::app);
+  if (!out)
+    throw std::runtime_error("cannot append FFN activation dump");
+  const std::uint32_t magic = 0x31414653; // SFA1
+  const std::uint32_t stage_id = stage == "up" ? 1 : 0;
+  const std::uint32_t layer_id = static_cast<std::uint32_t>(layer);
+  const std::uint32_t count = static_cast<std::uint32_t>(values.size());
+  out.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+  out.write(reinterpret_cast<const char *>(&stage_id), sizeof(stage_id));
+  out.write(reinterpret_cast<const char *>(&layer_id), sizeof(layer_id));
+  out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  out.write(reinterpret_cast<const char *>(values.data()),
+            static_cast<std::streamsize>(values.size_bytes()));
+}
+
 void write_npy_logits(const std::filesystem::path &path,
                       std::span<const std::vector<float>> rows) {
   if (rows.empty())
@@ -299,6 +321,23 @@ bool fast_logits_enabled() {
   return enabled;
 }
 
+std::size_t dotprod_ffn_group() {
+#if defined(SHADOW_ARM_DOTPROD)
+  static const std::size_t group = [] {
+    const char *value = std::getenv("SHADOW_DOTPROD_FFN");
+    if (!value || !*value || std::string_view(value) == "0")
+      return std::size_t{0};
+    const std::size_t parsed = std::stoul(value);
+    if (parsed != 64 && parsed != 128)
+      throw std::runtime_error("SHADOW_DOTPROD_FFN must be 64 or 128");
+    return parsed;
+  }();
+  return group;
+#else
+  return 0;
+#endif
+}
+
 void silu_inplace(std::span<float> values) {
   for (float &value : values)
     value = value / (1.0f + std::exp(-value));
@@ -317,6 +356,12 @@ std::size_t ternary3_offset(std::size_t row, std::size_t block,
 std::size_t ternary_nibble_offset(std::size_t row, std::size_t column,
                                   std::size_t input_width) {
   return ((row / 16) * input_width + column) * 8;
+}
+
+std::size_t ternary_dotprod_offset(std::size_t row, std::size_t column,
+                                   std::size_t input_width) {
+  return ((row / 16) * (input_width / 4) + column / 4) * 64 +
+         (row % 16) * 4 + column % 4;
 }
 
 #if defined(__aarch64__)
@@ -545,6 +590,59 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
       }
     });
   } else if (kind == WeightKind::ternary3) {
+#if defined(SHADOW_ARM_DOTPROD) && defined(__aarch64__)
+    const std::size_t quant_group = dotprod_ffn_group();
+    if (quant_group && !ternary_dotprod.empty()) {
+      std::vector<std::int8_t> quantized;
+      std::vector<float> quant_scales;
+      quantized.resize(in);
+      quant_scales.resize((in + quant_group - 1) / quant_group);
+      for (std::size_t begin = 0; begin < in; begin += quant_group) {
+        const std::size_t end = std::min(begin + quant_group, std::size_t(in));
+        float peak = 0;
+        for (std::size_t column = begin; column < end; ++column)
+          peak = std::max(peak, std::abs(x[column]));
+        const float scale = peak / 127.0f;
+        const float inverse = scale == 0 ? 0 : 1 / scale;
+        quant_scales[begin / quant_group] = scale;
+        for (std::size_t column = begin; column < end; ++column)
+          quantized[column] = static_cast<std::int8_t>(std::clamp(
+              std::nearbyint(x[column] * inverse), -127.0f, 127.0f));
+      }
+      parallel_rows(out, [&](std::size_t row_begin, std::size_t row_end) {
+        for (std::size_t row = row_begin; row < row_end; row += 16) {
+          float32x4_t output[4];
+          for (auto &part : output) part = vdupq_n_f32(0);
+          for (std::size_t begin = 0; begin < in; begin += quant_group) {
+            int32x4_t sums[4];
+            for (auto &sum : sums) sum = vdupq_n_s32(0);
+            const std::size_t end = std::min(begin + quant_group, std::size_t(in));
+            for (std::size_t column = begin; column < end; column += 4) {
+              std::int32_t word;
+              std::memcpy(&word, quantized.data() + column, sizeof(word));
+              const int8x16_t activation =
+                  vreinterpretq_s8_s32(vdupq_n_s32(word));
+              const auto *weights = ternary_dotprod.data() +
+                  ternary_dotprod_offset(row, column, in);
+              for (int lane = 0; lane < 4; ++lane)
+                sums[lane] = vdotq_s32(sums[lane],
+                                       vld1q_s8(weights + lane * 16), activation);
+            }
+            const float scale = quant_scales[begin / quant_group];
+            for (int lane = 0; lane < 4; ++lane)
+              output[lane] = vfmaq_n_f32(
+                  output[lane], vcvtq_f32_s32(sums[lane]), scale);
+          }
+          float values[16];
+          for (int lane = 0; lane < 4; ++lane)
+            vst1q_f32(values + lane * 4, output[lane]);
+          for (std::size_t lane = 0; lane < 16; ++lane)
+            y[row + lane] = values[lane] * scales[row + lane];
+        }
+      });
+      return;
+    }
+#endif
     const std::size_t stride = (in + 4) / 5;
     const bool reference = ternary_reference_enabled();
     parallel_rows(out, [&](std::size_t begin, std::size_t end) {
@@ -818,7 +916,9 @@ void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
                               std::span<float> other_y) const {
   if (kind != WeightKind::ternary3 || other.kind != WeightKind::ternary3 ||
       in != other.in || out != other.out || x.size() != in || y.size() != out ||
-      other_y.size() != out || ternary_reference_enabled()) {
+      other_y.size() != out || ternary_reference_enabled() ||
+      (dotprod_ffn_group() && !ternary_dotprod.empty() &&
+       !other.ternary_dotprod.empty())) {
     matvec_into(x, y);
     other.matvec_into(x, other_y);
     return;
@@ -1393,6 +1493,18 @@ ModelFile::ModelFile(const std::filesystem::path &path) : path_(path) {
             }
           }
         }
+        if (dotprod_ffn_group() &&
+            (t.name.ends_with(".up") || t.name.ends_with(".gt") ||
+             t.name.ends_with(".dn"))) {
+          if (t.in % 4 != 0)
+            throw std::runtime_error("DotProd FFN input must be divisible by 4");
+          t.ternary_dotprod.resize(static_cast<std::size_t>(t.out) * t.in);
+          for (std::size_t row = 0; row < t.out; ++row)
+            for (std::size_t column = 0; column < t.in; ++column)
+              t.ternary_dotprod[ternary_dotprod_offset(row, column, t.in)] =
+                  ternary3_table()[t.bytes[ternary3_offset(
+                      row, column / 5, stride)]][column % 5];
+        }
       }
       const auto sb = read_bytes(in, static_cast<std::size_t>(t.out) * 4);
       t.scales.resize(t.out);
@@ -1966,6 +2078,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       add_inplace(x, projected);
       rms_into(x, *w.n2, s.h);
       auto &h = s.h;
+      dump_ffn_activation("h", layer, h);
       timed(profile.ffn_up_gate,
             [&] { w.up->matvec_pair_into(*w.gt, h, s.up, s.gt); });
       auto &up = s.up;
@@ -1974,6 +2087,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         std::cerr << "TRACE l0ffnraw up " << up[0] << ' ' << up[1] << " gt "
                   << gt[0] << ' ' << gt[1] << '\n';
       silu_multiply_inplace(up, gt);
+      dump_ffn_activation("up", layer, up);
       timed(profile.ffn_down, [&] { w.dn->matvec_into(up, s.down); });
       auto &down = s.down;
       add_inplace(x, down);

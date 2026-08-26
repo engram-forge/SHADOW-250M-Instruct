@@ -27,12 +27,13 @@ There is no dedicated unit-test suite or coverage threshold. For runtime changes
 Treat prefill and decode as separate performance products. Prefill reports prompt
 tokens per second and time-to-first-token; decode reports generated tokens per
 second after prefill. Never combine them into one throughput number. Keep WSL
-measurements labeled as development evidence rather than Orange Pi H618 claims.
+measurements labeled as development evidence rather than Radxa ZERO 3W claims.
 
 Develop each optimization incrementally:
 
 1. Propose the expected bottleneck, intended gain, correctness boundary, memory
-   cost, and Cortex-A53 compatibility constraints.
+   cost, and Cortex-A55 compatibility constraints. Treat DotProd as an optional
+   path that requires an `asimddp` feature check on the production image.
 2. Break the proposal into the smallest independently measurable change. Change
    one kernel, layout, scheduling decision, or compiler option at a time.
 3. Try the candidate behind a temporary same-binary control when practical.
@@ -41,8 +42,9 @@ Develop each optimization incrementally:
 4. Verify correctness before accepting performance results. Require existing
    native and Python tests, strict scalar/NEON parity where applicable, and
    byte-identical logits or seeded sampling for transformations intended to be
-   exact. Scan target artifacts for instructions outside the H618 Cortex-A53
-   boundary.
+   exact. Scan baseline artifacts against the Cortex-A55 boundary and DotProd
+   artifacts against ARMv8.2-A+DotProd; never use `-march=native`. Approximate
+   integer paths additionally require sequence-level generation evaluation.
 5. Verify stable performance with warmups, repeated raw measurements, medians,
    spread, RSS, and identical inputs, threads, and sampling settings. Profile the
    affected stage to confirm that any gain comes from the intended component.
@@ -66,7 +68,7 @@ tokens after prefill, alternating candidate/control order, exact final-logit
 parity at every length, and stable repeated measurements. A candidate may be
 retained as a guarded context-dependent path only when it wins consistently
 above a documented threshold and repays its branch, code-size, and maintenance
-cost. Always rerun the 1/2/4-thread matrix on physical H618 hardware before
+cost. Always rerun the 1/2/4-thread matrix on physical RK3566 hardware before
 making release-performance claims.
 
 ## Commit & Pull Request Guidelines

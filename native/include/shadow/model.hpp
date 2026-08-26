@@ -27,6 +27,8 @@ struct Tensor {
   std::vector<float> scales;
   // Decode-optimized 4-bit expansion of base-3 weights, interleaved by 16 rows.
   std::vector<std::uint8_t> ternary_nibbles;
+  // Optional FFN-only layout: 16 rows x 4 columns per DotProd tile.
+  std::vector<std::int8_t> ternary_dotprod;
 
   std::vector<float> matvec(std::span<const float> x) const;
   void matvec_into(std::span<const float> x, std::span<float> y) const;
