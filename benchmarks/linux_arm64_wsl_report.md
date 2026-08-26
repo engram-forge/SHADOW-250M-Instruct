@@ -355,6 +355,16 @@ through optional-bias helper logic inhibited the existing hot loop enough to
 overwhelm the saved 512 KiB read-modify-write pass. The implementation was
 removed; the original explicit bias/argmax pass remains active.
 
+Structural recurrence parallelization was rejected for the 129-token interactive
+decode workload. Parallelizing the 1,536 recalled output dimensions preserved
+each dimension's token-order sum but measured 106.11 versus 106.46 tok/s in a
+serial same-binary alternating control. Parallelizing independent trunk score
+dot products measured 108.15 versus 107.93 tok/s (+0.2%). At this context size,
+neither loop repays an additional worker dispatch. Both switches were removed.
+The experiment should only be reconsidered near the 2,048-token context limit,
+where trunk work is sixteen times larger and requires a separate long-context
+performance gate.
+
 - Run the same suites on the owner's Orange Pi H618 with 1, 2, and 4 threads.
 - Record board OS/glibc, temperature, throttling, power mode, and sustained RSS.
 - Run the full 472-case strict/fast fixture unattended before enabling any
