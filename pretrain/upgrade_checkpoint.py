@@ -30,7 +30,8 @@ def upgrade(source,output,loss_weight=0.3,loss_warmup_tokens=100_000_000,seed=13
     torch.manual_seed(seed); mtp=MTPModule(D)
     state=dict(checkpoint["model"]); state.update({f"mtp.{name}":value
         for name,value in mtp.state_dict().items()})
-    cfg.update(mtp_horizon=2,mtp_loss_weight=float(loss_weight),
+    cfg.update(architecture_version=2,mtp_variant="a55_k2_conditioned_residual_mlp",
+               mtp_horizon=2,mtp_loss_weight=float(loss_weight),
                mtp_loss_warmup_tokens=int(loss_warmup_tokens))
     payload={"version":2,"checkpoint_type":"model_only_warm_start",
              "cfg":cfg,"model":state,"provenance":{

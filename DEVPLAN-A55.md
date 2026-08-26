@@ -145,6 +145,55 @@ longest valid prefix, and commit or roll back KV state. Measure acceptance rate 
 cost on-device before making token/s claims. The current bundled binary does not implement this
 protocol and is marked incompatible with horizon greater than one.
 
+## Experimental TurboQuant KV baseline
+
+TurboQuant is retained only as a precision/storage reference, not as the default A55 cache.
+The linked 0xsero/turboquant repository is GPL-3.0 and is not vendored into release code;
+finetune/modeling/turboquant_kv.py is an independent experiment based on the published
+algorithm. Keys use a two-bit spherical Lloyd-Max stage plus an independent one-bit QJL
+residual-sign sketch. Values use conventional asymmetric four-bit quantization in groups of 32.
+This is two aligned bitstreams, not a packed cross-byte three-bit integer format.
+
+At head dimension 64 the per-token, per-head payload is exact:
+
+| Component | Bytes |
+|---|---:|
+| Key two-bit indices | 16 |
+| Key one-bit QJL signs | 8 |
+| Key FP16 norm and residual norm | 4 |
+| Value four-bit codes | 32 |
+| Value two FP16 scales and minima | 8 |
+| **Total K+V** | **68** |
+
+The current one-bit K+V payload is 16 bytes/token/head, so this experiment is 4.25 times larger,
+though it remains 3.76 times smaller than FP16 K+V. Static random matrices and codebooks are not
+charged per token.
+
+For Cortex-A55, the costly operation is not three-bit extraction. The two-bit and one-bit streams
+are cheap to unpack, but the exact QR rotation and Gaussian QJL projection each require dense
+64-by-64 floating-point work. Historical attention then combines a Polar contribution and a QJL
+correction. SDOT does not directly eliminate these FP32 transforms or the softmax-weighted value
+accumulation. A randomized FWHT can reduce rotation complexity, but QJL still adds a second score
+path and must be evaluated against an ordinary INT4 cache.
+
+Real checkpoint tensors can be captured with benchmarks/capture_qkv.py and then passed to
+benchmarks/turboquant_kv.py through its --capture option. The comparison reports reconstruction,
+score correlation, top-eight overlap, attention-output error, payload bytes, and separate codec
+timings for one-bit, two-bit, A55 INT4, and experimental TurboQuant. Non-A55 timing remains
+diagnostic only.
+
+The experiment is complete enough to answer the precision question with
+benchmarks/turboquant_kv.py. Promotion requires captures of real Q/K/V tensors, attention-output
+quality gates, and native RK3566 measurements. Unless those gates show a clear end-to-end win,
+the production direction remains an exact recent FP16/INT8 tier, A55-aligned INT4 warm K/V with
+QAT, and the existing one-bit cold retrieval tier.
+
+The A55-aligned INT4 warm cache uses 74 bytes/token/head at width 64: 32 key-code bytes plus one
+FP16 key scale, and 32 value-code bytes plus two FP16 scales and minima for group size 32. It is
+slightly larger than the 68-byte TurboQuant experiment, but avoids dense QR/QJL transforms and
+maps key scoring to nibble expansion plus signed INT8 SDOT. Its advantage must therefore be judged
+by native latency and energy, not storage alone.
+
 ## Phases and gates
 
 ### Phase 1: QAT contract

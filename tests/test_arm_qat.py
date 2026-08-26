@@ -37,6 +37,29 @@ class ArmQATTest(unittest.TestCase):
         actual = common.int8_pot_values(values)[2] @ common.ternary_values(weight)[2].T
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_full_qat_bfloat16_layer_matches_integer_equation(self):
+        torch.manual_seed(29)
+        layer=common.RVQ(64,17,32,1)
+        values=torch.randn(3,64,dtype=torch.bfloat16)
+        common.set_ffn_qat("ternary",True,1.0)
+        code,activation_scale,_=common.int8_pot_values(values)
+        trits,row_scale,_=common.ternary_values(layer.weight)
+        expected=(code.float()@trits.float().T)*activation_scale*row_scale.T
+        actual=layer(values)
+        self.assertEqual(actual.dtype,torch.float32)
+        self.assertTrue(torch.equal(actual,expected))
+        common.set_ffn_qat("ternary",False,1.0)
+
+    def test_full_qat_keeps_weight_and_activation_gradients(self):
+        layer=common.RVQ(8,3,32,1)
+        values=torch.randn(2,8,requires_grad=True)
+        common.set_ffn_qat("int4_row",True,1.0)
+        layer(values).sum().backward()
+        self.assertIsNotNone(values.grad)
+        self.assertIsNotNone(layer.weight.grad)
+        self.assertTrue(bool((layer.weight.grad!=0).any()))
+        common.set_ffn_qat("ternary",False,1.0)
+
     def test_int4_row_contract_and_ste(self):
         weight = torch.tensor([[0.9, -0.2, 0.1, -0.7]], requires_grad=True)
         code, scale, reconstructed = common.int4_row_values(weight)

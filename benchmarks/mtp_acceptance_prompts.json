@@ -1,0 +1,18 @@
+[
+  {"id": "general_01", "category": "general", "prompt": "Explain why plants need sunlight."},
+  {"id": "general_02", "category": "general", "prompt": "Describe a calm morning in a city park."},
+  {"id": "general_03", "category": "general", "prompt": "What makes regular sleep useful?"},
+  {"id": "general_04", "category": "general", "prompt": "Compare walking and cycling briefly."},
+  {"id": "instruction_01", "category": "instruction", "prompt": "Give three concise study tips."},
+  {"id": "instruction_02", "category": "instruction", "prompt": "Write a polite appointment reminder."},
+  {"id": "instruction_03", "category": "instruction", "prompt": "List four steps for checking an application."},
+  {"id": "instruction_04", "category": "instruction", "prompt": "Summarize unit testing in two sentences."},
+  {"id": "code_01", "category": "code", "prompt": "Write a Python function that adds two numbers."},
+  {"id": "code_02", "category": "code", "prompt": "Show a Python loop over a list of names."},
+  {"id": "code_03", "category": "code", "prompt": "Define a Python function that tests whether an integer is even."},
+  {"id": "code_04", "category": "code", "prompt": "Write a short JSON object with a name and count."},
+  {"id": "dialogue_01", "category": "dialogue", "prompt": "User: Hello!\nAssistant:"},
+  {"id": "dialogue_02", "category": "dialogue", "prompt": "User: Can you help me plan dinner?\nAssistant:"},
+  {"id": "dialogue_03", "category": "dialogue", "prompt": "User: Thank you for the explanation.\nAssistant:"},
+  {"id": "dialogue_04", "category": "dialogue", "prompt": "User: Please answer briefly. What is an algorithm?\nAssistant:"}
+]

@@ -56,14 +56,16 @@ class AcceptanceMetrics:
         self.second_eligible=0
         self.second_accepted=0
 
-    def update(self,step):
+    def update(self,step,second_eligible=None):
         first=step.first_accepted.detach().bool()
         second=step.second_accepted.detach().bool()
+        eligible=(first if second_eligible is None else
+                  second_eligible.detach().bool() & first)
         self.cycles+=1
         self.first_proposals+=first.numel()
         self.first_accepted+=int(first.sum())
-        self.second_eligible+=int(first.sum())
-        self.second_accepted+=int(second.sum())
+        self.second_eligible+=int(eligible.sum())
+        self.second_accepted+=int((second & eligible).sum())
 
     def as_dict(self):
         first_rate=self.first_accepted/max(1,self.first_proposals)

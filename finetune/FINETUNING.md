@@ -44,6 +44,12 @@ add `--evaluate-mtp` to `evaluate_loss.py` for offset-two loss and top-1 accurac
 An activation-QAT export writes an adjacent `.a55.json` execution manifest. Its `.shdw` weight
 payload remains usable for kernel development, but exact inference requires the planned integer
 FFN engine; `export_model.py` prints this warning explicitly.
+The KV QAT format is inherited from checkpoint metadata. New A55 checkpoints use int4; an old
+checkpoint without KV metadata defaults to its legacy one-bit format. The option --kv-format int4
+may adapt an old checkpoint to the signed-INT4 Key/groupwise-INT4 Value contract, while
+--kv-hot-tokens controls the exact recent tier recorded in the resulting checkpoint. The bundled
+engine does not support that cache format yet.
+
 The trainer also audits pathological repetition, mixes 10 percent recovery examples, and
 uses repetition-completion unlikelihood loss with weight 0.2. Disable both additions with
 `--recovery-ratio 0 --ul-alpha 0` for an MLE baseline.

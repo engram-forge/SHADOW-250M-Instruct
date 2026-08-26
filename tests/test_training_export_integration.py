@@ -19,7 +19,7 @@ from weight_formats import (int4_row_pack,int4_row_unpack,ternary_pack,
 from validate_export import validate_export
 
 
-PYTHON=Path("/home/dlisuser/quanwen/SHADOW-250M-Instruct/.venv/bin/python")
+PYTHON=Path(sys.executable)
 TINY_ENV={"SHADOW_D":"64","SHADOW_NL":"1","SHADOW_NH":"1",
           "SHADOW_NKV":"1","SHADOW_HD":"64","SHADOW_FFNH":"128",
           "SHADOW_FAST_ATTN":"1","SHADOW_KV_BITS":"1","SHADOW_KV_TWO_TIER":"1"}
@@ -152,6 +152,10 @@ class TrainingExportIntegrationTest(unittest.TestCase):
                     self.assertEqual(checkpoint["cfg"]["ffn_weight_dtype"],dtype)
                     self.assertEqual(checkpoint["cfg"]["mtp_horizon"],2)
                     self.assertIn("mtp.down.weight",checkpoint["model"]); self.assertIn("mtp.up.weight",checkpoint["model"])
+                    evaluated=run(["finetune/evaluate_loss.py","--checkpoint",str(output/"finetuned.pt"),
+                                   "--data",str(data),"--ctx","32","--batches","1",
+                                   "--micro-batch","1","--evaluate-mtp"])
+                    self.assertIn("mtp_loss=",evaluated.stdout); self.assertIn("mtp_accuracy=",evaluated.stdout)
                     shdw=directory/f"{dtype}.shdw"
                     run(["finetune/export_model.py",str(output/"finetuned.pt"),str(shdw)])
                     exported=records(shdw)
@@ -230,6 +234,25 @@ class TrainingExportIntegrationTest(unittest.TestCase):
             manifest=json.loads(Path(str(shdw)+".a55.json").read_text())
             self.assertEqual(manifest["mtp"]["horizon"],1)
             validate_export(shdw,manifest,hidden_size=64)
+
+    def test_legacy_checkpoint_upgrade_warm_starts_new_pretrain_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory); legacy=directory/"legacy.pt"; upgraded=directory/"k2.pt"
+            make_checkpoint(legacy,"ternary",mtp_horizon=1)
+            run(["pretrain/upgrade_checkpoint.py","--input",str(legacy),"--output",str(upgraded)])
+            warm=torch.load(upgraded,map_location="cpu",weights_only=False)
+            self.assertEqual(warm["checkpoint_type"],"model_only_warm_start")
+            self.assertNotIn("optimizer",warm); self.assertEqual(warm["cfg"]["mtp_horizon"],2)
+            data=directory/"dolma"; data.mkdir(); write_dolma(data/"a.json.gz","alpha"); write_dolma(data/"b.json.gz","beta")
+            output=directory/"run"
+            run(["pretrain/train.py","train","--data",str(data),"--out",str(output),
+                 "--init-checkpoint",str(upgraded),"--device","cpu","--amp-dtype","fp32",
+                 "--ctx","8","--micro-batch","1","--accum","1","--workers","0",
+                 "--chunk-docs","1","--max-tokens","8","--val-every","1000",
+                 "--checkpoint-every","8","--diagnostics-every","0","--mtp-horizon","2",
+                 "--ffn-weight-dtype","ternary"])
+            final=torch.load(output/"checkpoints/final.pt",map_location="cpu",weights_only=False)
+            self.assertIn("optimizer",final); self.assertEqual(final["consumed_tokens"],8)
 
 
 if __name__=="__main__": unittest.main()

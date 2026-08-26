@@ -18,6 +18,7 @@ TRAIN_EXACT_KV=bool(int(__import__('os').environ.get(
     'SHADOW_TRAIN_EXACT_KV','1')))
 KV_BITS=_e("SHADOW_KV_BITS",1)             
 KV_TWO_TIER=bool(int(_os.environ.get("SHADOW_KV_TWO_TIER","0")))   
+KV_HOT_TOKENS=_e("SHADOW_KV_HOT_TOKENS",128)
 KV_COLD_MASK=None                          
 FFN_ACT_QAT=bool(int(_os.environ.get("SHADOW_FFN_ACT_QAT","0")))
 FFN_ACT_QAT_STRENGTH=float(_os.environ.get("SHADOW_FFN_ACT_QAT_STRENGTH","1"))
@@ -97,6 +98,36 @@ def ffn_activation(x):
     target=x.float().lerp(quantized.float(),FFN_ACT_QAT_STRENGTH).to(x.dtype)
     return ste(x,target)
 
+def ffn_linear(x,weight):
+    """STE linear whose full-QAT forward equals the A55 integer equation."""
+    quantized_weight=ffn_weight(weight)
+    reference=F.linear(x,quantized_weight.to(x.dtype))
+    if not FFN_ACT_QAT or FFN_ACT_QAT_STRENGTH<1.0:
+        return reference
+    activation_code,activation_scale,_=int8_pot_values(x)
+    if FFN_WEIGHT_DTYPE=="ternary":
+        weight_code,row_scale,_=ternary_values(weight)
+    else:
+        weight_code,row_scale,_=int4_row_values(weight)
+    # All integer sums are below 2^24, so this FP32 matmul is exactly the
+    # target INT32 dot product while remaining efficient in training.
+    with torch.autocast(device_type=x.device.type,enabled=False):
+        integer=activation_code.float()@weight_code.float().T
+        exact=integer*activation_scale.float()*row_scale.float().T
+    return ste(reference,exact)
+
+def set_kv_format(cache_format="1bit",hot_tokens=128):
+    """Select the training/cache contract before constructing model blocks."""
+    global KV_BITS,KV_TWO_TIER,KV_HOT_TOKENS
+    mapping={"1bit":1,"2bit":2,"int4":4}
+    if cache_format not in mapping:
+        raise ValueError(f"unsupported KV cache format {cache_format!r}")
+    if int(hot_tokens)<0:
+        raise ValueError("KV hot-token count must be nonnegative")
+    KV_BITS=mapping[cache_format]
+    KV_TWO_TIER=cache_format in {"1bit","int4"}
+    KV_HOT_TOKENS=int(hot_tokens)
+
 def pot(x):                                   
     m=x.abs().amax(-1,keepdim=True).clamp_min(1e-6); s=torch.exp2(torch.ceil(torch.log2(m/127.)))
     return ste(x,(x/s).round().clamp(-127,127)*s)
@@ -118,7 +149,7 @@ def walsh_hadamard(x):
 def _kv2_levels(x):
     m=x.abs().amax(-1,keepdim=True).clamp_min(1e-6)
     scale=torch.exp2(torch.ceil(torch.log2(m/1.5)))
-    return ((x/scale).round().clamp(-2,1)+0.5)*scale
+    return ((x/scale-0.5).round().clamp(-2,1)+0.5)*scale
 
 def kv2(x):                                   
     rotated=walsh_hadamard(x)
@@ -131,7 +162,7 @@ def kv2_pack(x):
     rotated=walsh_hadamard(x)
     m=rotated.abs().amax(-1,keepdim=True).clamp_min(1e-6)
     scale=torch.exp2(torch.ceil(torch.log2(m/1.5)))
-    code=(rotated/scale).round().clamp(-2,1).to(torch.int16).add_(2).to(torch.uint8)
+    code=(rotated/scale-0.5).round().clamp(-2,1).to(torch.int16).add_(2).to(torch.uint8)
     z=code.reshape(*code.shape[:-1],code.shape[-1]//4,4)
     packed=z[...,0] | (z[...,1]<<2) | (z[...,2]<<4) | (z[...,3]<<6)
     return packed.contiguous(),scale.to(x.dtype).contiguous()
@@ -142,6 +173,76 @@ def kv2_unpack(packed,scale,dtype=None):
     dt=dtype or scale.dtype
     rotated=(code.to(dt)-1.5)*scale.to(dt)
     return walsh_hadamard(rotated)
+
+
+def kv4_key_values(x):
+    """A55-friendly symmetric signed-INT4 key quantization per token/head."""
+    limit=torch.finfo(torch.float16).max
+    xf=torch.nan_to_num(x.float(),nan=0.0,posinf=limit,neginf=-limit).clamp(-limit,limit)
+    scale=(xf.abs().amax(-1,keepdim=True)/7.0).clamp_min(
+        torch.finfo(torch.float16).tiny).to(torch.float16)
+    code=(xf/scale).round().clamp(-7,7).to(torch.int8)
+    return code,scale,(code.float()*scale.float()).to(x.dtype)
+
+
+def kv4_key(x):
+    return ste(x,kv4_key_values(x)[2])
+
+
+def kv4_key_pack(x):
+    if x.shape[-1]%2:
+        raise ValueError("INT4 key width must be even")
+    code,scale,_=kv4_key_values(x)
+    nibble=torch.bitwise_and(code,15).to(torch.uint8)
+    pair=nibble.reshape(*nibble.shape[:-1],nibble.shape[-1]//2,2)
+    packed=pair[...,0] | (pair[...,1]<<4)
+    return packed.contiguous(),scale.contiguous()
+
+
+def kv4_key_unpack(packed,scale,dtype=None):
+    nibble=torch.stack((packed&15,(packed>>4)&15),-1).reshape(
+        *packed.shape[:-1],packed.shape[-1]*2)
+    signed=torch.where(nibble<8,nibble.to(torch.int8),(nibble.to(torch.int16)-16).to(torch.int8))
+    target=dtype or scale.dtype
+    return signed.to(target)*scale.to(target)
+
+
+def kv4_value_values(x,group_size=32):
+    """Asymmetric groupwise INT4 values; metadata is one scale/minimum per group."""
+    if x.shape[-1]%group_size:
+        raise ValueError(f"value width {x.shape[-1]} is not divisible by group {group_size}")
+    limit=torch.finfo(torch.float16).max
+    clean=torch.nan_to_num(x.float(),nan=0.0,posinf=limit,neginf=-limit).clamp(-limit,limit)
+    shape=x.shape; groups=clean.reshape(*shape[:-1],-1,group_size)
+    minimum=groups.amin(-1); maximum=groups.amax(-1)
+    scale=((maximum-minimum)/15.0).clamp_min(
+        torch.finfo(torch.float16).tiny).to(torch.float16)
+    minimum=minimum.to(torch.float16)
+    code=((groups-minimum.unsqueeze(-1))/scale.unsqueeze(-1)).round().clamp(0,15).to(torch.uint8)
+    reconstructed=code.float()*scale.float().unsqueeze(-1)+minimum.float().unsqueeze(-1)
+    return code.reshape(shape),scale,minimum,reconstructed.reshape(shape).to(x.dtype)
+
+
+def kv4_value(x,group_size=32):
+    return ste(x,kv4_value_values(x,group_size)[3])
+
+
+def kv4_value_pack(x,group_size=32):
+    if x.shape[-1]%2:
+        raise ValueError("INT4 value width must be even")
+    code,scale,minimum,_=kv4_value_values(x,group_size)
+    pair=code.reshape(*code.shape[:-1],code.shape[-1]//2,2)
+    packed=pair[...,0] | (pair[...,1]<<4)
+    return packed.contiguous(),scale.contiguous(),minimum.contiguous()
+
+
+def kv4_value_unpack(packed,scale,minimum,group_size=32,dtype=None):
+    code=torch.stack((packed&15,(packed>>4)&15),-1).reshape(
+        *packed.shape[:-1],packed.shape[-1]*2)
+    target=dtype or scale.dtype
+    grouped=code.to(target).reshape(*code.shape[:-1],-1,group_size)
+    values=grouped*scale.to(target).unsqueeze(-1)+minimum.to(target).unsqueeze(-1)
+    return values.reshape(*code.shape[:-1],code.shape[-1])
 
 
 class KVCodec1(nn.Module):
@@ -460,8 +561,7 @@ class RVQ(nn.Module):
         if s._q is None or s._q.device!=s.weight.device: s.enc()
         return ste(s.weight,s._q)
     def forward(s,x):
-        weight=ffn_weight(s.weight) if s.g==32 else s.qw()
-        return F.linear(x,weight.to(x.dtype))
+        return ffn_linear(x,s.weight) if s.g==32 else F.linear(x,s.qw().to(x.dtype))
     def bits(s): return s.st*math.log2(s.c)/s.g
 def requant(m):
     for md in m.modules():
@@ -493,6 +593,7 @@ class Block(nn.Module):
         s.qn=RMS(HD); s.kn=RMS(HD); s.g=nn.Parameter(torch.zeros(NH*HD)); s.alpha=nn.Parameter(torch.full((1,NH,1,1),0.25))
         s.up=RVQ(D,FFNH,32,1); s.gt=RVQ(D,FFNH,32,1); s.dn=RVQ(FFNH,D,32,1)                          
         s.kv_bits=KV_BITS
+        s.kv_hot_tokens=KV_HOT_TOKENS
         s.kcodec=KVCodec1(NKV,HD,seed=1000+int(layer_idx))
         s.vcodec=KVCodec1(NKV,HD,seed=2000+int(layer_idx))
     def _ffn(s,h):
@@ -515,8 +616,13 @@ class Block(nn.Module):
                     k=torch.where(mm,kc,k); v=torch.where(mm,vc,v)
             else:
                 k=s.kcodec(k); v=s.vcodec(v)
-        elif s.kv_bits!=1:
+        elif s.kv_bits==2:
             k=kv2(k); v=kv2(v)
+        elif s.kv_bits==4:
+            # Full-sequence SDPA cannot vary a stored key's precision by query
+            # age. Quantize all training K/V conservatively; cached inference
+            # keeps the configured recent tier exact.
+            k=kv4_key(k); v=kv4_value(v)
         k=k.repeat_interleave(NH//NKV,1); v=v.repeat_interleave(NH//NKV,1)
         if TRAIN_EXACT_POT or not s.training:
             q=pot(q).to(torch.bfloat16)
@@ -637,13 +743,30 @@ class Block(nn.Module):
         if s.kv_bits==1:
             kp=s.kcodec.pack(k0); vp=s.vcodec.pack(v0)
             k=s.kcodec.unpack(kp,z.dtype); v=s.vcodec.unpack(vp,z.dtype)
-        else:
+        elif s.kv_bits==2:
             kp,ks=kv2_pack(k0); vp,vs=kv2_pack(v0)
             k=kv2_unpack(kp,ks,z.dtype); v=kv2_unpack(vp,vs,z.dtype)
+        else:
+            hot=min(s.kv_hot_tokens,k0.shape[2]); warm=k0.shape[2]-hot
+            kp,ks=kv4_key_pack(k0[:,:,:warm]); vp,vs,vz=kv4_value_pack(v0[:,:,:warm])
+            kh=k0[:,:,warm:].detach(); vh=v0[:,:,warm:].detach()
+            k=torch.cat((kv4_key_unpack(kp,ks,z.dtype),kh),2)
+            v=torch.cat((kv4_value_unpack(vp,vs,vz,dtype=z.dtype),vh),2)
         out=s._finish_attention(x,q,k,v,causal=True,exact=exact)
-        cache={"k":kp[:,:,-max_ctx:],"v":vp[:,:,-max_ctx:],
-               "format":("random_walsh_ctv_1bit_v1" if s.kv_bits==1
-                         else "walsh_hadamard_2bit_v1")}
+        if s.kv_bits==4:
+            keep_warm=max(0,max_ctx-hot)
+            cache={"k":kp[:,:,-keep_warm:] if keep_warm else kp[:,:,:0],
+                   "ks":ks[:,:,-keep_warm:] if keep_warm else ks[:,:,:0],
+                   "v":vp[:,:,-keep_warm:] if keep_warm else vp[:,:,:0],
+                   "vs":vs[:,:,-keep_warm:] if keep_warm else vs[:,:,:0],
+                   "vz":vz[:,:,-keep_warm:] if keep_warm else vz[:,:,:0],
+                   "hot_k":kh[:,:,-max_ctx:],"hot_v":vh[:,:,-max_ctx:],
+                   "hot_tokens":min(s.kv_hot_tokens,max_ctx),
+                   "format":"a55_int4_kv_g32_v1"}
+        else:
+            cache={"k":kp[:,:,-max_ctx:],"v":vp[:,:,-max_ctx:],
+                   "format":("random_walsh_ctv_1bit_v1" if s.kv_bits==1
+                             else "walsh_hadamard_2bit_v1")}
         if archive_cold and s.kv_bits==1:
             archive=PagedKVArchive(
                 kp.shape[0],kp.shape[1],kp.shape[-1],
@@ -667,16 +790,40 @@ class Block(nn.Module):
     @torch.no_grad()
     def decode_cached(s,x,position,cache,max_ctx=2048,exact=True,
                       retrieve_cold=True):
-        expected=("random_walsh_ctv_1bit_v1" if s.kv_bits==1
-                  else "walsh_hadamard_2bit_v1")
+        expected=("random_walsh_ctv_1bit_v1" if s.kv_bits==1 else
+                  "walsh_hadamard_2bit_v1" if s.kv_bits==2 else
+                  "a55_int4_kv_g32_v1")
         if cache.get("format")!=expected:
             raise ValueError(f"legacy or unknown KV cache; expected {expected}")
         cos,sin=cs_at(position,x.shape[1],x.device)
         z=s.n1(x); q,k0,v0=s._qkv(z,cos,sin)
         if s.kv_bits==1:
             kp=s.kcodec.pack(k0); vp=s.vcodec.pack(v0)
-        else:
+        elif s.kv_bits==2:
             kp,ks=kv2_pack(k0); vp,vs=kv2_pack(v0)
+        else:
+            cache["hot_k"]=torch.cat((cache["hot_k"],k0.detach()),2)
+            cache["hot_v"]=torch.cat((cache["hot_v"],v0.detach()),2)
+            flush=max(0,cache["hot_k"].shape[2]-int(cache["hot_tokens"]))
+            if flush:
+                kp,ks=kv4_key_pack(cache["hot_k"][:,:,:flush])
+                vp,vs,vz=kv4_value_pack(cache["hot_v"][:,:,:flush])
+                cache["k"]=torch.cat((cache["k"],kp),2)
+                cache["ks"]=torch.cat((cache["ks"],ks),2)
+                cache["v"]=torch.cat((cache["v"],vp),2)
+                cache["vs"]=torch.cat((cache["vs"],vs),2)
+                cache["vz"]=torch.cat((cache["vz"],vz),2)
+                cache["hot_k"]=cache["hot_k"][:,:,flush:]
+                cache["hot_v"]=cache["hot_v"][:,:,flush:]
+            overflow=max(0,cache["k"].shape[2]+cache["hot_k"].shape[2]-max_ctx)
+            if overflow:
+                for name in ("k","ks","v","vs","vz"):
+                    cache[name]=cache[name][:,:,overflow:]
+            k=torch.cat((kv4_key_unpack(cache["k"],cache["ks"],z.dtype),
+                         cache["hot_k"].to(z.dtype)),2)
+            v=torch.cat((kv4_value_unpack(cache["v"],cache["vs"],cache["vz"],dtype=z.dtype),
+                         cache["hot_v"].to(z.dtype)),2)
+            return s._finish_attention(x,q,k,v,causal=x.shape[1]>1,exact=exact),cache
         joined_k=torch.cat((cache["k"],kp),2)
         joined_v=torch.cat((cache["v"],vp),2)
         overflow=max(0,joined_k.shape[2]-max_ctx)

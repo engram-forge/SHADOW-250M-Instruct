@@ -7,36 +7,66 @@ import struct
 import numpy as np
 
 
+def _read_exact(stream,size,description):
+    data=stream.read(size)
+    if len(data)!=size:
+        raise ValueError(f"truncated SHDW while reading {description}")
+    return data
+
+
+def _unpack_exact(stream,format,description):
+    return struct.unpack(format,_read_exact(stream,struct.calcsize(format),description))
+
+
+def _skip_exact(stream,size,description):
+    _read_exact(stream,size,description)
+
+
 def shdw_records(path):
     records={}
     with Path(path).open("rb") as stream:
-        if stream.read(4)!=b"SHDW": raise ValueError("invalid SHDW magic")
-        _,count=struct.unpack("<II",stream.read(8))
+        if _read_exact(stream,4,"magic")!=b"SHDW": raise ValueError("invalid SHDW magic")
+        version,count=_unpack_exact(stream,"<II","header")
+        if version!=1: raise ValueError(f"unsupported SHDW version {version}")
         for _ in range(count):
-            length,=struct.unpack("<I",stream.read(4)); name=stream.read(length).decode()
-            kind,=struct.unpack("<I",stream.read(4)); shape=None
+            length,=_unpack_exact(stream,"<I","record name length")
+            try: name=_read_exact(stream,length,"record name").decode()
+            except UnicodeDecodeError as error: raise ValueError("invalid SHDW record name") from error
+            kind,=_unpack_exact(stream,"<I",f"{name} kind"); shape=None
             if kind in (0,5):
-                rank,=struct.unpack("<I",stream.read(4)); shape=struct.unpack("<"+"I"*rank,stream.read(4*rank))
-                stream.seek(int(np.prod(shape))*(4 if kind==0 else 2),1)
+                rank,=_unpack_exact(stream,"<I",f"{name} rank")
+                if rank>16: raise ValueError(f"unreasonable rank {rank} for {name}")
+                shape=_unpack_exact(stream,"<"+"I"*rank,f"{name} shape") if rank else ()
+                _skip_exact(stream,int(np.prod(shape))*(4 if kind==0 else 2),f"{name} payload")
             elif kind==1:
-                output,input_size,group,stages=struct.unpack("<IIII",stream.read(16)); shape=(output,input_size)
+                output,input_size,group,stages=_unpack_exact(stream,"<IIII",f"{name} RVQ header"); shape=(output,input_size)
+                if not group or input_size%group: raise ValueError(f"invalid RVQ geometry for {name}")
                 groups=input_size//group; padded=(output+63)&~63
-                stream.seek(stages*group*16*4+stages*(padded//64)*groups*32+padded*4,1)
+                _skip_exact(stream,stages*group*16*4+stages*(padded//64)*groups*32+padded*4,
+                            f"{name} RVQ payload")
             elif kind in (3,4,6):
-                output,input_size=struct.unpack("<II",stream.read(8)); shape=(output,input_size)
+                output,input_size=_unpack_exact(stream,"<II",f"{name} quantized header"); shape=(output,input_size)
                 size=output*(input_size//4 if kind==3 else (input_size+4)//5 if kind==4 else (input_size+1)//2)
-                stream.seek(size+output*4,1)
+                _skip_exact(stream,size+output*4,f"{name} quantized payload")
             else: raise ValueError(f"unsupported SHDW record kind {kind}")
             if name in records: raise ValueError(f"duplicate SHDW record {name}")
             records[name]=(kind,shape)
+        if stream.read(1): raise ValueError("trailing data after SHDW records")
     return records
 
 
-def validate_export(path,manifest=None,hidden_size=1536):
+def validate_export(path,manifest=None,hidden_size=1536,checkpoint_cfg=None):
     path=Path(path)
     if manifest is None: manifest=json.loads(Path(str(path)+".a55.json").read_text())
     if manifest.get("architecture_version")!=2: raise ValueError("unsupported architecture version")
     records=shdw_records(path); mtp=manifest.get("mtp",{}); horizon=int(mtp.get("horizon",1))
+    if checkpoint_cfg is not None:
+        checkpoint_horizon=int(checkpoint_cfg.get("mtp_horizon",1))
+        if checkpoint_horizon!=horizon:
+            raise ValueError(f"checkpoint MTP horizon {checkpoint_horizon} != manifest {horizon}")
+        checkpoint_version=int(checkpoint_cfg.get("architecture_version",2))
+        if checkpoint_version!=manifest["architecture_version"]:
+            raise ValueError("checkpoint and manifest architecture versions differ")
     names={name for name in records if name.startswith("mtp.")}
     if horizon==1:
         if names: raise ValueError("K=1 manifest must not contain MTP records")

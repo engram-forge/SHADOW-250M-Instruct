@@ -63,6 +63,10 @@ def arguments():
     parser.add_argument("--ffn-weight-dtype",choices=("ternary","int4_row"),default="ternary")
     parser.add_argument("--ffn-act-qat",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--ffn-act-warmup-tokens",type=int,default=100_000_000)
+    parser.add_argument("--kv-format",choices=("1bit","2bit","int4"),default="int4",
+                        help="training/decode KV contract; int4 targets the A55 warm cache")
+    parser.add_argument("--kv-hot-tokens",type=int,default=128,
+                        help="recent exact tokens before INT4/1-bit compression")
     parser.add_argument("--mtp-horizon",type=int,choices=(1,2),default=2,
                         help="total prediction horizon including the normal next-token head")
     parser.add_argument("--mtp-loss-weight",type=float,default=0.3,
@@ -83,8 +87,13 @@ def arguments():
 
 def qat_config(args):
     return {**arm_qat.contract(args.ffn_act_qat,args.ffn_weight_dtype),
+            "architecture_version":2,
+            "mtp_variant":"a55_k2_conditioned_residual_mlp" if args.mtp_horizon==2 else "none",
             "ffn_act_warmup_tokens":args.ffn_act_warmup_tokens,
             "training_amp_dtype":args.amp_dtype,"parameter_dtype":"float32",
+            "kv_format":args.kv_format,"kv_hot_tokens":args.kv_hot_tokens,
+            "kv_key_scale":"per_token_head_symmetric_fp16" if args.kv_format=="int4" else None,
+            "kv_value_scale":"group32_asymmetric_fp16" if args.kv_format=="int4" else None,
             "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight,
             "mtp_loss_warmup_tokens":args.mtp_loss_warmup_tokens}
 
@@ -93,6 +102,7 @@ def training_contract(args):
     return {"ctx":args.ctx,"micro_batch":args.micro_batch,"accum":args.accum,
             "seed":args.seed,"qat":arm_qat.checkpoint_contract(qat_config(args)),
             "ffn_act_warmup_tokens":args.ffn_act_warmup_tokens,"amp_dtype":args.amp_dtype,
+            "kv_format":args.kv_format,"kv_hot_tokens":args.kv_hot_tokens,
             "mtp_horizon":args.mtp_horizon,"mtp_loss_weight":args.mtp_loss_weight,
             "mtp_loss_warmup_tokens":args.mtp_loss_warmup_tokens}
 
@@ -116,7 +126,7 @@ def file_hash(path):
 def corpus_identity(files, tokenizer, remap, seed):
     payload = {
         "seed": seed,
-        "files": [(path.name, path.stat().st_size) for path in files],
+        "files": [(path.name, path.stat().st_size, file_hash(path)) for path in files],
         "tokenizer_sha256": file_hash(tokenizer),
         "remap_sha256": file_hash(remap),
     }
@@ -136,6 +146,7 @@ def make_packer(args, shards, seed=None, workers=None):
 def make_model(args, device):
     strength=arm_qat.activation_qat_strength(0,args.ffn_act_warmup_tokens,args.ffn_act_qat)
     arm_qat.configure(args.ffn_act_qat,args.ffn_weight_dtype,strength)
+    common.set_kv_format(args.kv_format,args.kv_hot_tokens)
     packed = np.unpackbits(np.load(args.table), axis=1)[:, :512]
     centroids = torch.tensor(packed.astype(np.float32) * 2 - 1, device=device)
     torch.manual_seed(args.seed)
@@ -213,9 +224,9 @@ def validate(args, model, shards, device):
     packer = make_packer(args, shards, seed=args.seed + 1, workers=max(1, args.workers // 2))
     old_strength=common.FFN_ACT_QAT_STRENGTH
     common.set_ffn_activation_qat_strength(1.0 if args.ffn_act_qat else 0.0); model.eval()
-    totals={"loss":0.0,"base_loss":0.0,"base_accuracy":0.0,
-            "mtp_loss":0.0,"mtp_accuracy":0.0}
-    count = 0
+    totals={key:torch.zeros((),device=device) for key in
+            ("base_loss_sum","base_correct","mtp_loss_sum","mtp_correct")}
+    base_tokens=mtp_tokens=0
     dtype,enabled,_=arm_qat.autocast_and_scaler(device,args.amp_dtype)
     try:
         for _ in range(args.val_batches):
@@ -223,14 +234,21 @@ def validate(args, model, shards, device):
             with torch.autocast(device.type,dtype=dtype,enabled=enabled):
                 metrics=causal_metrics(model,inputs.to(device),targets.to(device),
                                        args.mtp_loss_weight)
-                for key in totals: totals[key]+=float(metrics[key])
-            count += 1
+                totals["base_loss_sum"]+=metrics["base_loss"]*metrics["base_tokens"]
+                totals["base_correct"]+=metrics["base_accuracy"]*metrics["base_tokens"]
+                totals["mtp_loss_sum"]+=metrics["mtp_loss"]*metrics["mtp_tokens"]
+                totals["mtp_correct"]+=metrics["mtp_accuracy"]*metrics["mtp_tokens"]
+                base_tokens+=metrics["base_tokens"]; mtp_tokens+=metrics["mtp_tokens"]
     except StopIteration:
         pass
     finally:
         packer.close()
         model.train(); common.set_ffn_activation_qat_strength(old_strength)
-    return {key:value/max(1,count) for key,value in totals.items()}
+    values=torch.stack(tuple(totals.values())).cpu().tolist()
+    base_loss=values[0]/max(1,base_tokens); mtp_loss=values[2]/max(1,mtp_tokens)
+    return {"loss":base_loss+args.mtp_loss_weight*mtp_loss,"base_loss":base_loss,
+            "base_accuracy":values[1]/max(1,base_tokens),"mtp_loss":mtp_loss,
+            "mtp_accuracy":values[3]/max(1,mtp_tokens)}
 
 
 def run_scan(args, files, identity):
@@ -370,8 +388,9 @@ def run_train(args, train_shards, val_shards, identity, device):
         common.set_ffn_activation_qat_strength(arm_qat.activation_qat_strength(
             consumed,args.ffn_act_warmup_tokens,args.ffn_act_qat))
         optimizer.zero_grad(set_to_none=True)
-        metric_sums={key:0.0 for key in ("loss","base_loss","base_accuracy",
-                                         "mtp_loss","mtp_accuracy")}
+        metric_sums={key:torch.zeros((),device=device) for key in
+                     ("base_loss_sum","base_correct","mtp_loss_sum","mtp_correct")}
+        base_metric_tokens=mtp_metric_tokens=0
         actual_accum = 0
         current_mtp_weight=mtp_loss_weight(args,consumed)
         try:
@@ -384,7 +403,13 @@ def run_train(args, train_shards, val_shards, identity, device):
                                                  current_mtp_weight)
                     loss=batch_metrics["loss"]/args.accum
                 scaler.scale(loss).backward()
-                for key in metric_sums: metric_sums[key]+=float(batch_metrics[key].detach())
+                with torch.no_grad():
+                    metric_sums["base_loss_sum"]+=batch_metrics["base_loss"].detach()*batch_metrics["base_tokens"]
+                    metric_sums["base_correct"]+=batch_metrics["base_accuracy"].detach()*batch_metrics["base_tokens"]
+                    metric_sums["mtp_loss_sum"]+=batch_metrics["mtp_loss"].detach()*batch_metrics["mtp_tokens"]
+                    metric_sums["mtp_correct"]+=batch_metrics["mtp_accuracy"].detach()*batch_metrics["mtp_tokens"]
+                    base_metric_tokens+=batch_metrics["base_tokens"]
+                    mtp_metric_tokens+=batch_metrics["mtp_tokens"]
                 actual_accum += 1
         except StopIteration:
             if not actual_accum:
@@ -418,9 +443,14 @@ def run_train(args, train_shards, val_shards, identity, device):
             with diagnostics_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(diagnostic) + "\n")
         elapsed = time.time() - started
+        metric_values=torch.stack(tuple(metric_sums.values())).cpu().tolist()
+        base_loss=metric_values[0]/max(1,base_metric_tokens)
+        mtp_loss=metric_values[2]/max(1,mtp_metric_tokens)
         metrics = {
             "update": update, "tokens": consumed,
-            **{key:value/actual_accum for key,value in metric_sums.items()},
+            "loss":base_loss+current_mtp_weight*mtp_loss,
+            "base_loss":base_loss,"base_accuracy":metric_values[1]/max(1,base_metric_tokens),
+            "mtp_loss":mtp_loss,"mtp_accuracy":metric_values[3]/max(1,mtp_metric_tokens),
             "mtp_loss_weight":current_mtp_weight,
             "lr": lr, "tokens_per_second": max(0, consumed - (0 if not args.resume else saved["consumed_tokens"])) / elapsed,
             "elapsed_seconds": elapsed,
@@ -459,6 +489,7 @@ def main():
     if args.ffn_act_warmup_tokens<0: raise SystemExit("--ffn-act-warmup-tokens must be nonnegative")
     if args.mtp_loss_weight<0: raise SystemExit("--mtp-loss-weight must be nonnegative")
     if args.mtp_loss_warmup_tokens<0: raise SystemExit("--mtp-loss-warmup-tokens must be nonnegative")
+    if args.kv_hot_tokens<0: raise SystemExit("--kv-hot-tokens must be nonnegative")
     if args.device=="cuda" and not torch.cuda.is_available(): raise SystemExit("CUDA is unavailable")
     files = corpus_files(args.data)
     identity = corpus_identity(files, args.tokenizer, args.remap, args.seed)

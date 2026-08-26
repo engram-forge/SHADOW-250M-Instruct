@@ -40,6 +40,13 @@ manifest = {
         "scale": cfg.get("ffn_act_scale", "none"),
         "boundaries": ["post_ffn_rmsnorm_shared_up_gate", "post_swiglu_pre_down"],
     },
+    "kv_cache": {
+        "format": cfg.get("kv_format", "1bit"),
+        "hot_tokens": int(cfg.get("kv_hot_tokens", 128)),
+        "key_scale": cfg.get("kv_key_scale"),
+        "value_scale": cfg.get("kv_value_scale"),
+        "native_engine_required": cfg.get("kv_format", "1bit") == "int4",
+    },
     "accumulator": "int32" if cfg.get("ffn_act_qat", False) else "float32",
     "required_cpu_features": ["asimd", "asimddp"],
     "runtime_dispatch": {"linux_hwcap": "HWCAP_ASIMDDP",
@@ -48,7 +55,7 @@ manifest = {
         if weight_dtype=="ternary" else ["twos_complement_int4_nibble_sdot","signed_int8_sdot"]),
     "compatible_with_bundled_engine": (weight_dtype=="ternary" and
                                         not bool(cfg.get("ffn_act_qat",False)) and
-                                        mtp_horizon==1),
+                                        mtp_horizon==1 and cfg.get("kv_format","1bit")=="1bit"),
 }
 tmp = dst + ".full"
 try:
@@ -61,7 +68,7 @@ finally:
     if os.path.exists(tmp): os.remove(tmp)
 pathlib.Path(dst + ".a55.json").write_text(json.dumps(manifest, indent=2) + "\n")
 from validate_export import validate_export
-validate_export(pathlib.Path(dst),manifest,int(os.environ["SHADOW_D"]))
+validate_export(pathlib.Path(dst),manifest,int(os.environ["SHADOW_D"]),cfg)
 if not manifest["compatible_with_bundled_engine"]:
     print("warning: this checkpoint requires the planned A55 DotProd FFN engine; "
           "the bundled ternary/FP32-activation binary is not deployment-exact")

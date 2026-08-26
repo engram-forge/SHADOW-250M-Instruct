@@ -31,6 +31,23 @@ class ExportValidationTest(unittest.TestCase):
             manifest["compatible_with_bundled_engine"]=True
             with self.assertRaisesRegex(ValueError,"bundled-engine"):
                 validate_export(path,manifest,hidden_size=4)
+            manifest["compatible_with_bundled_engine"]=False
+            with self.assertRaisesRegex(ValueError,"checkpoint MTP horizon"):
+                validate_export(path,manifest,hidden_size=4,checkpoint_cfg={"mtp_horizon":1})
+
+    def test_rejects_truncated_payload_and_trailing_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"broken.shdw"
+            record=dense_record("weight",(2,3))
+            complete=b"SHDW"+struct.pack("<II",1,1)+record
+            manifest={"architecture_version":2,"mtp":{"horizon":1},
+                      "compatible_with_bundled_engine":True}
+            path.write_bytes(complete[:-1])
+            with self.assertRaisesRegex(ValueError,"truncated SHDW"):
+                validate_export(path,manifest,hidden_size=4)
+            path.write_bytes(complete+b"garbage")
+            with self.assertRaisesRegex(ValueError,"trailing data"):
+                validate_export(path,manifest,hidden_size=4)
 
 
 if __name__=="__main__": unittest.main()

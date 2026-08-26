@@ -70,5 +70,12 @@ class ReferenceDecoderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reference_k2_step(model,torch.empty((1,0),dtype=torch.long))
 
+    def test_stop_token_can_make_second_proposal_ineligible(self):
+        step=reference_k2_step(FakeGreedyModel(True),torch.tensor([[0]]))
+        metrics=AcceptanceMetrics(); metrics.update(step,step.reference_first.ne(1))
+        result=metrics.as_dict()
+        self.assertEqual(result["second_eligible"],0)
+        self.assertEqual(result["second_accepted"],0)
+
 
 if __name__=="__main__": unittest.main()

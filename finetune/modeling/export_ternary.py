@@ -19,7 +19,11 @@ MTP_HORIZON=int(ck.get("cfg",{}).get("mtp_horizon",1))
 model=Shadow250M(torch.zeros(V,FPD),torch.zeros(V,FPD),V,mtp_horizon=MTP_HORIZON)
 WEIGHT_DTYPE=ck.get("cfg",{}).get("ffn_weight_dtype","ternary")
 common.set_ffn_qat(WEIGHT_DTYPE,ck.get("cfg",{}).get("ffn_act_qat",False),1.0)
-model.load_state_dict(ck["model"], strict=False); model.eval(); requant(model)
+try:
+    model.load_state_dict(ck["model"], strict=True)
+except RuntimeError as error:
+    raise SystemExit(f"checkpoint/model architecture mismatch: {error}") from error
+model.eval(); requant(model)
 
 class Wrap(torch.nn.Module):                                      
     def __init__(s, m):

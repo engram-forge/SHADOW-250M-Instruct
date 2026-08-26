@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from pretrain.data import DolmaPacker, EOS, ShadowTokenizer, split_shards
 from pretrain.diagnostics import normalized_participation, quantization_gap
-from pretrain.train import training_contract
+from pretrain.train import mtp_loss_weight,training_contract
 from shadow_runtime.retriever import enc
 
 
@@ -70,6 +70,7 @@ class DiagnosticsTest(unittest.TestCase):
             ctx=8; micro_batch=1; accum=1; seed=7; ffn_act_qat=True
             ffn_weight_dtype="ternary"; ffn_act_warmup_tokens=100; amp_dtype="bf16"
             mtp_horizon=2; mtp_loss_weight=0.3; mtp_loss_warmup_tokens=1000
+            kv_format="int4"; kv_hot_tokens=128
         first=training_contract(Args)
         Args.ffn_weight_dtype="int4_row"
         second=training_contract(Args)
@@ -80,11 +81,23 @@ class DiagnosticsTest(unittest.TestCase):
             ctx=8; micro_batch=1; accum=1; seed=7; ffn_act_qat=True
             ffn_weight_dtype="ternary"; ffn_act_warmup_tokens=100; amp_dtype="bf16"
             mtp_horizon=2; mtp_loss_weight=0.3; mtp_loss_warmup_tokens=1000
+            kv_format="int4"; kv_hot_tokens=128
         first=training_contract(Args)
         Args.mtp_horizon=1
         self.assertNotEqual(first,training_contract(Args))
         Args.mtp_horizon=2; Args.mtp_loss_weight=0.1
         self.assertNotEqual(first,training_contract(Args))
+        Args.mtp_loss_weight=0.3; Args.mtp_loss_warmup_tokens=500
+        self.assertNotEqual(first,training_contract(Args))
+
+    def test_mtp_loss_warmup(self):
+        class Args:
+            mtp_horizon=2; mtp_loss_weight=0.3; mtp_loss_warmup_tokens=100
+        self.assertEqual(mtp_loss_weight(Args,0),0.0)
+        self.assertAlmostEqual(mtp_loss_weight(Args,50),0.15)
+        self.assertEqual(mtp_loss_weight(Args,200),0.3)
+        Args.mtp_horizon=1
+        self.assertEqual(mtp_loss_weight(Args,200),0.0)
 
 
 class PackerTest(unittest.TestCase):

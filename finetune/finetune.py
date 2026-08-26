@@ -58,6 +58,10 @@ def get_args():
                     help="linearly introduce activation QAT over this many optimizer steps")
     ap.add_argument("--ffn-weight-dtype",choices=("auto","ternary","int4_row"),default="auto",
                     help="inherit the checkpoint alphabet or explicitly select it")
+    ap.add_argument("--kv-format",choices=("auto","1bit","2bit","int4"),default="auto",
+                    help="inherit checkpoint KV QAT or select the A55 cache format")
+    ap.add_argument("--kv-hot-tokens",type=int,default=None,
+                    help="exact recent KV tokens; defaults to checkpoint value")
     ap.add_argument("--mtp-loss-weight",type=float,default=None,
                     help="auxiliary loss per future head; defaults to checkpoint value")
     ap.add_argument("--mtp-loss-warmup-steps",type=int,default=0,
@@ -240,8 +244,14 @@ def main():
     weight_dtype=checkpoint_weight if a.ffn_weight_dtype=="auto" else a.ffn_weight_dtype
     if a.ffn_weight_dtype!="auto" and "ffn_weight_dtype" in ck.get("cfg",{}) and weight_dtype!=checkpoint_weight:
         raise SystemExit(f"checkpoint FFN dtype is {checkpoint_weight}, requested {weight_dtype}")
+    checkpoint_kv=ck.get("cfg",{}).get("kv_format","1bit")
+    kv_format=checkpoint_kv if a.kv_format=="auto" else a.kv_format
+    kv_hot_tokens=int(ck.get("cfg",{}).get("kv_hot_tokens",128)
+                      if a.kv_hot_tokens is None else a.kv_hot_tokens)
+    if kv_hot_tokens<0: raise SystemExit("--kv-hot-tokens must be nonnegative")
     initial_strength=arm_qat.activation_qat_strength(0,a.ffn_act_warmup_steps,a.ffn_act_qat)
     qat_cfg=arm_qat.configure(a.ffn_act_qat,weight_dtype,initial_strength)
+    common.set_kv_format(kv_format,kv_hot_tokens)
     amp_dtype,amp_enabled,scaler=arm_qat.autocast_and_scaler(dev,a.amp_dtype)
     fp = np.unpackbits(np.load(a.table), axis=1)[:, :512]
     cent = torch.tensor(fp.astype(np.float32) * 2 - 1, device=dev); cent_n = F.normalize(cent, dim=-1)
@@ -304,6 +314,9 @@ def main():
         current_mtp_weight=(mtp_loss_weight if a.mtp_loss_warmup_steps<=0 else
                             mtp_loss_weight*min(1.0,step/a.mtp_loss_warmup_steps))
         latest_metrics=None
+        metric_sums={key:torch.zeros((),device=dev) for key in
+                     ("base_loss_sum","base_correct","mtp_loss_sum","mtp_correct")}
+        base_metric_tokens=mtp_metric_tokens=0
         for _ in range(a.accum):
             x, y = data.pack(a.micro_batch)
             with torch.autocast(dev.type,dtype=amp_dtype,enabled=amp_enabled):
@@ -311,23 +324,36 @@ def main():
                                              return_metrics=True)
                 loss=total/a.accum
             scaler.scale(loss).backward()
+            with torch.no_grad():
+                metric_sums["base_loss_sum"]+=latest_metrics["base_loss"].detach()*latest_metrics["base_tokens"]
+                metric_sums["base_correct"]+=latest_metrics["base_accuracy"].detach()*latest_metrics["base_tokens"]
+                metric_sums["mtp_loss_sum"]+=latest_metrics["mtp_loss"].detach()*latest_metrics["mtp_tokens"]
+                metric_sums["mtp_correct"]+=latest_metrics["mtp_accuracy"].detach()*latest_metrics["mtp_tokens"]
+                base_metric_tokens+=latest_metrics["base_tokens"]
+                mtp_metric_tokens+=latest_metrics["mtp_tokens"]
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt); scaler.update(); requant(model)
         if step % a.log_every == 0:
             el = time.time() - t0
+            values=torch.stack(tuple(metric_sums.values())).cpu().tolist()
             print(json.dumps({"step":step,"lr":lr,"seconds_per_step":el/step,
                 "eta_minutes":(a.steps-step)*el/step/60,
-                "base_loss":float(latest_metrics["base_loss"]),
-                "base_accuracy":float(latest_metrics["base_accuracy"]),
-                "mtp_loss":float(latest_metrics["mtp_loss"]),
-                "mtp_accuracy":float(latest_metrics["mtp_accuracy"]),
+                "base_loss":values[0]/max(1,base_metric_tokens),
+                "base_accuracy":values[1]/max(1,base_metric_tokens),
+                "mtp_loss":values[2]/max(1,mtp_metric_tokens),
+                "mtp_accuracy":values[3]/max(1,mtp_metric_tokens),
                 "mtp_loss_weight":current_mtp_weight}),flush=True)
     v1 = val()
     common.set_ffn_activation_qat_strength(1.0 if a.ffn_act_qat else 0.0)
     torch.save({"model": model.state_dict(),"cfg":{
         "V":cent.shape[0],**qat_cfg,"training_amp_dtype":a.amp_dtype,
+        "kv_format":kv_format,"kv_hot_tokens":kv_hot_tokens,
+        "kv_key_scale":"per_token_head_symmetric_fp16" if kv_format=="int4" else None,
+        "kv_value_scale":"group32_asymmetric_fp16" if kv_format=="int4" else None,
         "parameter_dtype":"float32","ffn_act_warmup_steps":a.ffn_act_warmup_steps,
+        "architecture_version":2,
+        "mtp_variant":"a55_k2_conditioned_residual_mlp" if mtp_horizon==2 else "none",
         "mtp_horizon":mtp_horizon,"mtp_loss_weight":mtp_loss_weight,
         "mtp_loss_warmup_steps":a.mtp_loss_warmup_steps}},out/"finetuned.pt")
     print(f"done  val loss {v0:.4f} -> {v1:.4f}  saved {out/'finetuned.pt'}")

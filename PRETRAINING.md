@@ -63,6 +63,13 @@ uv run python -m pretrain.train train --data DATA --out RUN_INT4 \
   --ffn-weight-dtype int4_row --ffn-act-warmup-tokens 100000000
 ```
 
+Fresh A55-oriented runs default to an INT4 KV training contract with 128 recent cached tokens kept
+exact during decode. Keys use signed INT4 with one FP16 scale per token/head; values use unsigned
+INT4 with FP16 scale/minimum metadata per group of 32. Full-sequence training conservatively
+quantizes every K/V position because SDPA cannot change a stored key's precision as it ages.
+The KV format and hot-tier size are part of the strict resume contract. Use --kv-format 1bit to
+reproduce the prior cache training behavior. INT4 K/V requires the planned native A55 engine.
+
 Fresh pretraining defaults to a prediction horizon of two: the ordinary next-token head plus one
 token-conditioned residual MLP for offset two. It uses RMSNorm and a `D -> D/2 -> D` path while
 sharing the input embedding, base fingerprint head, vocabulary projection, and tied bias. The
@@ -101,7 +108,7 @@ the base model sequentially for both verification positions and writes optional 
 ```bash
 python benchmarks/mtp_reference.py \
   --checkpoint pretrain_runs/dolma-8b/checkpoints/final.pt \
-  --prompt "The quick brown fox" --cycles 16 \
+  --prompts benchmarks/mtp_acceptance_prompts.json --cycles 16 \
   --device cpu --out pretrain_runs/dolma-8b/mtp-acceptance.json
 ```
 
@@ -154,7 +161,7 @@ installation. Override it with `SHADOW_PYTHON_BIN`. Other supported overrides ar
 `SHADOW_WORKERS`, `SHADOW_MICRO_BATCH`, `SHADOW_ACCUM`, `SHADOW_MAX_TOKENS`,
 `SHADOW_DIAGNOSTICS_EVERY`, `SHADOW_DATA_DIR`, `SHADOW_RUN_DIR`, `SHADOW_AMP_DTYPE`,
 `SHADOW_FFN_WEIGHT_DTYPE`, and `SHADOW_FFN_ACT_WARMUP_TOKENS`. Additional
-`SHADOW_MTP_HORIZON`, `SHADOW_MTP_LOSS_WEIGHT`,
+`SHADOW_MTP_HORIZON`, `SHADOW_MTP_LOSS_WEIGHT`, `SHADOW_MTP_LOSS_WARMUP_TOKENS`,
 arguments, such as `--lr 2e-4`, are forwarded to the Python trainer.
 
 ## 5. Stability diagnostics
