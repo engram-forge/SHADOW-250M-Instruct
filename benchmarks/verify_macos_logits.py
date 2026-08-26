@@ -28,10 +28,12 @@ def main():
     parser.add_argument("--table", required=True)
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--threads", type=int, default=10)
+    parser.add_argument("--limit", type=int)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
     fixture = json.loads(pathlib.Path(args.fixture).read_text())
+    cases = fixture["cases"][:args.limit] if args.limit else fixture["cases"]
     max_abs = 0.0
     squared_error = 0.0
     value_count = 0
@@ -40,7 +42,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="shadow-logits-") as directory:
         strict_path = pathlib.Path(directory) / "strict.npy"
         fast_path = pathlib.Path(directory) / "fast.npy"
-        for index, case in enumerate(fixture["cases"], 1):
+        for index, case in enumerate(cases, 1):
             strict = run_logits(args, case["tokens"], strict_path, False)
             fast = run_logits(args, case["tokens"], fast_path, True)
             difference = fast.astype(np.float64) - strict.astype(np.float64)
@@ -51,10 +53,10 @@ def main():
             strict_top = set(np.argpartition(strict, -10)[-10:])
             fast_top = set(np.argpartition(fast, -10)[-10:])
             top10_overlap += len(strict_top & fast_top)
-            if index % 25 == 0 or index == len(fixture["cases"]):
-                print(f"verified {index}/{len(fixture['cases'])}", flush=True)
+            if index % 25 == 0 or index == len(cases):
+                print(f"verified {index}/{len(cases)}", flush=True)
 
-    count = len(fixture["cases"])
+    count = len(cases)
     result = {
         "format": "shadow-macos-logits-verification-v1",
         "cases": count,

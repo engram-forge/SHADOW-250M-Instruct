@@ -184,6 +184,10 @@ bool metal_available() {
         catch (...) { return false; }
     }
 }
+std::vector<std::string> available_archive_backends() {
+    return metal_available() ? std::vector<std::string>{"cpu", "metal"}
+                             : std::vector<std::string>{"cpu"};
+}
 
 ScanResult scan_archive_metal(const std::filesystem::path& path, std::span<const std::uint8_t> query,
                               std::uint32_t layer, std::uint32_t head, std::size_t top_k) {

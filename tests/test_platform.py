@@ -13,11 +13,16 @@ class PlatformSelectionTest(unittest.TestCase):
     def test_selects_each_bundled_runtime(self):
         self.assertEqual(bundled_kernel(self.root, "Windows", "AMD64"), self.root / "deployment/bin/windows/shadow.exe")
         self.assertEqual(bundled_kernel(self.root, "Linux", "x86_64"), self.root / "deployment/bin/linux/shadow")
+        self.assertEqual(bundled_kernel(self.root, "Linux", "aarch64"), self.root / "deployment/bin/linux-arm64/shadow")
         self.assertEqual(bundled_kernel(self.root, "Darwin", "arm64"), self.root / "deployment/bin/macos/shadow")
 
     def test_rejects_intel_mac(self):
         with self.assertRaisesRegex(RuntimeError, "Apple Silicon"):
             bundled_kernel(self.root, "Darwin", "x86_64")
+
+    def test_rejects_unknown_linux_architecture(self):
+        with self.assertRaisesRegex(RuntimeError, "Linux riscv64"):
+            bundled_kernel(self.root, "Linux", "riscv64")
 
     def test_native_archive_arguments_are_forwarded(self):
         with tempfile.TemporaryDirectory() as directory:

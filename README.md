@@ -18,7 +18,7 @@ The model is in this repository. Clone and chat:
     cd SHADOW-250M-Instruct
     python shadow_chat.py
 
-That picks the right prebuilt runtime for Windows, Linux, or Apple Silicon macOS
+That picks the right prebuilt runtime for Windows, x86-64 Linux, ARM64 Linux, or Apple Silicon macOS
 and starts the chat. No framework or model download is required after cloning.
 
 **SHADOW 250M Instruct** is a 250 million parameter language model built from scratch,
@@ -233,6 +233,15 @@ Linux:
 Apple Silicon macOS:
 
     deployment/bin/macos/shadow deployment/shadow250m_instruct.shdw deployment/fp131072.npy "2" 16
+
+Orange Pi H618 / ARM64 Linux:
+
+    deployment/bin/linux-arm64/shadow deployment/shadow250m_instruct.shdw deployment/fp131072.npy "2" 16 --status
+
+Build and qualification details for the Cortex-A53 NEON runtime are documented
+in [native/README.md](native/README.md). The maintained workflow builds in the
+owner's ARM64 Ubuntu 24.04 WSL2 environment and performs final compatibility,
+performance, memory, and thermal validation on the owner's Orange Pi H618.
 
 The macOS runner is an independently reconstructed implementation because the
 historical x86 kernel source is not distributed. Its native build, Metal cold-KV

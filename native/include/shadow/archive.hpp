@@ -49,6 +49,7 @@ ScanResult scan_archive_metal(const std::filesystem::path& path,
                               std::uint32_t layer, std::uint32_t head,
                               std::size_t top_k);
 bool metal_available();
+std::vector<std::string> available_archive_backends();
 ArchiveVectors gather_archive(const std::filesystem::path& path, std::uint32_t layer,
                               std::uint32_t head, std::span<const std::uint64_t> indices);
 void validate_archive_assets(const std::filesystem::path& archive,

@@ -51,7 +51,7 @@ class Engine:
         s.model = str(pathlib.Path(model).resolve()); s.table = str(pathlib.Path(table).resolve())
         selected = pathlib.Path(kernel) if kernel else bundled_kernel(HERE.parent)
         if not selected.exists():
-            raise FileNotFoundError(f"bundled runtime is missing: {selected}; build it with native/build_macos.sh")
+            raise FileNotFoundError(f"bundled runtime is missing: {selected}; see native/README.md for build instructions")
         s.kernel = str(ensure_executable(selected).resolve())
         s.env = dict(os.environ)
         if threads: s.env["SHADOW_THREADS"] = str(threads)

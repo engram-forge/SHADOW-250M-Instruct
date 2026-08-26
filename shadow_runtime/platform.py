@@ -11,7 +11,11 @@ def bundled_kernel(root=None, system=None, machine=None):
     if system == "Windows":
         return root / "deployment" / "bin" / "windows" / "shadow.exe"
     if system == "Linux":
-        return root / "deployment" / "bin" / "linux" / "shadow"
+        if machine in {"aarch64", "arm64"}:
+            return root / "deployment" / "bin" / "linux-arm64" / "shadow"
+        if machine in {"x86_64", "amd64"}:
+            return root / "deployment" / "bin" / "linux" / "shadow"
+        raise RuntimeError(f"no bundled SHADOW runtime for Linux {machine}")
     if system == "Darwin" and machine in {"arm64", "aarch64"}:
         return root / "deployment" / "bin" / "macos" / "shadow"
     if system == "Darwin":

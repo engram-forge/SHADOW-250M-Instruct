@@ -1,6 +1,7 @@
 #include "shadow/archive.hpp"
 #include "shadow/model.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -33,7 +34,19 @@ int main(int argc, char** argv) try {
         constexpr const char* architecture = "unknown";
 #endif
         std::cout << "{\"architecture\":\"" << architecture
-                  << "\",\"cpu_backend\":\"neon\",\"metal_available\":"
+                  << "\",\"cpu_backend\":\""
+#if defined(__aarch64__)
+                  << "neon-armv8"
+#else
+                  << "scalar"
+#endif
+                  << "\",\"archive_backends\":[";
+        const auto backends = shadowrt::available_archive_backends();
+        for (std::size_t i = 0; i < backends.size(); ++i) {
+            if (i) std::cout << ',';
+            std::cout << '"' << backends[i] << '"';
+        }
+        std::cout << "],\"metal_available\":"
                   << (shadowrt::metal_available() ? "true" : "false")
                   << ",\"archive_auto_threshold_bytes\":67108864}\n";
         return 0;
@@ -48,6 +61,10 @@ int main(int argc, char** argv) try {
             if (std::string(argv[i]) == "--backend") backend = argv[++i];
             else if (std::string(argv[i]) == "--repeat") repeat = std::max<std::size_t>(1, std::stoul(argv[++i]));
         }
+        if (backend != "auto" && backend != "cpu" && backend != "metal")
+            throw std::runtime_error("unsupported archive backend: " + backend);
+        if (backend == "metal" && !shadowrt::metal_available())
+            throw std::runtime_error("Metal archive backend is unavailable on this platform");
         shadowrt::ScanResult result; std::vector<double> timings; timings.reserve(repeat);
         const bool auto_metal = backend == "auto" && shadowrt::metal_available()
             && std::filesystem::file_size(argv[2]) >= 64ull * 1024 * 1024;
@@ -61,7 +78,8 @@ int main(int argc, char** argv) try {
         std::cout << "{\"backend\":\"" << result.backend << "\",\"milliseconds\":"
                   << result.milliseconds << ",\"results\":[";
         for (std::size_t i = 0; i < result.indices.size(); ++i) {
-            if (i) std::cout << ','; std::cout << "[" << result.indices[i] << ',' << result.distances[i] << ']';
+            if (i) std::cout << ',';
+            std::cout << "[" << result.indices[i] << ',' << result.distances[i] << ']';
         }
         std::cout << "]}\n"; return 0;
     }
@@ -86,9 +104,15 @@ int main(int argc, char** argv) try {
         else if (arg == "--profile") options.profile = true;
         else throw std::runtime_error("unknown or incomplete option: " + arg);
     }
+    if (options.archive_backend != "auto" && options.archive_backend != "cpu" &&
+        options.archive_backend != "metal")
+        throw std::runtime_error("unsupported archive backend: " + options.archive_backend);
+    if (options.archive_backend == "metal" && !shadowrt::metal_available())
+        throw std::runtime_error("Metal archive backend is unavailable on this platform");
     shadowrt::Runtime runtime(argv[1], argv[2]);
     auto stats = runtime.generate(shadowrt::parse_token_list(argv[3]), options);
-    for (auto token : stats.tokens) std::cout << token << ' '; std::cout << '\n';
+    for (auto token : stats.tokens) std::cout << token << ' ';
+    std::cout << '\n';
     if (status || bench) {
         const auto decode_steps = stats.tokens.empty() ? 0 : stats.tokens.size() - 1;
         const double speed = stats.decode_seconds > 0 ? decode_steps / stats.decode_seconds : 0;
