@@ -215,6 +215,45 @@ exactly; CPU was 0.281 ms while Metal cold start was 37.678 ms, supporting the
 conservative small-archive CPU path. No real 100M archive was available, so no
 100M claim is made. Synthetic 1M/10M files remain build artifacts, not releases.
 
+### Phase 6 — Apple Silicon decode kernels
+
+Phase 6 reaches the 400 tok/s target on an M4 Max with 10 performance-core
+workers. The macOS Python launcher enables a 64 KiB byte-contribution table for fingerprint
+logits. In the 472-case pirate fixture it retained **100% argmax agreement** and
+**100% top-10 overlap** against strict logits across 61,865,984 compared values;
+RMSE was **6.91e-6** and maximum absolute error was **1.03e-4**. Set
+`SHADOW_FAST_LOGITS=0` when bitwise strict logits are required.
+
+The 3-warmup/20-run, 65-token benchmark measured:
+
+| Mode | Median | p05 | p95 | Numerical contract |
+| --- | ---: | ---: | ---: | --- |
+| macOS fast logits | **401.216 tok/s** | 395.885 | 405.015 | 472/472 argmax and top-10 match |
+| strict logits | 354.068 tok/s | 348.095 | 357.999 | bitwise-equal to scalar reference |
+
+Strict optimized and scalar output was byte-for-byte identical over 33 complete
+logit rows and pirate cases 001, 002, and 100. Accepted changes include a persistent
+generation-counter worker pool, Apple performance QoS, native FP16 widening, load-time
+signed-nibble expansion of base-3 weights, 16-row NEON ternary kernels, and 8-row
+fingerprint contribution-table evaluation. The signed-nibble cache costs one half-byte
+per ternary weight in addition to the on-disk base-3 representation; it is generated
+at load time and does not alter `.shdw`. Fast logits also keep a dedicated 8 MiB
+8-row-blocked view of the fingerprint table for contiguous reads. Explicit two-way loop unrolling was faster
+than wider unrolling on the tested M4 Max.
+
+Reproduce the benchmark with:
+
+    uv run python benchmarks/macos_runtime_bench.py \
+      --kernel deployment/bin/macos/shadow \
+      --model deployment/shadow250m_instruct.shdw \
+      --table deployment/fp131072.npy --tokens 2 --generate 65 \
+      --threads 10 --warmup 3 --runs 20 --fast-logits \
+      --out benchmarks/macos_phase6_fast_logits.json
+
+The corresponding strict command omits `--fast-logits`. The full pirate comparison
+is recorded in `benchmarks/macos_phase6_logits.json` and can be regenerated with
+`benchmarks/verify_macos_logits.py`.
+
 ## Modal Linux reference workflow
 
 The logged-in Modal profile is `qwen-wenquan`. Modal CLI 1.5.4 is available through

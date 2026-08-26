@@ -29,10 +29,12 @@ def percentile(values, fraction):
 
 
 def run_once(args):
+    environment = {**os.environ, "SHADOW_THREADS": str(args.threads)}
+    environment["SHADOW_FAST_LOGITS"] = "1" if args.fast_logits else "0"
     started = time.perf_counter()
     result = subprocess.run(
         [args.kernel, args.model, args.table, args.tokens, str(args.generate), "--bench"],
-        capture_output=True, text=True, check=True, env={**os.environ, "SHADOW_THREADS": str(args.threads)},
+        capture_output=True, text=True, check=True, env=environment,
     )
     wall = time.perf_counter() - started
     speed = SPEED.search(result.stderr); prefill = PREFILL.search(result.stderr)
@@ -48,6 +50,7 @@ def main():
     parser.add_argument("--table", required=True); parser.add_argument("--tokens", default="2")
     parser.add_argument("--generate", type=int, default=33); parser.add_argument("--threads", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3); parser.add_argument("--runs", type=int, default=20)
+    parser.add_argument("--fast-logits", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     for _ in range(args.warmup): run_once(args)
@@ -57,7 +60,8 @@ def main():
         "format": "shadow-macos-benchmark-v1", "machine": platform.machine(),
         "platform": platform.platform(), "kernel_sha256": sha256(args.kernel),
         "model_sha256": sha256(args.model), "table_sha256": sha256(args.table),
-        "threads": args.threads, "prompt_tokens": len(args.tokens.split()),
+        "threads": args.threads, "fast_logits": args.fast_logits,
+        "prompt_tokens": len(args.tokens.split()),
         "requested_tokens": args.generate, "warmup": args.warmup, "runs": rows,
         "decode_tok_s_median": statistics.median(speeds),
         "decode_tok_s_p05": percentile(speeds, 0.05), "decode_tok_s_p95": percentile(speeds, 0.95),

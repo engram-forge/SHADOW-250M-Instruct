@@ -55,6 +55,7 @@ class Engine:
         s.kernel = str(ensure_executable(selected).resolve())
         s.env = dict(os.environ)
         if threads: s.env["SHADOW_THREADS"] = str(threads)
+        if sys.platform == "darwin": s.env.setdefault("SHADOW_FAST_LOGITS", "1")
         s.kernel_extra = ()
         if kv_archive:
             s.kernel_extra = ("--archive", str(pathlib.Path(kv_archive).resolve()),

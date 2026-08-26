@@ -1,0 +1,9 @@
+{
+  "format": "shadow-macos-logits-verification-v1",
+  "cases": 472,
+  "logit_values": 61865984,
+  "max_abs": 0.000102996826171875,
+  "rmse": 6.907724578764347e-06,
+  "argmax_agreement": 1.0,
+  "top10_overlap": 1.0
+}
