@@ -483,6 +483,24 @@ def test_tilelang_rms_norm_is_bit_exact(shape):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_tilelang_residual_rms_norm_is_bit_exact():
+    from shadow_tilelang.engine import _rms_norm
+    from shadow_tilelang.kernels import compile_residual_rms_norm
+
+    torch.manual_seed(901)
+    residual = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    projected = torch.randn_like(residual)
+    weight = torch.randn(1536, device="cuda")
+    actual, actual_normalized = compile_residual_rms_norm(1536)(
+        residual, projected, weight
+    )
+    expected = residual + projected
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_normalized, _rms_norm(expected, weight), rtol=0, atol=0
+    )
+
+
 def test_tilelang_combined_qk_norm_is_bit_exact():
     from shadow_tilelang.kernels import compile_qk_rms_norm, compile_rms_norm
 

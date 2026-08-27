@@ -16,6 +16,7 @@ from .kernels import (
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
+    compile_residual_rms_norm,
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
     compile_qk_rms_norm,
     compile_structural_softmax,
@@ -370,12 +371,18 @@ class TileLangEngine:
             (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
         ).flatten(-2)
 
-    def _block(self, layer: int, x, cosine, sine):
+    def _block(
+        self, layer: int, x, cosine, sine, *, normalized=None,
+        next_norm_weight=None,
+    ):
         import torch
         import torch.nn.functional as functional
 
         prefix = f"b.{layer}"
-        z = self._norm(x, self.weights[f"{prefix}.n1.w"])
+        z = (
+            normalized if normalized is not None
+            else self._norm(x, self.weights[f"{prefix}.n1.w"])
+        )
         qkv = self._projection(f"{prefix}.qkv", z)
         q_end = QUERY_HEADS * HEAD_DIM
         kv_width = KV_HEADS * HEAD_DIM
@@ -437,6 +444,11 @@ class TileLangEngine:
             gated = self.linear.swiglu(
                 hidden, self.weights[f"{prefix}.up_gate"]
             )
+            if next_norm_weight is not None:
+                projected = functional.linear(gated, self.weights[f"{prefix}.dn"])
+                return compile_residual_rms_norm(D)(
+                    x, projected, next_norm_weight
+                )
             return self.linear.residual(gated, x, self.weights[f"{prefix}.dn"])
         up_gate = self._projection(f"{prefix}.up_gate", hidden)
         up, gate_projection = up_gate.split(FFN_DIM)
@@ -529,8 +541,19 @@ class TileLangEngine:
             self.fingerprints, self._token_cuda,
             self.weights["emb.weight"],
         )
+        normalized = None
         for layer in range(LAYERS):
-            hidden = self._block(layer, hidden, cosine, sine)
+            result = self._block(
+                layer, hidden, cosine, sine, normalized=normalized,
+                next_norm_weight=(
+                    self.weights[f"b.{layer + 1}.n1.w"]
+                    if layer + 1 < LAYERS else None
+                ),
+            )
+            if layer + 1 < LAYERS:
+                hidden, normalized = result
+            else:
+                hidden = result
         return hidden
 
     def _decode_cuda(self):
