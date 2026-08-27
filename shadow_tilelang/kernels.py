@@ -941,7 +941,7 @@ def compile_attention_value_partials(
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
-    token_parallel = 16
+    token_parallel = 32
 
     @tilelang.jit(target="cuda")
     def value_partials(
@@ -984,7 +984,7 @@ def compile_attention_value_reduce(query_heads: int, head_dim: int):
     """Reduce decode-value segments in the reference segment order."""
 
     tilelang, T = _imports()
-    token_parallel = 16
+    token_parallel = 32
 
     @tilelang.jit(target="cuda")
     def value_reduce(
