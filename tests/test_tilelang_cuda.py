@@ -76,21 +76,22 @@ def test_tilelang_async_greedy_generation_matches_reference(
 
 def test_tilelang_greedy_generation_crosses_split_attention_boundary():
     from pathlib import Path
-    from shadow_tilelang.engine import SPLIT_ATTENTION_POSITION, TileLangEngine
+    from shadow_tilelang.engine import ATTENTION_PARALLELISM, TileLangEngine
 
     root = Path(__file__).resolve().parents[1]
     paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
     with torch.inference_mode():
         engine = TileLangEngine(*paths, backend="tilelang", max_context=512)
         try:
-            engine.position = SPLIT_ATTENTION_POSITION - 2
+            boundary = ATTENTION_PARALLELISM[0][0]
+            engine.position = boundary - 2
             engine._position_cuda.fill_(engine.position)
             logits = engine.step(925)
             generated = engine._generate_greedy_cuda(logits, 4)
             assert len(generated) == 4
-            assert engine.position == SPLIT_ATTENTION_POSITION + 3
-            assert engine._greedy_graph is not None
-            assert engine._greedy_graph_split is not None
+            assert engine.position == boundary + 3
+            assert 0 in engine._greedy_graphs
+            assert ATTENTION_PARALLELISM[0][1] in engine._greedy_graphs
         finally:
             engine.close()
 

@@ -933,7 +933,8 @@ def compile_attention_probabilities(query_heads: int, max_context: int):
 
 @lru_cache(maxsize=None)
 def compile_attention_value_partials(
-    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int,
+    token_parallel: int = 64,
 ):
     """Accumulate the proven 16 decode-value token segments in parallel."""
 
@@ -941,7 +942,8 @@ def compile_attention_value_partials(
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
-    token_parallel = 32
+    if token_parallel < 1:
+        raise ValueError("attention value parallelism must be positive")
 
     @tilelang.jit(target="cuda")
     def value_partials(
@@ -980,11 +982,14 @@ def compile_attention_value_partials(
 
 
 @lru_cache(maxsize=None)
-def compile_attention_value_reduce(query_heads: int, head_dim: int):
+def compile_attention_value_reduce(
+    query_heads: int, head_dim: int, token_parallel: int = 64
+):
     """Reduce decode-value segments in the reference segment order."""
 
     tilelang, T = _imports()
-    token_parallel = 32
+    if token_parallel < 1:
+        raise ValueError("attention value parallelism must be positive")
 
     @tilelang.jit(target="cuda")
     def value_reduce(

@@ -36,7 +36,7 @@ HEAD_DIM = 64
 FFN_DIM = 4224
 FINGERPRINT_DIM = 512
 VOCAB_SIZE = 131072
-SPLIT_ATTENTION_POSITION = 224
+ATTENTION_PARALLELISM = ((208, 64), (768, 128), (1792, 256))
 
 
 def _rms_norm(x, weight, eps: float = 1e-6):
@@ -119,12 +119,9 @@ class TileLangEngine:
                 self.max_context, D, device=self.device, dtype=self.dtype
             )
             self._trunk_cache_cuda.zero_()
-            self._decode_graph = None
-            self._decode_graph_logits = None
-            self._decode_graph_split = None
-            self._decode_graph_split_logits = None
-            self._greedy_graph = None
-            self._greedy_graph_split = None
+            self._decode_graphs = {}
+            self._decode_graph_logits = {}
+            self._greedy_graphs = {}
             self._greedy_tokens_cuda = torch.empty(
                 self.max_context, device=self.device, dtype=torch.int64
             )
@@ -381,7 +378,7 @@ class TileLangEngine:
 
     def _block(
         self, layer: int, x, cosine, sine, *, normalized=None,
-        next_norm_weight=None, split_attention=False,
+        next_norm_weight=None, attention_parallelism=0,
     ):
         import torch
         import torch.nn.functional as functional
@@ -416,7 +413,7 @@ class TileLangEngine:
             v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
-            if split_attention:
+            if attention_parallelism:
                 scores = compile_attention_scores(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
                 )(q, self.k_cache[layer], alpha, self._position_cuda)
@@ -424,12 +421,13 @@ class TileLangEngine:
                     QUERY_HEADS, self.max_context
                 )(scores, self._position_cuda)
                 partials = compile_attention_value_partials(
-                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
+                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,
+                    attention_parallelism,
                 )(
                     probability, self.v_cache[layer], self._position_cuda
                 )
                 attended = compile_attention_value_reduce(
-                    QUERY_HEADS, HEAD_DIM
+                    QUERY_HEADS, HEAD_DIM, attention_parallelism
                 )(partials).reshape(D)
             else:
                 attended = compile_attention(
@@ -556,7 +554,7 @@ class TileLangEngine:
         )
         return self._norm(output, self.weights["step.nf.w"])
 
-    def _decode_trunk_cuda(self, *, split_attention=False):
+    def _decode_trunk_cuda(self, *, attention_parallelism=0):
         angle = self._position_cuda.float() * self._inv_frequency
         cosine = angle.cos().to(self.dtype)
         sine = angle.sin().to(self.dtype)
@@ -570,7 +568,7 @@ class TileLangEngine:
         for layer in range(LAYERS):
             result = self._block(
                 layer, hidden, cosine, sine, normalized=normalized,
-                split_attention=split_attention,
+                attention_parallelism=attention_parallelism,
                 next_norm_weight=(
                     self.weights[f"b.{layer + 1}.n1.w"]
                     if layer + 1 < LAYERS else None
@@ -582,8 +580,10 @@ class TileLangEngine:
                 hidden = result
         return hidden
 
-    def _decode_cuda(self, *, split_attention=False):
-        hidden = self._decode_trunk_cuda(split_attention=split_attention)
+    def _decode_cuda(self, *, attention_parallelism=0):
+        hidden = self._decode_trunk_cuda(
+            attention_parallelism=attention_parallelism
+        )
         compile_circular_store(self.max_context, D)(
             hidden, self._trunk_cache_cuda, self._position_cuda
         )
@@ -597,54 +597,55 @@ class TileLangEngine:
 
         import torch
 
-        split_attention = (
-            self.max_context >= 512
-            and self.position >= SPLIT_ATTENTION_POSITION
-        )
-        self._ensure_decode_graph(split_attention=split_attention)
-        graph = self._decode_graph_split if split_attention else self._decode_graph
+        attention_parallelism = self._attention_parallelism(self.position)
+        self._ensure_decode_graph(attention_parallelism)
+        graph = self._decode_graphs[attention_parallelism]
         graph.replay()
         # Graph outputs have stable storage and are overwritten by the next
         # replay. Preserve normal step() value semantics for callers retaining
         # logits from more than one token.
-        logits = (
-            self._decode_graph_split_logits
-            if split_attention else self._decode_graph_logits
-        )
-        return logits.clone()
+        return self._decode_graph_logits[attention_parallelism].clone()
 
-    def _ensure_decode_graph(self, *, split_attention=False):
+    def _attention_parallelism(self, position: int) -> int:
+        if self.max_context < 512:
+            return 0
+        parallelism = 0
+        for threshold, candidate in ATTENTION_PARALLELISM:
+            if position < threshold:
+                break
+            parallelism = candidate
+        return parallelism
+
+    def _ensure_decode_graph(self, attention_parallelism=0):
         """Capture the dynamic decode graph without changing logical position."""
 
         import torch
 
-        graph = self._decode_graph_split if split_attention else self._decode_graph
+        graph = self._decode_graphs.get(attention_parallelism)
         if graph is None:
             # Compile every lazy TileLang specialization before capture. The
             # warm execution writes the same dynamic cache slot that capture
             # immediately overwrites, so it does not advance model state.
-            self._decode_cuda(split_attention=split_attention)
+            self._decode_cuda(attention_parallelism=attention_parallelism)
             torch.cuda.synchronize(self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                logits = self._decode_cuda(split_attention=split_attention)
-            if split_attention:
-                self._decode_graph_split = graph
-                self._decode_graph_split_logits = logits
-            else:
-                self._decode_graph = graph
-                self._decode_graph_logits = logits
+                logits = self._decode_cuda(
+                    attention_parallelism=attention_parallelism
+                )
+            self._decode_graphs[attention_parallelism] = graph
+            self._decode_graph_logits[attention_parallelism] = logits
             # Capture records work but does not execute it. Replay immediately
             # so the first graphed token observes populated output storage.
 
-    def _ensure_greedy_graph(self, *, split_attention=False):
+    def _ensure_greedy_graph(self, attention_parallelism=0):
         """Capture token selection, state advance, and one complete decode."""
 
         import torch
 
-        graph = self._greedy_graph_split if split_attention else self._greedy_graph
+        graph = self._greedy_graphs.get(attention_parallelism)
         if graph is None:
-            self._ensure_decode_graph(split_attention=split_attention)
+            self._ensure_decode_graph(attention_parallelism)
             torch.cuda.synchronize(self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -652,13 +653,12 @@ class TileLangEngine:
                     self._token_cuda, self._greedy_tokens_cuda,
                     self._position_cuda,
                 )
-                logits = self._decode_cuda(split_attention=split_attention)
+                logits = self._decode_cuda(
+                    attention_parallelism=attention_parallelism
+                )
                 self._token_cuda.copy_(logits.argmax().reshape(1))
                 self._position_cuda.add_(1)
-            if split_attention:
-                self._greedy_graph_split = graph
-            else:
-                self._greedy_graph = graph
+            self._greedy_graphs[attention_parallelism] = graph
 
     def _generate_greedy_cuda(self, logits, token_count: int) -> list[int]:
         """Generate fixed-length greedy tokens with one final host transfer."""
@@ -675,15 +675,9 @@ class TileLangEngine:
             chunk = min(self.max_context, token_count - completed)
             for _ in range(chunk):
                 position = start_position + completed
-                split_attention = (
-                    self.max_context >= 512
-                    and position >= SPLIT_ATTENTION_POSITION
-                )
-                self._ensure_greedy_graph(split_attention=split_attention)
-                graph = (
-                    self._greedy_graph_split
-                    if split_attention else self._greedy_graph
-                )
+                attention_parallelism = self._attention_parallelism(position)
+                self._ensure_greedy_graph(attention_parallelism)
+                graph = self._greedy_graphs[attention_parallelism]
                 graph.replay()
                 completed += 1
             slots = torch.arange(
