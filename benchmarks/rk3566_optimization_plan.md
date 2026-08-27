@@ -299,3 +299,86 @@ At context 2048, prefill also regressed 14.2%. The maximum memory saving was
 about 18.3 MiB, insufficient to justify slower inference and extra cache paths.
 The experiment was removed; FP32 KV storage remains the baseline. These are WSL
 development results and should not be interpreted as RK3566 measurements.
+
+### Mixed-FP16 attention result
+
+A second experiment used FP16 Q/K/V multiplication with FP32 dot-product and
+value accumulation; score scaling, flooring, softmax, normalization, and output
+remained FP32. It required the optional `asimdfhm`/FP16FML extension and retained
+an FP32 fallback. Isolated corrected operator tests on the Surface WSL host found
+shared-MQA Q/K 1.23--1.29x faster and a channel-blocked FP16 V layout 1.86--1.99x
+faster than its same-layout FP32 control. FP16 V in the original token-major
+layout remained slower.
+
+The whole-runtime gate did not preserve those gains. After removing per-head
+allocation, vectorizing probability conversion, and restoring shared-MQA scans,
+context-1024 exact decode measured 67.45 tok/s versus 77.95 tok/s for FP32
+(-13.5%). Median RSS fell only from 194.8 MiB to 185.6 MiB. Short-prompt logits
+and generated tokens were identical, but the performance gate failed before a
+full quality matrix was justified. Batch-4 prefill was intentionally disabled in
+the experimental path and therefore its slower TTFT was not used as acceptance
+evidence. All runtime and microbenchmark code was removed.
+
+This result does not rule out a board-specific assembly kernel, but another retry
+must first explain the operator-to-runtime gap and demonstrate an end-to-end win
+on physical RK3566 hardware. Do not enable FP16 attention merely because Cortex-A55
+supports FP16FML.
+
+### Fair batch-4 FP16 prefill result
+
+The prefill question was retested without the earlier scheduling mismatch. Both
+control and candidate used the same batch-4 scheduler and FP32 KV layout; only
+Q/K and probability/V multiplication changed to FP16FML, with FP32 accumulation
+and FP32 softmax. Final prompt logits were byte-identical for every tested length.
+Three-run WSL medians were:
+
+| Threads | Length | FP32 | Mixed FP16 | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 | 59.28 tok/s | 58.50 tok/s | -1.3% |
+| 1 | 16 | 59.46 tok/s | 57.37 tok/s | -3.5% |
+| 1 | 64 | 58.86 tok/s | 56.43 tok/s | -4.1% |
+| 1 | 256 | 56.49 tok/s | 55.51 tok/s | -1.7% |
+| 2 | 4 | 100.44 tok/s | 78.06 tok/s | -22.3% |
+| 2 | 16 | 98.17 tok/s | 79.04 tok/s | -19.5% |
+| 2 | 64 | 96.36 tok/s | 87.36 tok/s | -9.3% |
+| 2 | 256 | 89.01 tok/s | 97.72 tok/s | +9.8% |
+| 4 | 4 | 161.15 tok/s | 147.86 tok/s | -8.2% |
+| 4 | 16 | 178.17 tok/s | 162.46 tok/s | -8.8% |
+| 4 | 64 | 181.97 tok/s | 166.89 tok/s | -8.3% |
+| 4 | 256 | 139.71 tok/s | 150.57 tok/s | +7.8% |
+
+RSS was effectively unchanged because cache representation was deliberately held
+constant. The candidate failed the no-regression rule and the 15% gain gate at
+lengths 64/256. Compact64 integration was not run because weight format cannot
+remove this isolated attention regression. The FP16 prefill code and benchmark
+switch were removed; FP32 remains the accepted prefill path.
+
+### FP16 range audit
+
+Temporary aggregate instrumentation measured 44 stratified cases from the
+472-case fixture: 32 evenly distributed cases plus the 16 longest prompts,
+deduplicated to 44 prompts and 3,475 input tokens (maximum length 144).
+
+| Stage | Values | Range | Overflow | Zero underflow | Relative RMSE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q cache-ready | 53.4M | -8.875 to 7.562 | 0 | 0 | 0 |
+| K cache-ready | 4.45M | -37.5 to 35 | 0 | 0 | 0 |
+| V cache-ready | 4.45M | -121 to 115 | 0 | 0 | 0 |
+| Q/K/V projected | 62.3M | -240.1 to 252.6 | 0 | 0 | ~2.08e-4 |
+| FFN input | 53.4M | -5.179 to 6.93 | 0 | 2 | ~2.07e-4 |
+| FFN product | 146.8M | -295.5 to 262 | 0 | 119 | ~2.07e-4 |
+| Residual after attention | 53.4M | -329.6 to 2381 | 0 | 0 | ~2.21e-4 |
+| Residual after FFN | 53.4M | -670.9 to 2446 | 0 | 1 | ~2.05e-4 |
+| Logits | 455.5M | -75.62 to 57.58 | 0 | 0 | ~2.09e-4 |
+
+Cache-ready Q/K/V are power-of-two quantized and BF16-rounded; every observed
+value was exactly representable in FP16. Residuals retained about 26.8x range
+headroom below FP16 maximum finite value 65,504. Rare zero-underflows affected
+only extremely small FFN/residual values and do not prove quality safety.
+
+Decision: FP16 storage is range-safe for measured Q/K/V and is a reasonable
+future A55 storage baseline. Keep RMS statistics, attention reductions, softmax,
+residual accumulation, structural recurrence, and logits FP32 initially. FFN and
+residual FP16 storage remain approximate candidates requiring full 472-case
+generation validation. Range safety does not override the rejected WSL speed
+results; persistent FP16 storage should next be measured on physical RK3566.
