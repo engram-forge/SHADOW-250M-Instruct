@@ -73,12 +73,15 @@ backends run on CUDA and use the same quantized weight values and caches.
   sigmoid gates and quantized attention scales are materialized once at load.
 - Packed attention-output and FFN-down projections include bit-exact BF16 gate
   and residual epilogues, avoiding separate pointwise launches.
+- RVQ nibble indices are transposed for coalesced group reads. The two 16-entry
+  stage codebooks are pre-summed into a 256-entry pair table at load, preserving
+  the exact FP32 sum-before-scale value while removing the inner stage loop.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.
 
 On the development H100 NVL, native packed-weight GEMV and exact attention run
-the warm stateful decode fixture at about 89 tokens/s. Packed-weight GEMV
+the warm stateful decode fixture at about 165 tokens/s. Packed-weight GEMV
 reduced load-time CUDA allocation from 644.7 MiB to 178.8 MiB; the fixed K/V
 cache plus packed fingerprints brings the final load allocation to 68.8 MiB
 and peak allocation to 102.0 MiB. Warm 128-token batched prefill runs at about 1,527 tokens/s versus

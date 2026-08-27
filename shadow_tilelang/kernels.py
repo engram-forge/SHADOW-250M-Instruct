@@ -206,8 +206,8 @@ def compile_rvq_gemv(
     @tilelang.jit(target="cuda")
     def gemv(
         x: T.Tensor((in_features,), T.bfloat16),
-        codebooks: T.Tensor((chunks, stages, group_size, 16), T.float32),
-        indices: T.Tensor((stages, chunks, groups, 32), T.uint8),
+        codebooks: T.Tensor((chunks, group_size, 256), T.float32),
+        indices: T.Tensor((stages, chunks, 32, groups), T.uint8),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((out_features,), T.bfloat16)
@@ -227,18 +227,14 @@ def compile_rvq_gemv(
             for group_tile in T.serial(group_tiles):
                 group = group_tile * reduce_threads + lane_k
                 if group < groups:
-                    codes = T.alloc_local((stages,), T.int32)
-                    for stage in T.serial(stages):
-                        byte = indices[stage, chunk, group, packed_lane].astype(T.int32)
-                        codes[stage] = T.if_then_else(
-                            row_lane < 32, byte & 15, byte >> 4
-                        )
+                    byte0 = indices[0, chunk, packed_lane, group].astype(T.int32)
+                    byte1 = indices[1, chunk, packed_lane, group].astype(T.int32)
+                    code0 = T.if_then_else(row_lane < 32, byte0 & 15, byte0 >> 4)
+                    code1 = T.if_then_else(row_lane < 32, byte1 & 15, byte1 >> 4)
+                    pair_code = code0 | (code1 << 4)
                     for component in T.serial(group_size):
-                        value = T.alloc_local((1,), T.float32)
-                        value[0] = 0.0
-                        for stage in T.serial(stages):
-                            value[0] += codebooks[chunk, stage, component, codes[stage]]
-                        weight = (value[0] * scales[row]).astype(T.bfloat16)
+                        value = codebooks[chunk, component, pair_code]
+                        weight = (value * scales[row]).astype(T.bfloat16)
                         partial[0] += (
                             x[group * group_size + component].astype(T.float32)
                             * weight.astype(T.float32)
@@ -278,8 +274,8 @@ def compile_rvq_gemv_gated_residual(
         x: T.Tensor((in_features,), T.bfloat16),
         gate: T.Tensor((in_features,), T.bfloat16),
         residual: T.Tensor((out_features,), T.bfloat16),
-        codebooks: T.Tensor((chunks, stages, group_size, 16), T.float32),
-        indices: T.Tensor((stages, chunks, groups, 32), T.uint8),
+        codebooks: T.Tensor((chunks, group_size, 256), T.float32),
+        indices: T.Tensor((stages, chunks, 32, groups), T.uint8),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((out_features,), T.bfloat16)
@@ -298,17 +294,15 @@ def compile_rvq_gemv_gated_residual(
             for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
                 group = group_tile * reduce_threads + lane_k
                 if group < groups:
-                    codes = T.alloc_local((stages,), T.int32)
-                    for stage in T.serial(stages):
-                        byte = indices[stage, chunk, group, packed_lane].astype(T.int32)
-                        codes[stage] = T.if_then_else(row_lane < 32, byte & 15, byte >> 4)
+                    byte0 = indices[0, chunk, packed_lane, group].astype(T.int32)
+                    byte1 = indices[1, chunk, packed_lane, group].astype(T.int32)
+                    code0 = T.if_then_else(row_lane < 32, byte0 & 15, byte0 >> 4)
+                    code1 = T.if_then_else(row_lane < 32, byte1 & 15, byte1 >> 4)
+                    pair_code = code0 | (code1 << 4)
                     for component in T.serial(group_size):
                         column = group * group_size + component
-                        value = T.alloc_local((1,), T.float32)
-                        value[0] = 0.0
-                        for stage in T.serial(stages):
-                            value[0] += codebooks[chunk, stage, component, codes[stage]]
-                        weight = (value[0] * scales[row]).astype(T.bfloat16)
+                        value = codebooks[chunk, component, pair_code]
+                        weight = (value * scales[row]).astype(T.bfloat16)
                         gated = (x[column] * gate[column]).astype(T.bfloat16)
                         partial[0] += gated.astype(T.float32) * weight.astype(T.float32)
             with T.attr(
@@ -592,8 +586,8 @@ def compile_rvq_gemm(
     @tilelang.jit(target="cuda")
     def gemm(
         x: T.Tensor((batch_size, in_features), T.bfloat16),
-        codebooks: T.Tensor((chunks, stages, group_size, 16), T.float32),
-        indices: T.Tensor((stages, chunks, groups, 32), T.uint8),
+        codebooks: T.Tensor((chunks, group_size, 256), T.float32),
+        indices: T.Tensor((stages, chunks, 32, groups), T.uint8),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((batch_size, out_features), T.bfloat16)
@@ -612,16 +606,14 @@ def compile_rvq_gemm(
             for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
                 group = group_tile * reduce_threads + lane_k
                 if group < groups:
-                    codes = T.alloc_local((stages,), T.int32)
-                    for stage in T.serial(stages):
-                        byte = indices[stage, chunk, group, packed_lane].astype(T.int32)
-                        codes[stage] = T.if_then_else(row_lane < 32, byte & 15, byte >> 4)
+                    byte0 = indices[0, chunk, packed_lane, group].astype(T.int32)
+                    byte1 = indices[1, chunk, packed_lane, group].astype(T.int32)
+                    code0 = T.if_then_else(row_lane < 32, byte0 & 15, byte0 >> 4)
+                    code1 = T.if_then_else(row_lane < 32, byte1 & 15, byte1 >> 4)
+                    pair_code = code0 | (code1 << 4)
                     for component in T.serial(group_size):
-                        value = T.alloc_local((1,), T.float32)
-                        value[0] = 0.0
-                        for stage in T.serial(stages):
-                            value[0] += codebooks[chunk, stage, component, codes[stage]]
-                        weight = (value[0] * scales[row]).astype(T.bfloat16)
+                        value = codebooks[chunk, component, pair_code]
+                        weight = (value * scales[row]).astype(T.bfloat16)
                         partial[0] += (x[token, group * group_size + component].astype(T.float32)
                                        * weight.astype(T.float32))
             with T.attr(

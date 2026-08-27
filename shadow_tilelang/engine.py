@@ -119,14 +119,22 @@ class TileLangEngine:
                 )
             elif isinstance(record, RVQRecord):
                 if self.backend == "tilelang":
+                    if record.stages != 2:
+                        raise ValueError(
+                            f"TileLang packed RVQ requires two stages, got {record.stages} for {record.name}"
+                        )
                     codebooks = torch.from_numpy(np.array(record.codebooks, copy=True)).to(self.device)
+                    pair_codebooks = (
+                        codebooks[0][:, None, :] + codebooks[1][:, :, None]
+                    ).reshape(record.group_size, 256)
                     indices = torch.from_numpy(np.array(record.indices, copy=True)).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)
                     tensor = PackedRVQWeight(
-                        codebooks.unsqueeze(0).expand(
-                            record.out_features // 64, -1, -1, -1
+                        pair_codebooks.unsqueeze(0).expand(
+                            record.out_features // 64, -1, -1
                         ).contiguous(),
-                        indices, scales, record.out_features, record.in_features,
+                        indices.permute(0, 1, 3, 2).contiguous(), scales,
+                        record.out_features, record.in_features,
                         record.group_size, record.stages,
                     )
                 else:
