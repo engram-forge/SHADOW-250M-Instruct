@@ -312,6 +312,28 @@ float dot_fp16(const std::uint16_t *a, const std::uint16_t *b) {
 }
 
 __attribute__((target("fp16fml")))
+void dot_fp16_mqa(const std::uint16_t *queries, const std::uint16_t *key,
+                  float *outputs) {
+  constexpr std::size_t query_count = NH / NKV;
+  float32x4_t low[query_count], high[query_count];
+  for (std::size_t q = 0; q < query_count; ++q) {
+    low[q] = vdupq_n_f32(0);
+    high[q] = vdupq_n_f32(0);
+  }
+  for (std::size_t i = 0; i < HD; i += 8) {
+    const auto kv = vreinterpretq_f16_u16(vld1q_u16(key + i));
+    for (std::size_t q = 0; q < query_count; ++q) {
+      const auto qv =
+          vreinterpretq_f16_u16(vld1q_u16(queries + q * HD + i));
+      low[q] = vfmlalq_low_f16(low[q], qv, kv);
+      high[q] = vfmlalq_high_f16(high[q], qv, kv);
+    }
+  }
+  for (std::size_t q = 0; q < query_count; ++q)
+    outputs[q] = vaddvq_f32(vaddq_f32(low[q], high[q]));
+}
+
+__attribute__((target("fp16fml")))
 void accumulate_value_fp16(float weight, const std::uint16_t *value, float *out) {
   const auto wh = vdupq_n_f16(static_cast<__fp16>(weight));
   for (std::size_t i = 0; i < HD; i += 8) {
@@ -2157,7 +2179,26 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       const std::size_t cache_tokens = use_fp16_qkv ? cache.keys_f16[0].size()
                                                     : cache.keys[0].size();
       std::vector<float> shared_scores;
-      if (!use_fp16_qkv && cache_tokens >= 1024 && options.archive.empty()) {
+      // Scan each long-context MQA key once for all query heads sharing it.
+      // Below the crossover, the per-head kernel's lower register pressure wins.
+      if (use_fp16_qkv && cache_tokens >= 1536 && options.archive.empty()) {
+        shared_scores.resize(NH * cache_tokens);
+        std::array<std::uint16_t, NH * HD> queries_f16{};
+        to_fp16(q, queries_f16.data());
+        for (std::size_t kvh = 0; kvh < NKV; ++kvh)
+          for (std::size_t t = 0; t < cache_tokens; ++t) {
+            float sums[NH / NKV];
+            dot_fp16_mqa(queries_f16.data() + kvh * (NH / NKV) * HD,
+                         cache.keys_f16[kvh][t].data(), sums);
+            for (std::size_t group = 0; group < NH / NKV; ++group) {
+              const std::size_t head = kvh * (NH / NKV) + group;
+              const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
+              shared_scores[head * cache_tokens + t] =
+                  std::floor(aq * bfloat16_round(sums[group]));
+            }
+          }
+      } else if (!use_fp16_qkv && cache_tokens >= 1024 &&
+                 options.archive.empty()) {
         shared_scores.resize(NH * cache_tokens);
         for (std::size_t kvh = 0; kvh < NKV; ++kvh)
           for (std::size_t t = 0; t < cache_tokens; ++t) {

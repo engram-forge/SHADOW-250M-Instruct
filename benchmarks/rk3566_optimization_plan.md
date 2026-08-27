@@ -429,3 +429,17 @@ lookup construction cost more than the existing four-way FP32 kernel. Do not
 retry persistent FP16 hidden/projection inputs without a materially different RVQ
 layout or physical-board evidence. The accepted FP16 QKV cache island is
 unaffected.
+
+### Shared long-context FP16 MQA key scan
+
+The FP16 QKV path now loads each MQA key once and evaluates all 12 query heads
+sharing that KV head with independent FP32 accumulators. It activates only from
+1536 cached tokens; shorter contexts retain the lower-register-pressure per-head
+kernel. Logits and generated tokens were byte-identical to the prior FP16 QKV
+path in the context-512 check.
+
+At context 2048 and four threads, seven interleaved WSL runs improved median
+decode from 57.37 to 60.71 tok/s (+5.8%); the shared scan won six of seven paired
+runs. Initial context-512 and context-1024 screens showed no benefit, which is why
+this is thresholded. These are Surface WSL development results; confirm the
+threshold and gain on physical RK3566.
