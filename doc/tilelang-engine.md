@@ -59,6 +59,10 @@ backends run on CUDA and use the same quantized weight values and caches.
 - Fresh prompts use shape-cached packed GEMM and causal shiftmax kernels. Prompt
   lengths are padded to power-of-two compile buckets and only the final token
   evaluates structural attention, the fingerprint head, and vocabulary logits.
+- Token fingerprints remain in their original 512-bit packed representation.
+  TileLang expands only selected input tokens and computes vocabulary logits
+  directly against packed signs, avoiding a persistent 128 MiB BF16 table and
+  its per-token FP32 conversion.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.
@@ -66,8 +70,8 @@ prompts use the batched prefill path.
 On the development H100 NVL, native packed-weight GEMV and exact attention run
 the warm stateful decode fixture at about 89 tokens/s. Packed-weight GEMV
 reduced load-time CUDA allocation from 644.7 MiB to 178.8 MiB; the fixed K/V
-cache brings the final load allocation to 188.8 MiB and peak allocation to
-734.4 MiB. Warm 128-token batched prefill runs at about 1,527 tokens/s versus
+cache plus packed fingerprints brings the final load allocation to 68.8 MiB
+and peak allocation to 102.0 MiB. Warm 128-token batched prefill runs at about 1,527 tokens/s versus
 113 tokens/s for the token-wise path. These are bring-up numbers, not release
 claims: the GPU was shared during measurement.
 

@@ -225,3 +225,57 @@ def test_tilelang_batched_prefill_matches_reference_and_decode(length):
         finally:
             reference.close()
             native.close()
+
+
+def test_tilelang_packed_fingerprint_logits_match_dense_reference():
+    import numpy as np
+    from shadow_tilelang.kernels import (
+        compile_fingerprint_logits, compile_fingerprint_unpack,
+        compile_fingerprint_unpack_batch,
+    )
+
+    vocabulary, features = 257, 512
+    rng = np.random.default_rng(41)
+    packed = rng.integers(0, 256, size=(vocabulary, features // 8), dtype=np.uint8)
+    packed_cuda = torch.from_numpy(packed).cuda()
+    dense = torch.from_numpy(
+        np.unpackbits(packed, axis=1).astype(np.float32) * 2.0 - 1.0
+    ).cuda().bfloat16()
+    indices = torch.tensor([0, 37, vocabulary - 1], device="cuda")
+    torch.testing.assert_close(
+        compile_fingerprint_unpack(features)(packed_cuda[37]), dense[37], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compile_fingerprint_unpack_batch(3, vocabulary, features)(packed_cuda, indices),
+        dense[indices], rtol=0, atol=0,
+    )
+    projected = torch.randn(features, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(vocabulary, device="cuda")
+    actual = compile_fingerprint_logits(vocabulary, features)(projected, packed_cuda, bias)
+    expected = projected.float() @ (dense.float().T / (features ** 0.5)) + bias
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    assert int(actual.argmax()) == int(expected.argmax())
+
+
+def test_tilelang_decode_preserves_full_logits_and_tokens():
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    prompt = [2, 8, 925, 1234]
+    with torch.inference_mode():
+        reference = TileLangEngine(*paths, backend="torch", max_context=32)
+        native = TileLangEngine(*paths, backend="tilelang", max_context=32)
+        try:
+            expected = reference.prefill(prompt)
+            actual = native.prefill(prompt)
+            for _ in range(12):
+                torch.testing.assert_close(actual, expected, rtol=0.025, atol=1.0)
+                expected_token = int(expected.argmax())
+                assert int(actual.argmax()) == expected_token
+                expected = reference.step(expected_token)
+                actual = native.step(expected_token)
+        finally:
+            reference.close()
+            native.close()

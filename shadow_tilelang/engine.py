@@ -11,7 +11,8 @@ import numpy as np
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
-    compile_attention, compile_prefill_attention,
+    compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
+    compile_fingerprint_unpack_batch, compile_prefill_attention,
 )
 
 
@@ -209,13 +210,50 @@ class TileLangEngine:
         import torch
 
         packed = np.load(path)
-        if packed.ndim != 2 or packed.shape[0] != VOCAB_SIZE:
+        if (
+            packed.ndim != 2 or packed.shape[0] != VOCAB_SIZE
+            or packed.shape[1] * 8 < FINGERPRINT_DIM
+        ):
             raise ValueError(
                 f"fingerprint table must have shape ({VOCAB_SIZE}, bytes), got {packed.shape}"
             )
+        if self.backend == "tilelang":
+            byte_width = FINGERPRINT_DIM // 8
+            return torch.from_numpy(np.array(packed[:, :byte_width], copy=True)).to(
+                self.device
+            ).contiguous()
         bits = np.unpackbits(packed, axis=1)[:, :FINGERPRINT_DIM]
         values = bits.astype(np.float32) * 2.0 - 1.0
         return torch.from_numpy(values).to(self.device, self.dtype).contiguous()
+
+    def _fingerprint(self, token_id: int):
+        if self.backend == "tilelang":
+            return compile_fingerprint_unpack(FINGERPRINT_DIM)(
+                self.fingerprints[token_id]
+            )
+        return self.fingerprints[token_id]
+
+    def _fingerprint_batch(self, indices, batch_size: int):
+        import torch
+
+        if self.backend == "tilelang":
+            padded = torch.zeros(batch_size, device=self.device, dtype=torch.int64)
+            padded[: indices.numel()] = indices
+            return compile_fingerprint_unpack_batch(
+                batch_size, VOCAB_SIZE, FINGERPRINT_DIM
+            )(self.fingerprints, padded)
+        return self.fingerprints[indices]
+
+    def _logits(self, projected):
+        if self.backend == "tilelang":
+            return compile_fingerprint_logits(VOCAB_SIZE, FINGERPRINT_DIM)(
+                projected, self.fingerprints, self.weights["tb"].float()
+            )
+        return (
+            projected.float()
+            @ (self.fingerprints.float().T / math.sqrt(FINGERPRINT_DIM))
+            + self.weights["tb"].float()
+        )
 
     def _projection(self, name: str, x):
         return self.linear(x, self.weights[name])
@@ -353,7 +391,7 @@ class TileLangEngine:
     def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
             raise ValueError(f"token id {token_id} is outside [0, {VOCAB_SIZE})")
-        fingerprint = self.fingerprints[int(token_id)]
+        fingerprint = self._fingerprint(int(token_id))
         if self.backend == "tilelang":
             self._position_cuda.fill_(self.position)
         hidden = self._projection("emb.weight", fingerprint)
@@ -366,10 +404,8 @@ class TileLangEngine:
             return None
         hidden = self._structural_step(hidden)
         hidden = _rms_norm(hidden, self.weights["nf.w"])
-        projected = self._projection("head.weight", hidden).float()
-        logits = projected @ (self.fingerprints.float().T / math.sqrt(FINGERPRINT_DIM))
-        logits += self.weights["tb"].float()
-        return logits
+        projected = self._projection("head.weight", hidden)
+        return self._logits(projected)
 
     def step(self, token_id: int):
         """Consume one token and return float32 next-token logits."""
@@ -391,10 +427,7 @@ class TileLangEngine:
             token_count = len(tokens)
             batch_size = 1 << (token_count - 1).bit_length()
             index = torch.tensor(tokens, device=self.device)
-            fingerprints = torch.zeros(
-                batch_size, FINGERPRINT_DIM, device=self.device, dtype=self.dtype
-            )
-            fingerprints[:token_count] = self.fingerprints[index]
+            fingerprints = self._fingerprint_batch(index, batch_size)
             hidden = self._batch_projection("emb.weight", fingerprints)
             for layer in range(LAYERS):
                 hidden = self._prefill_block(layer, hidden, 0)
@@ -404,9 +437,8 @@ class TileLangEngine:
             self._position_cuda.fill_(self.position)
             final = self._structural_step(hidden[-1])
             final = _rms_norm(final, self.weights["nf.w"])
-            projected = self._projection("head.weight", final).float()
-            logits = projected @ (self.fingerprints.float().T / math.sqrt(FINGERPRINT_DIM))
-            return logits + self.weights["tb"].float()
+            projected = self._projection("head.weight", final)
+            return self._logits(projected)
         for token_id in tokens[:-1]:
             self._consume(token_id, return_logits=False)
         return self._consume(tokens[-1], return_logits=True)

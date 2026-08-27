@@ -634,6 +634,110 @@ def compile_prefill_attention(
     return attention
 
 
+@lru_cache(maxsize=None)
+def compile_fingerprint_unpack(features: int):
+    """Expand one MSB-first bit-packed fingerprint to BF16 signs."""
+
+    if features % 8:
+        raise ValueError("fingerprint width must be divisible by eight")
+    tilelang, T = _imports()
+    packed_width = features // 8
+    threads = min(features, 256)
+
+    @tilelang.jit(target="cuda")
+    def unpack(packed: T.Tensor((packed_width,), T.uint8)):
+        output = T.empty((features,), T.bfloat16)
+        with T.Kernel(T.ceildiv(features, threads), threads=threads) as block:
+            lane = T.get_thread_binding(0)
+            feature = block * threads + lane
+            if feature < features:
+                byte = packed[feature // 8].astype(T.int32)
+                bit = (byte >> (7 - feature % 8)) & 1
+                output[feature] = (bit * 2 - 1).astype(T.bfloat16)
+        return output
+
+    return unpack
+
+
+@lru_cache(maxsize=None)
+def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features: int):
+    """Gather and expand a batch of MSB-first packed fingerprints."""
+
+    if features % 8:
+        raise ValueError("fingerprint width must be divisible by eight")
+    tilelang, T = _imports()
+    packed_width = features // 8
+    threads = min(features, 256)
+
+    @tilelang.jit(target="cuda")
+    def unpack(
+        packed: T.Tensor((vocabulary, packed_width), T.uint8),
+        indices: T.Tensor((batch_size,), T.int64),
+    ):
+        output = T.empty((batch_size, features), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(features, threads), batch_size, threads=threads
+        ) as (block, token):
+            lane = T.get_thread_binding(0)
+            feature = block * threads + lane
+            if feature < features:
+                byte = packed[indices[token], feature // 8].astype(T.int32)
+                bit = (byte >> (7 - feature % 8)) & 1
+                output[token, feature] = (bit * 2 - 1).astype(T.bfloat16)
+        return output
+
+    return unpack
+
+
+@lru_cache(maxsize=None)
+def compile_fingerprint_logits(vocabulary: int, features: int):
+    """Project a BF16 fingerprint vector directly against packed signs."""
+
+    if features % 8:
+        raise ValueError("fingerprint width must be divisible by eight")
+    tilelang, T = _imports()
+    packed_width = features // 8
+    threads = 32
+    bytes_per_lane = T.ceildiv(packed_width, threads)
+    normalization = features ** -0.5
+
+    @tilelang.jit(target="cuda")
+    def logits(
+        projected: T.Tensor((features,), T.bfloat16),
+        packed: T.Tensor((vocabulary, packed_width), T.uint8),
+        bias: T.Tensor((vocabulary,), T.float32),
+    ):
+        output = T.empty((vocabulary,), T.float32)
+        with T.Kernel(vocabulary, threads=threads) as token:
+            lane = T.get_thread_binding(0)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for byte_tile in T.serial(bytes_per_lane):
+                byte_index = byte_tile * threads + lane
+                if byte_index < packed_width:
+                    byte = packed[token, byte_index].astype(T.int32)
+                    for component in T.serial(8):
+                        bit = (byte >> (7 - component)) & 1
+                        sign = bit * 2 - 1
+                        partial[0] += (
+                            projected[byte_index * 8 + component].astype(T.float32)
+                            * sign.astype(T.float32)
+                        )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
+                ))
+            if lane == 0:
+                output[token] = reduced[0] * normalization + bias[token]
+        return output
+
+    return logits
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 
