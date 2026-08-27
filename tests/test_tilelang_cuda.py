@@ -531,7 +531,11 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     vocabulary, features = 257, 512
     rng = np.random.default_rng(41)
     packed = rng.integers(0, 256, size=(vocabulary, features // 8), dtype=np.uint8)
-    packed_cuda = torch.from_numpy(packed).cuda()
+    paired = (
+        packed[:, :32].astype(np.uint16)
+        | (packed[:, 32:].astype(np.uint16) << 8)
+    )
+    packed_cuda = torch.from_numpy(paired).cuda()
     dense = torch.from_numpy(
         np.unpackbits(packed, axis=1).astype(np.float32) * 2.0 - 1.0
     ).cuda().bfloat16()

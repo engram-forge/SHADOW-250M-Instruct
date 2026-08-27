@@ -344,9 +344,18 @@ class TileLangEngine:
             )
         if self.backend == "tilelang":
             byte_width = FINGERPRINT_DIM // 8
-            return torch.from_numpy(np.array(packed[:, :byte_width], copy=True)).to(
-                self.device
-            ).contiguous()
+            if byte_width % 64:
+                raise ValueError(
+                    "TileLang fingerprint width must be divisible by 512 bits"
+                )
+            source = np.array(packed[:, :byte_width], copy=True).reshape(
+                VOCAB_SIZE, byte_width // 64, 64
+            )
+            paired = (
+                source[:, :, :32].astype(np.uint16)
+                | (source[:, :, 32:].astype(np.uint16) << 8)
+            ).reshape(VOCAB_SIZE, byte_width // 2)
+            return torch.from_numpy(paired).to(self.device).contiguous()
         bits = np.unpackbits(packed, axis=1)[:, :FINGERPRINT_DIM]
         values = bits.astype(np.float32) * 2.0 - 1.0
         return torch.from_numpy(values).to(self.device, self.dtype).contiguous()
