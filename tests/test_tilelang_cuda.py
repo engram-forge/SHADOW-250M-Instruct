@@ -313,7 +313,9 @@ def test_tilelang_attention_full_context_equal_scores_are_bit_exact():
 @pytest.mark.parametrize("max_context,position", [(12, 19), (512, 519), (2048, 2055)])
 def test_tilelang_split_attention_is_bit_exact(max_context, position):
     from shadow_tilelang.kernels import (
-        compile_attention, compile_attention_scores, compile_attention_values,
+        compile_attention, compile_attention_probabilities,
+        compile_attention_scores, compile_attention_value_partials,
+        compile_attention_value_reduce, compile_attention_values,
     )
 
     query_heads, kv_heads, head_dim = 24, 2, 64
@@ -337,6 +339,14 @@ def test_tilelang_split_attention_is_bit_exact(max_context, position):
         query_heads, kv_heads, head_dim, max_context
     )(scores, values, position_cuda)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probability = compile_attention_probabilities(query_heads, max_context)(
+        scores, position_cuda
+    )
+    partials = compile_attention_value_partials(
+        query_heads, kv_heads, head_dim, max_context
+    )(probability, values, position_cuda)
+    parallel_actual = compile_attention_value_reduce(query_heads, head_dim)(partials)
+    torch.testing.assert_close(parallel_actual, expected, rtol=0, atol=0)
 
 
 def test_tilelang_engine_circular_cache_matches_reference_after_wrap():

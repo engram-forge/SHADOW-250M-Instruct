@@ -840,6 +840,159 @@ def compile_attention_values(
 
 
 @lru_cache(maxsize=None)
+def compile_attention_probabilities(query_heads: int, max_context: int):
+    """Normalize split attention scores into exact BF16 probabilities."""
+
+    tilelang, T = _imports()
+    head_dim, token_parallel = 64, 16
+    score_threads = head_dim * token_parallel
+
+    @tilelang.jit(target="cuda")
+    def probabilities(
+        input_scores: T.Tensor((query_heads, max_context), T.float32),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((query_heads, max_context), T.bfloat16)
+        with T.Kernel(
+            query_heads, threads=(head_dim, token_parallel)
+        ) as head:
+            lane = T.get_thread_binding(0)
+            token_lane = T.get_thread_binding(1)
+            scores = T.alloc_shared((max_context + 1,), T.float32)
+            total = T.if_then_else(
+                position[0] + 1 < max_context, position[0] + 1, max_context
+            )
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    scores[token] = input_scores[head, token]
+            T.sync_threads()
+            maximum = T.alloc_local((1,), T.float32)
+            if lane == 0 and token_lane == 0:
+                maximum[0] = scores[0]
+                for token in T.serial(1, total):
+                    maximum[0] = T.max(maximum[0], scores[token])
+                scores[max_context] = maximum[0]
+            T.sync_threads()
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    scores[token] = T.exp2(T.max(
+                        scores[token] - scores[max_context], T.float32(-15.0)
+                    ))
+            T.sync_threads()
+            denominator = T.alloc_local((1,), T.float32)
+            T.clear(denominator)
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    denominator[0] += scores[token]
+            denominator_reduced = T.alloc_local((1,), T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), denominator[0], True, denominator_reduced[0],
+                    lane, token_lane, dtype="handle",
+                ))
+            if lane == 0 and token_lane == 0:
+                scores[max_context] = denominator_reduced[0]
+            T.sync_threads()
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    output[head, token] = (
+                        scores[token] / scores[max_context]
+                    ).astype(T.bfloat16)
+        return output
+
+    return probabilities
+
+
+@lru_cache(maxsize=None)
+def compile_attention_value_partials(
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+):
+    """Accumulate the proven 16 decode-value token segments in parallel."""
+
+    if query_heads % kv_heads:
+        raise ValueError("query head count must be divisible by KV head count")
+    tilelang, T = _imports()
+    heads_per_kv = query_heads // kv_heads
+    token_parallel = 16
+
+    @tilelang.jit(target="cuda")
+    def value_partials(
+        probability: T.Tensor((query_heads, max_context), T.bfloat16),
+        values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty(
+            (query_heads, token_parallel, head_dim), T.float32
+        )
+        with T.Kernel(
+            query_heads, token_parallel, threads=head_dim
+        ) as (head, segment):
+            lane = T.get_thread_binding(0)
+            total = T.if_then_else(
+                position[0] + 1 < max_context, position[0] + 1, max_context
+            )
+            start = T.if_then_else(
+                position[0] + 1 <= max_context,
+                0, (position[0] + 1) % max_context,
+            )
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for token_tile in T.serial(T.ceildiv(total, token_parallel)):
+                token = token_tile * token_parallel + segment
+                if token < total:
+                    slot = (start + token) % max_context
+                    attended[0] += (
+                        probability[head, token].astype(T.float32)
+                        * values[head // heads_per_kv, slot, lane].astype(T.float32)
+                    )
+            output[head, segment, lane] = attended[0]
+        return output
+
+    return value_partials
+
+
+@lru_cache(maxsize=None)
+def compile_attention_value_reduce(query_heads: int, head_dim: int):
+    """Reduce decode-value segments in the reference segment order."""
+
+    tilelang, T = _imports()
+    token_parallel = 16
+
+    @tilelang.jit(target="cuda")
+    def value_reduce(
+        partials: T.Tensor(
+            (query_heads, token_parallel, head_dim), T.float32
+        ),
+    ):
+        output = T.empty((query_heads, head_dim), T.bfloat16)
+        with T.Kernel(query_heads, threads=head_dim) as head:
+            lane = T.get_thread_binding(0)
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for segment in T.serial(token_parallel):
+                attended[0] += partials[head, segment, lane]
+            output[head, lane] = attended[0]
+        return output
+
+    return value_reduce
+
+
+@lru_cache(maxsize=None)
 def compile_attention(
     query_heads: int, kv_heads: int, head_dim: int, max_context: int
 ):

@@ -12,7 +12,8 @@ from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpa
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_attention_cache_update, compile_attention_scores,
-    compile_attention_values,
+    compile_attention_probabilities, compile_attention_value_partials,
+    compile_attention_value_reduce, compile_attention_values,
     compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_embedding,
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
@@ -35,7 +36,7 @@ HEAD_DIM = 64
 FFN_DIM = 4224
 FINGERPRINT_DIM = 512
 VOCAB_SIZE = 131072
-SPLIT_ATTENTION_POSITION = 288
+SPLIT_ATTENTION_POSITION = 320
 
 
 def _rms_norm(x, weight, eps: float = 1e-6):
@@ -419,11 +420,17 @@ class TileLangEngine:
                 scores = compile_attention_scores(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
                 )(q, self.k_cache[layer], alpha, self._position_cuda)
-                attended = compile_attention_values(
+                probability = compile_attention_probabilities(
+                    QUERY_HEADS, self.max_context
+                )(scores, self._position_cuda)
+                partials = compile_attention_value_partials(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
                 )(
-                    scores, self.v_cache[layer], self._position_cuda
-                ).reshape(D)
+                    probability, self.v_cache[layer], self._position_cuda
+                )
+                attended = compile_attention_value_reduce(
+                    QUERY_HEADS, HEAD_DIM
+                )(partials).reshape(D)
             else:
                 attended = compile_attention(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
