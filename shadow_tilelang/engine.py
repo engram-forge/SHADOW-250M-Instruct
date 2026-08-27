@@ -18,6 +18,7 @@ from .kernels import (
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
     compile_qk_rms_norm,
     compile_structural_softmax,
+    compile_token_store,
 )
 
 
@@ -113,6 +114,10 @@ class TileLangEngine:
             self._trunk_cache_cuda.zero_()
             self._decode_graph = None
             self._decode_graph_logits = None
+            self._greedy_graph = None
+            self._greedy_tokens_cuda = torch.empty(
+                self.max_context, device=self.device, dtype=torch.int64
+            )
         else:
             self.k_cache = [[] for _ in range(LAYERS)]
             self.v_cache = [[] for _ in range(LAYERS)]
@@ -521,6 +526,18 @@ class TileLangEngine:
 
         import torch
 
+        self._ensure_decode_graph()
+        self._decode_graph.replay()
+        # Graph outputs have stable storage and are overwritten by the next
+        # replay. Preserve normal step() value semantics for callers retaining
+        # logits from more than one token.
+        return self._decode_graph_logits.clone()
+
+    def _ensure_decode_graph(self):
+        """Capture the dynamic decode graph without changing logical position."""
+
+        import torch
+
         if self._decode_graph is None:
             # Compile every lazy TileLang specialization before capture. The
             # warm execution writes the same dynamic cache slot that capture
@@ -532,11 +549,50 @@ class TileLangEngine:
                 self._decode_graph_logits = self._decode_cuda()
             # Capture records work but does not execute it. Replay immediately
             # so the first graphed token observes populated output storage.
-        self._decode_graph.replay()
-        # Graph outputs have stable storage and are overwritten by the next
-        # replay. Preserve normal step() value semantics for callers retaining
-        # logits from more than one token.
-        return self._decode_graph_logits.clone()
+
+    def _ensure_greedy_graph(self):
+        """Capture token selection, state advance, and one complete decode."""
+
+        import torch
+
+        if self._greedy_graph is None:
+            self._ensure_decode_graph()
+            torch.cuda.synchronize(self.device)
+            self._greedy_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._greedy_graph):
+                compile_token_store(self.max_context)(
+                    self._token_cuda, self._greedy_tokens_cuda,
+                    self._position_cuda,
+                )
+                logits = self._decode_cuda()
+                self._token_cuda.copy_(logits.argmax().reshape(1))
+                self._position_cuda.add_(1)
+
+    def _generate_greedy_cuda(self, logits, token_count: int) -> list[int]:
+        """Generate fixed-length greedy tokens with one final host transfer."""
+
+        import torch
+
+        if token_count <= 0:
+            return []
+        start_position = self.position
+        self._token_cuda.copy_(logits.argmax().reshape(1))
+        self._ensure_greedy_graph()
+        generated = []
+        completed = 0
+        while completed < token_count:
+            chunk = min(self.max_context, token_count - completed)
+            for _ in range(chunk):
+                self._greedy_graph.replay()
+            slots = torch.arange(
+                start_position + completed,
+                start_position + completed + chunk,
+                device=self.device, dtype=torch.int64,
+            ) % self.max_context
+            generated.extend(self._greedy_tokens_cuda[slots].cpu().tolist())
+            completed += chunk
+        self.position += token_count
+        return generated
 
     def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
@@ -628,6 +684,13 @@ class TileLangEngine:
 
         prompt = [int(token) for token in token_ids]
         logits = self.prefill(prompt)
+        if (
+            self.backend == "tilelang"
+            and temperature <= 0
+            and repetition_penalty == 1.0
+            and not stop_ids
+        ):
+            return self._generate_greedy_cuda(logits, int(max_new_tokens))
         generated: list[int] = []
         generator = torch.Generator(device=self.device).manual_seed(seed)
         for _ in range(int(max_new_tokens)):

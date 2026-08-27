@@ -843,6 +843,27 @@ def compile_circular_store(max_context: int, width: int):
 
 
 @lru_cache(maxsize=None)
+def compile_token_store(max_context: int):
+    """Record one dynamic token in a circular device-side history."""
+
+    tilelang, T = _imports()
+
+    @tilelang.jit(target="cuda")
+    def store(
+        token: T.Tensor((1,), T.int64),
+        history: T.Tensor((max_context,), T.int64),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((1,), T.int32)
+        with T.Kernel(1, threads=1):
+            history[position[0] % max_context] = token[0]
+            output[0] = position[0]
+        return output
+
+    return store
+
+
+@lru_cache(maxsize=None)
 def compile_circular_gather(max_context: int, width: int):
     """Read a circular cache in chronological order on CUDA."""
 

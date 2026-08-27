@@ -47,6 +47,33 @@ def test_tilelang_engine_matches_cuda_reference():
     assert actual == expected == [356, 296, 306, 356, 297, 267, 356, 296]
 
 
+@pytest.mark.parametrize("max_context,token_count", [(32, 12), (8, 12)])
+def test_tilelang_async_greedy_generation_matches_reference(
+    max_context, token_count
+):
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    prompt = [2, 8, 925, 1234]
+    with torch.inference_mode():
+        reference = TileLangEngine(*paths, backend="torch", max_context=max_context)
+        native = TileLangEngine(*paths, backend="tilelang", max_context=max_context)
+        try:
+            expected = reference.generate(
+                prompt, token_count, repetition_penalty=1.0, stop_ids=()
+            )
+            actual = native.generate(
+                prompt, token_count, repetition_penalty=1.0, stop_ids=()
+            )
+            assert actual == expected
+            assert native.position == reference.position == len(prompt) + token_count
+        finally:
+            reference.close()
+            native.close()
+
+
 def test_tilelang_ternary_unpack_matches_cpu():
     import numpy as np
     from shadow_tilelang.format import TernaryRecord, unpack_ternary
