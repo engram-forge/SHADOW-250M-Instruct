@@ -479,14 +479,11 @@ class TileLangEngine:
         import torch.nn.functional as functional
 
         query = self._projection("step.Wq", current)
-        context = compile_circular_gather(self.max_context, D)(
-            self._trunk_cache_cuda, self._position_cuda
-        )
-        scores = context @ query / math.sqrt(D)
+        scores = self._trunk_cache_cuda @ query / math.sqrt(D)
         valid = self._trunk_slots_cuda <= self._position_cuda[0]
         scores = scores.masked_fill(~valid, float("-inf"))
         probability = torch.softmax(scores.float(), dim=-1).to(self.dtype)
-        recall = probability @ context
+        recall = probability @ self._trunk_cache_cuda
         joined = torch.cat((current, recall))
         hidden = functional.silu(self._projection("step.cin", joined))
         output = current + self._projection("step.cout", hidden)

@@ -245,6 +245,33 @@ def test_tilelang_structural_cache_preserves_chronological_order():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("position", [2, 6])
+def test_tilelang_structural_attention_is_invariant_to_cache_order(position):
+    from shadow_tilelang.kernels import compile_circular_gather
+
+    max_context, width = 4, 64
+    torch.manual_seed(37 + position)
+    cache = torch.randn(
+        max_context, width, device="cuda", dtype=torch.bfloat16
+    )
+    query = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
+    chronological = compile_circular_gather(max_context, width)(cache, position_cuda)
+    valid_count = min(position + 1, max_context)
+
+    expected_scores = chronological @ query
+    expected_scores[valid_count:] = float("-inf")
+    expected_probability = torch.softmax(expected_scores.float(), dim=-1).bfloat16()
+    expected = expected_probability @ chronological
+
+    physical_scores = cache @ query
+    if position + 1 < max_context:
+        physical_scores[position + 1:] = float("-inf")
+    physical_probability = torch.softmax(physical_scores.float(), dim=-1).bfloat16()
+    actual = physical_probability @ cache
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("length", [2, 4, 7])
 def test_tilelang_batched_prefill_matches_reference_and_decode(length):
     from pathlib import Path
