@@ -728,11 +728,24 @@ def compile_attention(
                 maximum[0] = scores[0]
                 for token in T.serial(1, total):
                     maximum[0] = T.max(maximum[0], scores[token])
+                scores[max_context] = maximum[0]
+            T.sync_threads()
+            score_threads = head_dim * token_parallel
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    scores[token] = T.exp2(
+                        T.max(
+                            scores[token] - scores[max_context],
+                            T.float32(-15.0),
+                        )
+                    )
+            T.sync_threads()
+            if lane == 0 and token_lane == 0:
                 denominator[0] = 0.0
                 for token in T.serial(total):
-                    scores[token] = T.exp2(
-                        T.max(scores[token] - maximum[0], T.float32(-15.0))
-                    )
                     denominator[0] += scores[token]
                 scores[max_context] = denominator[0]
             T.sync_threads()
