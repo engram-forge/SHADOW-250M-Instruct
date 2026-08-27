@@ -1256,6 +1256,7 @@ def compile_attention_value_partials(
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
+    query_heads_per_block = 4
     if token_parallel < 1:
         raise ValueError("attention value parallelism must be positive")
 
@@ -1269,9 +1270,14 @@ def compile_attention_value_partials(
             (query_heads, token_parallel, head_dim), T.float32
         )
         with T.Kernel(
-            query_heads, token_parallel, threads=head_dim
-        ) as (head, segment):
+            kv_heads, T.ceildiv(heads_per_kv, query_heads_per_block),
+            token_parallel, threads=head_dim
+        ) as (kv_head, head_block, segment):
             lane = T.get_thread_binding(0)
+            head_0 = kv_head * heads_per_kv + head_block * query_heads_per_block
+            head_1 = head_0 + 1
+            head_2 = head_0 + 2
+            head_3 = head_0 + 3
             total = T.if_then_else(
                 position[0] + 1 < max_context, position[0] + 1, max_context
             )
@@ -1279,17 +1285,35 @@ def compile_attention_value_partials(
                 position[0] + 1 <= max_context,
                 0, (position[0] + 1) % max_context,
             )
-            attended = T.alloc_local((1,), T.float32)
-            T.clear(attended)
+            attended_0 = T.alloc_local((1,), T.float32)
+            attended_1 = T.alloc_local((1,), T.float32)
+            attended_2 = T.alloc_local((1,), T.float32)
+            attended_3 = T.alloc_local((1,), T.float32)
+            T.clear(attended_0)
+            T.clear(attended_1)
+            T.clear(attended_2)
+            T.clear(attended_3)
             for token_tile in T.serial(T.ceildiv(total, token_parallel)):
                 token = token_tile * token_parallel + segment
                 if token < total:
                     slot = (start + token) % max_context
-                    attended[0] += (
-                        probability[head, token].astype(T.float32)
-                        * values[head // heads_per_kv, slot, lane].astype(T.float32)
+                    value = values[kv_head, slot, lane].astype(T.float32)
+                    attended_0[0] += (
+                        probability[head_0, token].astype(T.float32) * value
                     )
-            output[head, segment, lane] = attended[0]
+                    attended_1[0] += (
+                        probability[head_1, token].astype(T.float32) * value
+                    )
+                    attended_2[0] += (
+                        probability[head_2, token].astype(T.float32) * value
+                    )
+                    attended_3[0] += (
+                        probability[head_3, token].astype(T.float32) * value
+                    )
+            output[head_0, segment, lane] = attended_0[0]
+            output[head_1, segment, lane] = attended_1[0]
+            output[head_2, segment, lane] = attended_2[0]
+            output[head_3, segment, lane] = attended_3[0]
         return output
 
     return value_partials
