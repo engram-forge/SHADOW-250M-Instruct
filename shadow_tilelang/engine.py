@@ -10,7 +10,7 @@ import numpy as np
 
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
-    TileLangLinear, TorchLinear, compile_rvq_unpack, compile_ternary_unpack,
+    PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
 )
 
 
@@ -105,23 +105,29 @@ class TileLangEngine:
                     codebooks = torch.from_numpy(np.array(record.codebooks, copy=True)).to(self.device)
                     indices = torch.from_numpy(np.array(record.indices, copy=True)).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)
-                    tensor = compile_rvq_unpack(
-                        record.out_features, record.in_features, record.group_size, record.stages
-                    )(codebooks, indices, scales)
+                    tensor = PackedRVQWeight(
+                        codebooks.unsqueeze(0).expand(
+                            record.out_features // 64, -1, -1, -1
+                        ).contiguous(),
+                        indices, scales, record.out_features, record.in_features,
+                        record.group_size, record.stages,
+                    )
                 else:
                     tensor = torch.from_numpy(unpack_rvq(record)).to(self.device, self.dtype)
             elif isinstance(record, TernaryRecord):
                 if self.backend == "tilelang":
                     packed = torch.from_numpy(np.array(record.packed, copy=True)).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)
-                    tensor = compile_ternary_unpack(
-                        record.out_features, record.in_features
-                    )(packed, scales)
+                    tensor = PackedTernaryWeight(
+                        packed, scales, record.out_features, record.in_features
+                    )
                 else:
                     tensor = torch.from_numpy(unpack_ternary(record)).to(self.device, self.dtype)
             else:  # pragma: no cover - exhaustive type guard
                 raise TypeError(type(record))
-            weights[record.name] = tensor.contiguous()
+            weights[record.name] = (
+                tensor.contiguous() if isinstance(tensor, torch.Tensor) else tensor
+            )
         expected = {"emb.weight", "head.weight", "tb", "nf.w"}
         missing = expected - weights.keys()
         if missing:
@@ -131,16 +137,58 @@ class TileLangEngine:
         # same operation as three Q/K/V and two up/gate calls.
         for layer in range(LAYERS):
             prefix = f"b.{layer}"
-            weights[f"{prefix}.qkv"] = torch.cat(
-                (weights[f"{prefix}.q"], weights[f"{prefix}.k"], weights[f"{prefix}.v"]),
-                dim=0,
-            ).contiguous()
-            weights[f"{prefix}.up_gate"] = torch.cat(
-                (weights[f"{prefix}.up"], weights[f"{prefix}.gt"]), dim=0
-            ).contiguous()
+            if self.backend == "tilelang":
+                weights[f"{prefix}.qkv"] = self._join_rvq(
+                    weights[f"{prefix}.q"], weights[f"{prefix}.k"],
+                    weights[f"{prefix}.v"],
+                )
+                weights[f"{prefix}.up_gate"] = self._join_ternary(
+                    weights[f"{prefix}.up"], weights[f"{prefix}.gt"]
+                )
+            else:
+                weights[f"{prefix}.qkv"] = torch.cat(
+                    (weights[f"{prefix}.q"], weights[f"{prefix}.k"],
+                     weights[f"{prefix}.v"]), dim=0,
+                ).contiguous()
+                weights[f"{prefix}.up_gate"] = torch.cat(
+                    (weights[f"{prefix}.up"], weights[f"{prefix}.gt"]), dim=0
+                ).contiguous()
             for suffix in ("q", "k", "v", "up", "gt"):
                 del weights[f"{prefix}.{suffix}"]
         return weights
+
+    @staticmethod
+    def _join_rvq(*weights: PackedRVQWeight) -> PackedRVQWeight:
+        import torch
+
+        first = weights[0]
+        if any(
+            weight.in_features != first.in_features
+            or weight.group_size != first.group_size
+            or weight.stages != first.stages
+            for weight in weights
+        ):
+            raise ValueError("cannot concatenate incompatible packed RVQ matrices")
+        return PackedRVQWeight(
+            torch.cat(tuple(weight.codebooks for weight in weights), dim=0).contiguous(),
+            torch.cat(tuple(weight.indices for weight in weights), dim=1).contiguous(),
+            torch.cat(tuple(weight.scales for weight in weights), dim=0).contiguous(),
+            sum(weight.out_features for weight in weights),
+            first.in_features, first.group_size, first.stages,
+        )
+
+    @staticmethod
+    def _join_ternary(*weights: PackedTernaryWeight) -> PackedTernaryWeight:
+        import torch
+
+        first = weights[0]
+        if any(weight.in_features != first.in_features for weight in weights):
+            raise ValueError("cannot concatenate incompatible packed ternary matrices")
+        return PackedTernaryWeight(
+            torch.cat(tuple(weight.packed for weight in weights), dim=0).contiguous(),
+            torch.cat(tuple(weight.scales for weight in weights), dim=0).contiguous(),
+            sum(weight.out_features for weight in weights), first.in_features,
+        )
 
     def _load_fingerprints(self, path: str | Path):
         import torch

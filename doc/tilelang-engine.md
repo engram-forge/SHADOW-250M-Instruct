@@ -39,32 +39,31 @@ uv run python -m shadow_tilelang.chat
 ```
 
 Use `--backend torch` to validate the graph without TileLang kernels. Both
-backends run on CUDA and use the same unpacked weights and caches.
+backends run on CUDA and use the same quantized weight values and caches.
 
 ## What is native today
 
 - The 52 MB deployment model is read directly; no training checkpoint or
   conversion step is required.
-- RVQ and base-3 ternary records are validated and materialized on the GPU.
+- RVQ and base-3 ternary records are validated and kept packed on the GPU.
 - Prompt processing and generation stay in one process; the bundled CPU binary
   is not invoked.
-- All autoregressive linear projections use a shape-specialized TileLang CUDA
-  BF16 GEMV with FP32 accumulation.
+- Dense autoregressive projections use a shape-specialized TileLang CUDA BF16
+  GEMV with FP32 accumulation. RVQ and base-3 projections fuse packed-weight
+  lookup, BF16 dequantization, and GEMV in one kernel.
 - Q/K/V and SwiGLU up/gate rows are concatenated at load time, reducing each
   transformer block from seven projection launches to four.
 - The exact power-of-two Q/K/V quantizer and floor/exp2 shiftmax attention are
   represented in the runtime graph.
 
-The first implementation processes prefill one token at a time and materializes
-weights as BF16. That is the correctness-oriented baseline. The next measured
-optimizations are fused RVQ/base-3 dequantization GEMV, a tiled exact-shiftmax
-attention kernel, and a batched prefill path.
+The current implementation processes prefill one token at a time. The next
+measured optimizations are a tiled exact-shiftmax attention kernel and a batched
+prefill path.
 
 On the development H100 NVL, the warm stateful decode fixture currently runs
-at about 72 tokens/s and peaks at 1.19 GiB allocated. This is a bring-up number,
-not a release claim: the GPU was shared, and the baseline deliberately expands
-the 52 MB packed weights to BF16. Packed dequantization GEMV is the main memory
-and bandwidth milestone.
+at about 72 tokens/s. Packed-weight GEMV reduced load-time CUDA allocation from
+644.7 MiB to 178.8 MiB and peak allocation from 1,189.0 MiB to 725.6 MiB. These
+are bring-up numbers, not release claims: the GPU was shared during measurement.
 
 ## Inspect generated CUDA
 
