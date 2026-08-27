@@ -159,6 +159,109 @@ def compile_rvq_dense_gemv(out_features: int, in_features: int):
 
 
 @lru_cache(maxsize=None)
+def compile_rvq_dense_gemv_split_silu(
+    out_features: int, input_features: int
+):
+    """Dense exact-order structural projection with a BF16 SiLU epilogue."""
+
+    tilelang, T = _imports()
+    in_features = input_features * 2
+    n_partition, reduce_threads, vector = 8, 16, 8
+    block_k = reduce_threads * vector
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        left: T.Tensor((input_features,), T.bfloat16),
+        right: T.Tensor((input_features,), T.bfloat16),
+        weight: T.Tensor((out_features, in_features), T.bfloat16),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile_k in T.serial(T.ceildiv(in_features, block_k)):
+                for inner in T.serial(vector):
+                    column = tile_k * block_k + lane_k * vector + inner
+                    activation = T.if_then_else(
+                        column < input_features,
+                        left[column], right[column - input_features],
+                    )
+                    partial[0] += (
+                        activation.astype(T.float32)
+                        * weight[row, column].astype(T.float32)
+                    )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                value = reduced[0].astype(T.bfloat16).astype(T.float32)
+                output[row] = value / (T.float32(1) + T.exp(-value))
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
+def compile_rvq_dense_gemv_residual(out_features: int, in_features: int):
+    """Dense exact-order RVQ projection with a BF16 residual epilogue."""
+
+    tilelang, T = _imports()
+    n_partition, reduce_threads, vector = 8, 16, 8
+    block_k = reduce_threads * vector
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        x: T.Tensor((in_features,), T.bfloat16),
+        residual: T.Tensor((out_features,), T.bfloat16),
+        weight: T.Tensor((out_features, in_features), T.bfloat16),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile_k in T.serial(T.ceildiv(in_features, block_k)):
+                for inner in T.serial(vector):
+                    column = tile_k * block_k + lane_k * vector + inner
+                    partial[0] += (
+                        x[column].astype(T.float32)
+                        * weight[row, column].astype(T.float32)
+                    )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                projected = reduced[0].astype(T.bfloat16)
+                output[row] = residual[row] + projected
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
 def compile_ternary_unpack(out_features: int, in_features: int):
     """Compile CUDA expansion of row-local five-trit weight bytes."""
 
@@ -2237,6 +2340,10 @@ class TileLangLinear:
             raise TypeError("split SiLU projection requires packed RVQ weights")
         if weight.in_features != left.numel() + right.numel():
             raise ValueError("split SiLU inputs do not match projection width")
+        if isinstance(weight, DenseDecodeRVQWeight):
+            return compile_rvq_dense_gemv_split_silu(
+                weight.out_features, left.numel()
+            )(left.contiguous(), right.contiguous(), weight.dense)
         return compile_rvq_gemv_split_silu(
             weight.out_features, left.numel(), weight.group_size, weight.stages
         )(
@@ -2247,6 +2354,10 @@ class TileLangLinear:
     def rvq_residual(self, x, residual, weight):
         if not isinstance(weight, PackedRVQWeight):
             raise TypeError("RVQ residual projection requires packed RVQ weights")
+        if isinstance(weight, DenseDecodeRVQWeight):
+            return compile_rvq_dense_gemv_residual(*weight.shape)(
+                x.contiguous(), residual, weight.dense
+            )
         return compile_rvq_gemv_residual(
             weight.out_features, weight.in_features, weight.group_size,
             weight.stages,

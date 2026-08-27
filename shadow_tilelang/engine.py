@@ -253,6 +253,14 @@ class TileLangEngine:
                 ).contiguous()
             for suffix in ("q", "k", "v", "up", "gt"):
                 del weights[f"{prefix}.{suffix}"]
+        if self.backend == "tilelang":
+            for name in ("step.cin", "step.cout"):
+                packed = weights[name]
+                weights[name] = DenseDecodeRVQWeight(
+                    packed.codebooks, packed.indices, packed.scales,
+                    packed.out_features, packed.in_features, packed.group_size,
+                    packed.stages, self._materialize_rvq(packed),
+                )
         return weights
 
     @staticmethod
