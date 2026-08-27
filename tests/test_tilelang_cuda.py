@@ -292,3 +292,15 @@ def test_tilelang_rms_norm_is_bit_exact(shape):
     actual = compile_rms_norm(*shape)(x, weight)
     expected = _rms_norm(x, weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(24, 64), (2, 64), (4, 64)])
+def test_tilelang_power_of_two_quantizer_is_bit_exact(shape):
+    from shadow_tilelang.engine import _power_of_two_quantize
+    from shadow_tilelang.kernels import compile_power_of_two_quantize
+
+    torch.manual_seed(sum(shape))
+    x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+    actual = compile_power_of_two_quantize(*shape)(x)
+    expected = _power_of_two_quantize(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

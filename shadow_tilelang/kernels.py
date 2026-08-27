@@ -783,6 +783,49 @@ def compile_rms_norm(rows: int, width: int, epsilon: float = 1e-6):
     return rms_norm
 
 
+@lru_cache(maxsize=None)
+def compile_power_of_two_quantize(rows: int, width: int):
+    """Compile the exact per-row BF16 power-of-two activation quantizer."""
+
+    tilelang, T = _imports()
+    threads = min(256, 1 << (width - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def quantize(x: T.Tensor((rows, width), T.bfloat16)):
+        output = T.empty((rows, width), T.bfloat16)
+        with T.Kernel(rows, threads=threads) as row:
+            lane = T.get_thread_binding(0)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            if lane < width:
+                partial[0] = T.abs(x[row, lane]).astype(T.float32)
+            else:
+                partial[0] = 0.0
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
+                ))
+            maximum = T.max(reduced[0], T.float32(1e-6)).astype(T.bfloat16)
+            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+            scale = T.exp2(exponent).astype(T.bfloat16)
+            if lane < width:
+                rounded = T.round((x[row, lane] / scale).astype(T.float32))
+                clipped = T.min(
+                    T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+                ).astype(T.bfloat16)
+                output[row, lane] = clipped * scale
+        return output
+
+    return quantize
+
+
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 

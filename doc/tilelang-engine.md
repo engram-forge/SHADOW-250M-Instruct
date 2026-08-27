@@ -65,6 +65,9 @@ backends run on CUDA and use the same quantized weight values and caches.
   its per-token FP32 conversion.
 - FP32-accumulating RMSNorm is a shape-specialized TileLang kernel and remains
   bit-exact with the CUDA reference implementation.
+- The exact per-head power-of-two Q/K/V quantizer is also a single, bit-exact
+  TileLang kernel rather than a sequence of PyTorch reductions and pointwise
+  launches.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.

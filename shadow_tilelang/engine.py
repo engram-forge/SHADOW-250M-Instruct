@@ -13,6 +13,7 @@ from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_unpack_batch, compile_prefill_attention, compile_rms_norm,
+    compile_power_of_two_quantize,
 )
 
 
@@ -267,6 +268,17 @@ class TileLangEngine:
         output = compile_rms_norm(rows, width)(x.reshape(rows, width), weight)
         return output.reshape(shape)
 
+    def _quantize(self, x):
+        if self.backend != "tilelang":
+            return _power_of_two_quantize(x)
+        shape = x.shape
+        width = shape[-1]
+        rows = x.numel() // width
+        output = compile_power_of_two_quantize(rows, width)(
+            x.reshape(rows, width)
+        )
+        return output.reshape(shape)
+
     def _batch_projection(self, name: str, x):
         if self.backend == "tilelang":
             return self.linear.batch(x, self.weights[name])
@@ -297,9 +309,9 @@ class TileLangEngine:
         q = self._norm(q, self.weights[f"{prefix}.qn.w"])
         k = self._norm(k, self.weights[f"{prefix}.kn.w"])
         q, k = self._rope(q, self.position), self._rope(k, self.position)
-        q = _power_of_two_quantize(q)
-        k = _power_of_two_quantize(k)
-        v = _power_of_two_quantize(v)
+        q = self._quantize(q)
+        k = self._quantize(k)
+        v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha"].reshape(QUERY_HEADS)
         alpha = (alpha * 4096.0).round() / 4096.0
         if self.backend == "tilelang":
