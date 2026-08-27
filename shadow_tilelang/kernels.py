@@ -170,13 +170,13 @@ def compile_rvq_dense_gemv(
 
 @lru_cache(maxsize=None)
 def compile_rvq_dense_gemv_split_silu(
-    out_features: int, input_features: int
+    out_features: int, input_features: int, reduce_threads: int = 16
 ):
     """Dense exact-order structural projection with a BF16 SiLU epilogue."""
 
     tilelang, T = _imports()
     in_features = input_features * 2
-    n_partition, reduce_threads, vector = 8, 16, 8
+    n_partition, vector = 8, 128 // reduce_threads
     block_k = reduce_threads * vector
 
     @tilelang.jit(target="cuda")
@@ -2886,7 +2886,7 @@ class TileLangLinear:
             raise ValueError("split SiLU inputs do not match projection width")
         if isinstance(weight, DenseDecodeRVQWeight):
             return compile_rvq_dense_gemv_split_silu(
-                weight.out_features, left.numel()
+                weight.out_features, left.numel(), 32
             )(left.contiguous(), right.contiguous(), weight.dense)
         return compile_rvq_gemv_split_silu(
             weight.out_features, left.numel(), weight.group_size, weight.stages

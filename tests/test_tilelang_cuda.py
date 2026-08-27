@@ -225,6 +225,7 @@ def test_tilelang_rvq_gemv_matches_materialized_sections():
 def test_tilelang_dense_rvq_reduction_geometry_is_bit_exact():
     from shadow_tilelang.kernels import (
         compile_rvq_dense_gemv, compile_rvq_dense_gemv_residual,
+        compile_rvq_dense_gemv_split_silu,
     )
 
     torch.manual_seed(29)
@@ -233,6 +234,18 @@ def test_tilelang_dense_rvq_reduction_geometry_is_bit_exact():
     residual = torch.randn(128, device="cuda", dtype=torch.bfloat16)
     expected = compile_rvq_dense_gemv(128, 512, 2, 16)(value, weight)
     actual = compile_rvq_dense_gemv(128, 512, 2, 32)(value, weight)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    left = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    right = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    split_weight = torch.randn(
+        128, 512, device="cuda", dtype=torch.bfloat16
+    )
+    expected = compile_rvq_dense_gemv_split_silu(
+        128, 256, 16
+    )(left, right, split_weight)
+    actual = compile_rvq_dense_gemv_split_silu(
+        128, 256, 32
+    )(left, right, split_weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     expected = compile_rvq_dense_gemv_residual(
         128, 512, 2, 16
