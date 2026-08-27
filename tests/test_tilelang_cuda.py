@@ -272,13 +272,14 @@ def test_tilelang_attention_matches_reference_with_circular_cache(
     keys[:, slots] = chronological_keys
     values[:, slots] = chronological_values
     alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    gate = torch.ones(query_heads * head_dim, device="cuda", dtype=torch.bfloat16)
     position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
     compile_attention_cache_update(kv_heads, head_dim, max_context)(
         chronological_keys[:, -1].contiguous(),
         chronological_values[:, -1].contiguous(), keys, values, position_cuda,
     )
     actual = compile_attention(query_heads, kv_heads, head_dim, max_context)(
-        query, keys, values, alpha, position_cuda,
+        query, keys, values, alpha, gate, position_cuda,
     )
     repeated_keys = chronological_keys.repeat_interleave(query_heads // kv_heads, dim=0)
     repeated_values = chronological_values.repeat_interleave(query_heads // kv_heads, dim=0)
@@ -335,10 +336,11 @@ def test_tilelang_attention_full_context_equal_scores_are_bit_exact():
     torch.manual_seed(771)
     values = torch.randn_like(keys)
     alpha = torch.ones(query_heads, device="cuda")
+    gate = torch.ones(query_heads * head_dim, device="cuda", dtype=torch.bfloat16)
     position = torch.tensor([max_context - 1], device="cuda", dtype=torch.int32)
     actual = compile_attention(
         query_heads, kv_heads, head_dim, max_context
-    )(query, keys, values, alpha, position)
+    )(query, keys, values, alpha, gate, position)
     expected = values.float().mean(dim=1).bfloat16().repeat_interleave(
         query_heads // kv_heads, dim=0
     )
@@ -363,10 +365,11 @@ def test_tilelang_split_attention_is_bit_exact(max_context, position):
     )
     values = torch.randn_like(keys)
     alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    gate = torch.ones(query_heads * head_dim, device="cuda", dtype=torch.bfloat16)
     position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
     expected = compile_attention(
         query_heads, kv_heads, head_dim, max_context
-    )(query, keys, values, alpha, position_cuda)
+    )(query, keys, values, alpha, gate, position_cuda)
     scores = compile_attention_scores(
         query_heads, kv_heads, head_dim, max_context
     )(query, keys, alpha, position_cuda)

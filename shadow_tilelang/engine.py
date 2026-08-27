@@ -40,7 +40,7 @@ HEAD_DIM = 64
 FFN_DIM = 4224
 FINGERPRINT_DIM = 512
 VOCAB_SIZE = 131072
-ATTENTION_PARALLELISM = ((120, 64), (328, 128), (976, 256))
+ATTENTION_PARALLELISM = ((128, 64), (328, 128), (976, 256))
 EARLY_ATTENTION_PARALLELISM = ((3, -2), (4, -4), (16, -8))
 
 
@@ -482,7 +482,7 @@ class TileLangEngine:
                     -attention_parallelism if attention_parallelism < 0 else 16,
                 )(
                     q, self.k_cache[layer], self.v_cache[layer], alpha,
-                    self._position_cuda,
+                    self.weights[f"{prefix}.gate"], self._position_cuda,
                 ).reshape(D)
         else:
             self.k_cache[layer].append(k)
@@ -513,8 +513,8 @@ class TileLangEngine:
                     attended, x, self.weights[f"{prefix}.o"]
                 )
             else:
-                x = self.linear.gated_residual(
-                    attended, gate, x, self.weights[f"{prefix}.o"]
+                x = self.linear.rvq_residual(
+                    attended, x, self.weights[f"{prefix}.o"]
                 )
         else:
             x = x + self._projection(f"{prefix}.o", attended * gate)

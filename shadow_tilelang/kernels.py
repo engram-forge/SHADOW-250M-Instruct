@@ -1401,6 +1401,7 @@ def compile_attention(
         keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         alpha: T.Tensor((query_heads,), T.float32),
+        gate: T.Tensor((query_heads * head_dim,), T.bfloat16),
         position: T.Tensor((1,), T.int32),
     ):
         output = T.empty((query_heads, head_dim), T.bfloat16)
@@ -1505,7 +1506,8 @@ def compile_attention(
                 T.clear(attended)
                 for segment in T.serial(token_parallel):
                     attended[0] += attended_partials[segment, lane]
-                output[head, lane] = attended[0]
+                rounded = attended[0].astype(T.bfloat16)
+                output[head, lane] = rounded * gate[head * head_dim + lane]
         return output
 
     return attention
