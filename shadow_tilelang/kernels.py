@@ -908,10 +908,11 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
                     byte = packed[token, byte_index].astype(T.int32)
                     for component in T.serial(8):
                         bit = (byte >> (7 - component)) & 1
-                        sign = bit * 2 - 1
-                        partial[0] += (
-                            projected[byte_index * 8 + component].astype(T.float32)
-                            * sign.astype(T.float32)
+                        value = projected[
+                            byte_index * 8 + component
+                        ].astype(T.float32)
+                        partial[0] += T.if_then_else(
+                            bit == 0, -value, value
                         )
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
