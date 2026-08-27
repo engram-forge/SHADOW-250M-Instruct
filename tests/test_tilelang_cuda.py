@@ -196,3 +196,27 @@ def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
         finally:
             reference.close()
             native.close()
+
+
+@pytest.mark.parametrize("length", [2, 4, 7])
+def test_tilelang_batched_prefill_matches_reference_and_decode(length):
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    prompt = [2, 8, 925, 1234, 356, 296, 306][:length]
+    with torch.inference_mode():
+        reference = TileLangEngine(*paths, backend="torch", max_context=16)
+        native = TileLangEngine(*paths, backend="tilelang", max_context=16)
+        try:
+            expected = reference.prefill(prompt)
+            actual = native.prefill(prompt)
+            assert int(actual.argmax()) == int(expected.argmax())
+            token = int(expected.argmax())
+            expected = reference.step(token)
+            actual = native.step(token)
+            assert int(actual.argmax()) == int(expected.argmax())
+        finally:
+            reference.close()
+            native.close()

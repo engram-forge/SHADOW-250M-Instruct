@@ -406,6 +406,234 @@ def compile_attention(
     return attention
 
 
+@lru_cache(maxsize=None)
+def compile_gemm(batch_size: int, out_features: int, in_features: int):
+    """Compile the batched counterpart of :func:`compile_gemv`."""
+
+    tilelang, T = _imports()
+    n_partition, reduce_threads, vector = 8, 16, 8
+    block_k = reduce_threads * vector
+
+    @tilelang.jit(target="cuda")
+    def gemm(
+        x: T.Tensor((batch_size, in_features), T.bfloat16),
+        weight: T.Tensor((out_features, in_features), T.bfloat16),
+    ):
+        output = T.empty((batch_size, out_features), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition), batch_size,
+            threads=(reduce_threads, n_partition),
+        ) as (block, token):
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            x_local = T.alloc_local((vector,), T.bfloat16)
+            w_local = T.alloc_local((vector,), T.bfloat16)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile_k in T.serial(T.ceildiv(in_features, block_k)):
+                for inner in T.vectorized(vector):
+                    k = tile_k * block_k + lane_k * vector + inner
+                    x_local[inner] = x[token, k]
+                    w_local[inner] = weight[block * n_partition + lane_n, k]
+                for inner in T.serial(vector):
+                    partial[0] += (
+                        x_local[inner].astype(T.float32)
+                        * w_local[inner].astype(T.float32)
+                    )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k, dtype="handle"
+                ))
+            if lane_k == 0:
+                output[token, block * n_partition + lane_n] = reduced[0]
+        return output
+
+    return gemm
+
+
+@lru_cache(maxsize=None)
+def compile_rvq_gemm(
+    batch_size: int, out_features: int, in_features: int, group_size: int, stages: int
+):
+    """Compile fused packed RVQ dequantization GEMM for prompt ingestion."""
+
+    if out_features <= 0 or out_features % 64:
+        raise ValueError("RVQ GEMM output width must be positive and 64-row aligned")
+    tilelang, T = _imports()
+    groups, chunks = in_features // group_size, out_features // 64
+    n_partition, reduce_threads = 8, 16
+
+    @tilelang.jit(target="cuda")
+    def gemm(
+        x: T.Tensor((batch_size, in_features), T.bfloat16),
+        codebooks: T.Tensor((chunks, stages, group_size, 16), T.float32),
+        indices: T.Tensor((stages, chunks, groups, 32), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((batch_size, out_features), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition), batch_size,
+            threads=(reduce_threads, n_partition),
+        ) as (block, token):
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            chunk, row_lane = row // 64, row % 64
+            packed_lane = T.if_then_else(row_lane < 32, row_lane, row_lane - 32)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
+                group = group_tile * reduce_threads + lane_k
+                if group < groups:
+                    codes = T.alloc_local((stages,), T.int32)
+                    for stage in T.serial(stages):
+                        byte = indices[stage, chunk, group, packed_lane].astype(T.int32)
+                        codes[stage] = T.if_then_else(row_lane < 32, byte & 15, byte >> 4)
+                    for component in T.serial(group_size):
+                        value = T.alloc_local((1,), T.float32)
+                        value[0] = 0.0
+                        for stage in T.serial(stages):
+                            value[0] += codebooks[chunk, stage, component, codes[stage]]
+                        weight = (value[0] * scales[row]).astype(T.bfloat16)
+                        partial[0] += (x[token, group * group_size + component].astype(T.float32)
+                                       * weight.astype(T.float32))
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k, dtype="handle"
+                ))
+            if lane_k == 0:
+                output[token, row] = reduced[0]
+        return output
+
+    return gemm
+
+
+@lru_cache(maxsize=None)
+def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
+    """Compile fused packed base-3 dequantization GEMM for prompt ingestion."""
+
+    tilelang, T = _imports()
+    packed_width = (in_features + 4) // 5
+    n_partition, reduce_threads = 8, 32
+
+    @tilelang.jit(target="cuda")
+    def gemm(
+        x: T.Tensor((batch_size, in_features), T.bfloat16),
+        packed: T.Tensor((out_features, packed_width), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((batch_size, out_features), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition), batch_size,
+            threads=(reduce_threads, n_partition),
+        ) as (block, token):
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            if row < out_features:
+                for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
+                    byte_column = byte_tile * reduce_threads + lane_k
+                    if byte_column < packed_width:
+                        byte = packed[row, byte_column].astype(T.int32)
+                        divisor = T.alloc_local((1,), T.int32)
+                        divisor[0] = 1
+                        for component in T.serial(5):
+                            column = byte_column * 5 + component
+                            if column < in_features:
+                                trit = (byte // divisor[0]) % 3 - 1
+                                weight = (trit.astype(T.float32) * scales[row]).astype(T.bfloat16)
+                                partial[0] += (x[token, column].astype(T.float32)
+                                               * weight.astype(T.float32))
+                            divisor[0] *= 3
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k, dtype="handle"
+                ))
+            if lane_k == 0 and row < out_features:
+                output[token, row] = reduced[0]
+        return output
+
+    return gemm
+
+
+@lru_cache(maxsize=None)
+def compile_prefill_attention(
+    tokens: int, query_heads: int, kv_heads: int, head_dim: int
+):
+    """Compile causal exact-shiftmax attention for a fresh prompt."""
+
+    tilelang, T = _imports()
+    heads_per_kv = query_heads // kv_heads
+
+    @tilelang.jit(target="cuda")
+    def attention(
+        query: T.Tensor((tokens, query_heads, head_dim), T.bfloat16),
+        keys: T.Tensor((tokens, kv_heads, head_dim), T.bfloat16),
+        values: T.Tensor((tokens, kv_heads, head_dim), T.bfloat16),
+        alpha: T.Tensor((query_heads,), T.float32),
+    ):
+        output = T.empty((tokens, query_heads, head_dim), T.bfloat16)
+        with T.Kernel(query_heads, tokens, threads=head_dim) as (head, query_token):
+            lane = T.get_thread_binding(0)
+            scores = T.alloc_shared((tokens + 1,), T.float32)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            kv_head = head // heads_per_kv
+            for key_token in T.serial(query_token + 1):
+                partial[0] = (query[query_token, head, lane].astype(T.float32)
+                              * keys[key_token, kv_head, lane].astype(T.float32))
+                with T.attr(
+                    T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                    "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(T.tvm_thread_allreduce(
+                        T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
+                    ))
+                if lane == 0:
+                    dot = reduced[0].astype(T.bfloat16).astype(T.float32)
+                    scores[key_token] = T.floor(dot * alpha[head])
+            T.sync_threads()
+            if lane == 0:
+                maximum = T.alloc_local((1,), T.float32)
+                maximum[0] = scores[0]
+                for key_token in T.serial(1, query_token + 1):
+                    maximum[0] = T.max(maximum[0], scores[key_token])
+                denominator = T.alloc_local((1,), T.float32)
+                denominator[0] = 0.0
+                for key_token in T.serial(query_token + 1):
+                    scores[key_token] = T.exp2(T.max(
+                        scores[key_token] - maximum[0], T.float32(-15.0)
+                    ))
+                    denominator[0] += scores[key_token]
+                scores[tokens] = denominator[0]
+            T.sync_threads()
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for key_token in T.serial(query_token + 1):
+                probability = (scores[key_token] / scores[tokens]).astype(T.bfloat16)
+                attended[0] += (probability.astype(T.float32)
+                                * values[key_token, kv_head, lane].astype(T.float32))
+            output[query_token, head, lane] = attended[0]
+        return output
+
+    return attention
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 
@@ -423,6 +651,23 @@ class TileLangLinear:
             return kernel(x.contiguous(), weight.packed, weight.scales)
         kernel = compile_gemv(weight.shape[0], weight.shape[1])
         return kernel(x.contiguous(), weight)
+
+    def batch(self, x, weight):
+        batch_size = x.shape[0]
+        if isinstance(weight, PackedRVQWeight):
+            kernel = compile_rvq_gemm(
+                batch_size, weight.out_features, weight.in_features,
+                weight.group_size, weight.stages,
+            )
+            return kernel(x.contiguous(), weight.codebooks, weight.indices, weight.scales)
+        if isinstance(weight, PackedTernaryWeight):
+            kernel = compile_ternary_gemm(
+                batch_size, weight.out_features, weight.in_features
+            )
+            return kernel(x.contiguous(), weight.packed, weight.scales)
+        return compile_gemm(batch_size, weight.shape[0], weight.shape[1])(
+            x.contiguous(), weight
+        )
 
 
 class TorchLinear:

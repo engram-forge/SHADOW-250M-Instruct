@@ -56,16 +56,20 @@ backends run on CUDA and use the same quantized weight values and caches.
 - A TileLang kernel evaluates exact floor/exp2 shiftmax attention directly over
   a fixed circular BF16 K/V cache. Q/K/V are power-of-two quantized once before
   cache insertion instead of re-quantizing the complete history during decode.
+- Fresh prompts use shape-cached packed GEMM and causal shiftmax kernels. Prompt
+  lengths are padded to power-of-two compile buckets and only the final token
+  evaluates structural attention, the fingerprint head, and vocabulary logits.
 
-The current implementation processes prefill one token at a time. A batched
-prefill path is the next measured optimization.
+The stateful fallback processes prompt additions one token at a time; fresh
+prompts use the batched prefill path.
 
 On the development H100 NVL, native packed-weight GEMV and exact attention run
 the warm stateful decode fixture at about 89 tokens/s. Packed-weight GEMV
 reduced load-time CUDA allocation from 644.7 MiB to 178.8 MiB; the fixed K/V
 cache brings the final load allocation to 188.8 MiB and peak allocation to
-734.4 MiB. These are bring-up numbers, not release claims: the GPU was shared
-during measurement.
+734.4 MiB. Warm 128-token batched prefill runs at about 1,527 tokens/s versus
+113 tokens/s for the token-wise path. These are bring-up numbers, not release
+claims: the GPU was shared during measurement.
 
 ## Inspect generated CUDA
 

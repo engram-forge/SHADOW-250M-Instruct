@@ -11,7 +11,7 @@ import numpy as np
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
-    compile_attention,
+    compile_attention, compile_prefill_attention,
 )
 
 
@@ -220,6 +220,11 @@ class TileLangEngine:
     def _projection(self, name: str, x):
         return self.linear(x, self.weights[name])
 
+    def _batch_projection(self, name: str, x):
+        if self.backend == "tilelang":
+            return self.linear.batch(x, self.weights[name])
+        return self.linear(x, self.weights[name])
+
     def _rope(self, x, position: int):
         import torch
 
@@ -287,6 +292,51 @@ class TileLangEngine:
         gated = functional.silu(gate_projection) * up
         return x + self._projection(f"{prefix}.dn", gated)
 
+    def _prefill_block(self, layer: int, x, start_position: int):
+        import torch
+        import torch.nn.functional as functional
+
+        prefix = f"b.{layer}"
+        tokens = x.shape[0]
+        z = _rms_norm(x, self.weights[f"{prefix}.n1.w"])
+        qkv = self._batch_projection(f"{prefix}.qkv", z)
+        q_end = QUERY_HEADS * HEAD_DIM
+        kv_width = KV_HEADS * HEAD_DIM
+        q = qkv[:, :q_end].reshape(tokens, QUERY_HEADS, HEAD_DIM)
+        k = qkv[:, q_end : q_end + kv_width].reshape(tokens, KV_HEADS, HEAD_DIM)
+        v = qkv[:, q_end + kv_width :].reshape(tokens, KV_HEADS, HEAD_DIM)
+        q = _rms_norm(q, self.weights[f"{prefix}.qn.w"])
+        k = _rms_norm(k, self.weights[f"{prefix}.kn.w"])
+        positions = torch.arange(
+            start_position, start_position + tokens, device=self.device, dtype=torch.float32
+        )
+        angle = positions[:, None] * self._inv_frequency[None]
+        cosine, sine = angle.cos().to(q.dtype), angle.sin().to(q.dtype)
+        q_even, q_odd = q[..., 0::2], q[..., 1::2]
+        k_even, k_odd = k[..., 0::2], k[..., 1::2]
+        q = torch.stack((q_even * cosine[:, None] - q_odd * sine[:, None],
+                         q_even * sine[:, None] + q_odd * cosine[:, None]), -1).flatten(-2)
+        k = torch.stack((k_even * cosine[:, None] - k_odd * sine[:, None],
+                         k_even * sine[:, None] + k_odd * cosine[:, None]), -1).flatten(-2)
+        q, k, v = (_power_of_two_quantize(value) for value in (q, k, v))
+        slots = torch.arange(start_position, start_position + tokens, device=self.device)
+        slots %= self.max_context
+        self.k_cache[layer, :, slots] = k.transpose(0, 1)
+        self.v_cache[layer, :, slots] = v.transpose(0, 1)
+        alpha = self.weights[f"{prefix}.alpha"].reshape(QUERY_HEADS)
+        alpha = (alpha * 4096.0).round() / 4096.0
+        attended = compile_prefill_attention(
+            tokens, QUERY_HEADS, KV_HEADS, HEAD_DIM
+        )(q, k, v, alpha).reshape(tokens, D)
+        gate = torch.sigmoid(self.weights[f"{prefix}.g"]).to(attended.dtype)
+        x = x + self._batch_projection(f"{prefix}.o", attended * gate)
+        hidden = _rms_norm(x, self.weights[f"{prefix}.n2.w"])
+        up_gate = self._batch_projection(f"{prefix}.up_gate", hidden)
+        up, gate_projection = up_gate.split(FFN_DIM, dim=-1)
+        return x + self._batch_projection(
+            f"{prefix}.dn", functional.silu(gate_projection) * up
+        )
+
     def _structural_step(self, current):
         import torch
         import torch.nn.functional as functional
@@ -300,9 +350,7 @@ class TileLangEngine:
         output = current + self._projection("step.cout", hidden)
         return _rms_norm(output, self.weights["step.nf.w"])
 
-    def step(self, token_id: int):
-        """Consume one token and return float32 next-token logits."""
-
+    def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
             raise ValueError(f"token id {token_id} is outside [0, {VOCAB_SIZE})")
         fingerprint = self.fingerprints[int(token_id)]
@@ -313,21 +361,55 @@ class TileLangEngine:
             hidden = self._block(layer, hidden)
         self.trunk_cache.append(hidden)
         self.trunk_cache = self.trunk_cache[-self.max_context :]
+        self.position += 1
+        if not return_logits:
+            return None
         hidden = self._structural_step(hidden)
         hidden = _rms_norm(hidden, self.weights["nf.w"])
         projected = self._projection("head.weight", hidden).float()
         logits = projected @ (self.fingerprints.float().T / math.sqrt(FINGERPRINT_DIM))
         logits += self.weights["tb"].float()
-        self.position += 1
         return logits
 
+    def step(self, token_id: int):
+        """Consume one token and return float32 next-token logits."""
+
+        return self._consume(token_id, return_logits=True)
+
     def prefill(self, token_ids: Iterable[int]):
-        logits = None
-        for token_id in token_ids:
-            logits = self.step(int(token_id))
-        if logits is None:
+        tokens = [int(token_id) for token_id in token_ids]
+        if not tokens:
             raise ValueError("prefill requires at least one token")
-        return logits
+        if (
+            self.backend == "tilelang" and self.position == 0
+            and 1 < len(tokens) <= self.max_context
+        ):
+            import torch
+
+            if any(not 0 <= token < VOCAB_SIZE for token in tokens):
+                raise ValueError(f"token IDs must be inside [0, {VOCAB_SIZE})")
+            token_count = len(tokens)
+            batch_size = 1 << (token_count - 1).bit_length()
+            index = torch.tensor(tokens, device=self.device)
+            fingerprints = torch.zeros(
+                batch_size, FINGERPRINT_DIM, device=self.device, dtype=self.dtype
+            )
+            fingerprints[:token_count] = self.fingerprints[index]
+            hidden = self._batch_projection("emb.weight", fingerprints)
+            for layer in range(LAYERS):
+                hidden = self._prefill_block(layer, hidden, 0)
+            hidden = hidden[:token_count]
+            self.trunk_cache = list(hidden.unbind(0))
+            self.position = token_count
+            self._position_cuda.fill_(self.position)
+            final = self._structural_step(hidden[-1])
+            final = _rms_norm(final, self.weights["nf.w"])
+            projected = self._projection("head.weight", final).float()
+            logits = projected @ (self.fingerprints.float().T / math.sqrt(FINGERPRINT_DIM))
+            return logits + self.weights["tb"].float()
+        for token_id in tokens[:-1]:
+            self._consume(token_id, return_logits=False)
+        return self._consume(tokens[-1], return_logits=True)
 
     def generate(
         self,
