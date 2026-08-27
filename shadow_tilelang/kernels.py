@@ -870,11 +870,24 @@ def compile_attention_probabilities(query_heads: int, max_context: int):
                     scores[token] = input_scores[head, token]
             T.sync_threads()
             maximum = T.alloc_local((1,), T.float32)
-            if lane == 0 and token_lane == 0:
-                maximum[0] = scores[0]
-                for token in T.serial(1, total):
+            maximum[0] = T.float32(-1e30)
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
                     maximum[0] = T.max(maximum[0], scores[token])
-                scores[max_context] = maximum[0]
+            maximum_reduced = T.alloc_local((1,), T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(-1e30)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), maximum[0], True, maximum_reduced[0],
+                    lane, token_lane, dtype="handle",
+                ))
+            if lane == 0 and token_lane == 0:
+                scores[max_context] = maximum_reduced[0]
             T.sync_threads()
             for token_tile in T.serial(T.ceildiv(total, score_threads)):
                 token = (
