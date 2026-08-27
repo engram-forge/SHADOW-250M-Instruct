@@ -222,6 +222,27 @@ def test_tilelang_rvq_gemv_matches_materialized_sections():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_tilelang_dense_rvq_reduction_geometry_is_bit_exact():
+    from shadow_tilelang.kernels import (
+        compile_rvq_dense_gemv, compile_rvq_dense_gemv_residual,
+    )
+
+    torch.manual_seed(29)
+    weight = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+    expected = compile_rvq_dense_gemv(128, 512, 2, 16)(value, weight)
+    actual = compile_rvq_dense_gemv(128, 512, 2, 32)(value, weight)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected = compile_rvq_dense_gemv_residual(
+        128, 512, 2, 16
+    )(value, residual, weight)
+    actual = compile_rvq_dense_gemv_residual(
+        128, 512, 2, 32
+    )(value, residual, weight)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_tilelang_engine_uses_decode_optimized_weight_storage():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine
