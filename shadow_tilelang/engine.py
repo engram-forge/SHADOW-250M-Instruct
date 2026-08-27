@@ -756,9 +756,12 @@ class TileLangEngine:
                     output_logits=False,
                 )
                 compile_candidate_argmax(
-                    block_values.numel(), VOCAB_SIZE, store_output=True
-                )(block_values, block_indices, self._token_cuda)
-                self._position_cuda.add_(1)
+                    block_values.numel(), VOCAB_SIZE, store_output=True,
+                    advance_position=True,
+                )(
+                    block_values, block_indices, self._token_cuda,
+                    self._position_cuda,
+                )
             self._greedy_graphs[attention_parallelism] = graph
 
     def _generate_greedy_cuda(self, logits, token_count: int) -> list[int]:

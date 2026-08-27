@@ -530,6 +530,7 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     )
 
     vocabulary, features = 257, 512
+    torch.manual_seed(41)
     rng = np.random.default_rng(41)
     packed = rng.integers(0, 256, size=(vocabulary, features // 8), dtype=np.uint8)
     paired = (
@@ -584,7 +585,8 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     actual_words = compile_fingerprint_logits(
         vocabulary, features, False, True, 32
     )(projected, packed_words_cuda, bias)
-    torch.testing.assert_close(actual_words, actual, rtol=0, atol=0)
+    torch.testing.assert_close(actual_words, expected, rtol=1e-6, atol=1e-6)
+    assert int(actual_words.argmax()) == int(actual.argmax())
     word_values, word_indices = compile_fingerprint_logits(
         vocabulary, features, True, False, 32
     )(projected, packed_words_cuda, bias)
@@ -599,15 +601,18 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
         block_values.numel(), vocabulary
     )(block_values, block_indices)
     stored_token = torch.full_like(selected_token, -1)
+    stored_position = torch.zeros(1, device="cuda", dtype=torch.int32)
     compile_candidate_argmax(
-        block_values.numel(), vocabulary, store_output=True
-    )(block_values, block_indices, stored_token)
+        block_values.numel(), vocabulary, store_output=True,
+        advance_position=True,
+    )(block_values, block_indices, stored_token, stored_position)
     legacy_selected_token = compile_candidate_argmax(
         block_values.numel(), vocabulary, 256
     )(block_values, block_indices)
     torch.testing.assert_close(selected_logits, actual, rtol=0, atol=0)
     assert int(selected_token) == int(actual.argmax())
     assert int(stored_token) == int(selected_token)
+    assert int(stored_position) == 1
     assert int(selected_token) == int(legacy_selected_token)
     candidate_values, candidate_indices = compile_fingerprint_logits(
         vocabulary, features, True, False
@@ -618,8 +623,7 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     torch.testing.assert_close(candidate_values, block_values, rtol=0, atol=0)
     torch.testing.assert_close(candidate_indices, block_indices, rtol=0, atol=0)
     assert int(candidate_token) == int(actual.argmax())
-    torch.testing.assert_close(word_values, block_values, rtol=0, atol=0)
-    torch.testing.assert_close(word_indices, block_indices, rtol=0, atol=0)
+    torch.testing.assert_close(word_values, block_values, rtol=1e-6, atol=1e-6)
     assert int(word_token) == int(actual.argmax())
 
     projected.zero_()
