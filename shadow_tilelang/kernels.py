@@ -1383,7 +1383,8 @@ def compile_attention_value_reduce_gate(
 
 @lru_cache(maxsize=None)
 def compile_attention(
-    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int,
+    token_parallel: int = 16,
 ):
     """Compile exact shiftmax decode attention over a circular KV cache."""
 
@@ -1393,7 +1394,6 @@ def compile_attention(
         raise ValueError("attention head width exceeds a CUDA thread block")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
-    token_parallel = 16
 
     @tilelang.jit(target="cuda")
     def attention(

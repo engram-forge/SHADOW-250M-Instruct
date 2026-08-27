@@ -41,6 +41,7 @@ FFN_DIM = 4224
 FINGERPRINT_DIM = 512
 VOCAB_SIZE = 131072
 ATTENTION_PARALLELISM = ((120, 64), (328, 128), (976, 256))
+POSITION_ZERO_ATTENTION = -1
 
 
 def _rms_norm(x, weight, eps: float = 1e-6):
@@ -461,7 +462,7 @@ class TileLangEngine:
             v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
-            if attention_parallelism:
+            if attention_parallelism > 0:
                 scores = compile_attention_scores(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
                 )(q, self.k_cache[layer], alpha, self._position_cuda)
@@ -477,7 +478,8 @@ class TileLangEngine:
                 )
             else:
                 attended = compile_attention(
-                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
+                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,
+                    1 if attention_parallelism == POSITION_ZERO_ATTENTION else 16,
                 )(
                     q, self.k_cache[layer], self.v_cache[layer], alpha,
                     self._position_cuda,
@@ -503,7 +505,7 @@ class TileLangEngine:
             ).reshape(D)
         gate = self.weights[f"{prefix}.gate"]
         if self.backend == "tilelang":
-            if attention_parallelism:
+            if attention_parallelism > 0:
                 attended = compile_attention_value_reduce_gate(
                     QUERY_HEADS, HEAD_DIM, attention_parallelism
                 )(partials, gate).reshape(D)
@@ -661,6 +663,8 @@ class TileLangEngine:
         return self._decode_graph_logits[attention_parallelism].clone()
 
     def _attention_parallelism(self, position: int) -> int:
+        if position == 0:
+            return POSITION_ZERO_ATTENTION
         if self.max_context < 512:
             return 0
         parallelism = 0

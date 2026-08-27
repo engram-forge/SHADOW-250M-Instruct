@@ -102,6 +102,25 @@ def test_tilelang_greedy_generation_crosses_split_attention_boundary(boundary_in
             engine.close()
 
 
+def test_tilelang_greedy_generation_leaves_position_zero_graph():
+    from pathlib import Path
+    from shadow_tilelang.engine import POSITION_ZERO_ATTENTION, TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=512)
+        try:
+            logits = engine.step(925)
+            generated = engine._generate_greedy_cuda(logits, 2)
+            assert len(generated) == 2
+            assert engine.position == 3
+            assert POSITION_ZERO_ATTENTION in engine._decode_graphs
+            assert 0 in engine._greedy_graphs
+        finally:
+            engine.close()
+
+
 def test_tilelang_ternary_unpack_matches_cpu():
     import numpy as np
     from shadow_tilelang.format import TernaryRecord, unpack_ternary
