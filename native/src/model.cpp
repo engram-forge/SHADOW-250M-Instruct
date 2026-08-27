@@ -2081,11 +2081,46 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       std::fill(s.attended.begin(), s.attended.end(), 0.0f);
       auto &attended = s.attended;
       const auto alpha = w.alpha->dense_f32();
+      const std::size_t cache_tokens = cache.keys[0].size();
+      std::vector<float> shared_scores;
+      if (cache_tokens >= 1024 && options.archive.empty()) {
+        shared_scores.resize(NH * cache_tokens);
+        for (std::size_t kvh = 0; kvh < NKV; ++kvh)
+          for (std::size_t t = 0; t < cache_tokens; ++t) {
+#if defined(__aarch64__)
+            float32x4_t sums[NH / NKV];
+            for (auto &sum : sums) sum = vdupq_n_f32(0);
+            for (std::size_t j = 0; j < HD; j += 4) {
+              const float32x4_t key = vld1q_f32(cache.keys[kvh][t].data() + j);
+              for (std::size_t group = 0; group < NH / NKV; ++group) {
+                const std::size_t head = kvh * (NH / NKV) + group;
+                sums[group] = vfmaq_f32(sums[group],
+                    vld1q_f32(q.data() + head * HD + j), key);
+              }
+            }
+            for (std::size_t group = 0; group < NH / NKV; ++group) {
+              const std::size_t head = kvh * (NH / NKV) + group;
+              const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
+              shared_scores[head * cache_tokens + t] =
+                  std::floor(aq * bfloat16_round(vaddvq_f32(sums[group])));
+            }
+#else
+            for (std::size_t group = 0; group < NH / NKV; ++group) {
+              const std::size_t head = kvh * (NH / NKV) + group;
+              const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
+              shared_scores[head * cache_tokens + t] = std::floor(
+                  aq * bfloat16_round(dot(
+                      std::span<const float>(q).subspan(head * HD, HD),
+                      cache.keys[kvh][t])));
+            }
+#endif
+          }
+      }
       for (std::size_t head = 0; head < NH; ++head) {
         const std::size_t kvh = head / (NH / NKV);
         auto qh = std::span<const float>(q).subspan(head * HD, HD);
         const std::size_t cold_count = cold_keys[kvh].size();
-        s.score.assign(cold_count + cache.keys[kvh].size(), 0.0f);
+        s.score.assign(cold_count + cache_tokens, 0.0f);
         auto &score = s.score;
         float peak = -std::numeric_limits<float>::infinity();
         for (std::size_t t = 0; t < cold_count; ++t) {
@@ -2094,12 +2129,12 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
               std::floor(aq * bfloat16_round(dot(qh, cold_keys[kvh][t])));
           peak = std::max(peak, score[t]);
         }
-        for (std::size_t t = 0; t < cache.keys[kvh].size(); ++t) {
+        for (std::size_t t = 0; t < cache_tokens; ++t) {
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
-          const float raw =
-              aq *
-              bfloat16_round(dot(qh, cache.keys[kvh][t]));
-          score[cold_count + t] = std::floor(raw);
+          const float raw = shared_scores.empty()
+              ? aq * bfloat16_round(dot(qh, cache.keys[kvh][t]))
+              : shared_scores[head * cache_tokens + t];
+          score[cold_count + t] = shared_scores.empty() ? std::floor(raw) : raw;
           peak = std::max(peak, score[cold_count + t]);
           if (options.trace)
             std::cerr << "TRACE score " << impl_->position << ' ' << layer
@@ -2116,7 +2151,7 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         for (std::size_t t = 0; t < cold_count; ++t)
           for (std::size_t j = 0; j < HD; ++j)
             attended[head * HD + j] += score[t] * cold_values[kvh][t][j];
-        for (std::size_t t = 0; t < cache.keys[kvh].size(); ++t) {
+        for (std::size_t t = 0; t < cache_tokens; ++t) {
           auto vv = std::span<const float>(cache.values[kvh][t]);
           for (std::size_t j = 0; j < HD; ++j)
             attended[head * HD + j] += score[cold_count + t] * vv[j];
@@ -2294,7 +2329,8 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         for (std::size_t head = 0; head < NH; ++head) {
           const std::size_t kvh = head / (NH / NKV);
           auto qh = qs.subspan(head * HD, HD);
-          std::vector<float> scores(cache.keys[kvh].size());
+          const std::size_t cache_tokens = cache.keys[kvh].size();
+          std::vector<float> scores(cache_tokens);
           float peak = -std::numeric_limits<float>::infinity();
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
           for (std::size_t t = 0; t < scores.size(); ++t) {

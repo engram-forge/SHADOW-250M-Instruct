@@ -271,3 +271,31 @@ The gain grows with context as expected for a locality improvement. Retain the
 layout as an exact optimization and rerun it with Compact64 as the C integration
 control. Ring-buffer replacement remains separate future work for contexts that
 advance beyond the 2048-entry cap.
+### Shared multi-query key scoring result
+
+For each of two KV heads, 12 query heads scan the same key cache. The exact shared
+path loads each 64-float key row once and updates 12 independent FP32 accumulators,
+preserving every head's dot-product reduction and token order. Context-512 logits
+were byte-identical. Alternating exact measurements showed -1.6% at context 32,
++2.8% at 512, +14.9% at 1024, and +6.8% at 2048. The implementation therefore
+activates automatically only at 1024 or more cached tokens; the existing per-head
+path remains below that threshold. Cold archive attention retains the established
+path because its per-head shortlist may differ.
+
+### FP16 KV cache result
+
+An opt-in experiment stored the already-BF16-rounded K/V cache in FP16 and
+converted it to FP32 for attention. Context-32 and context-1024 logits were
+byte-identical in the parity fixtures, but conversion overhead outweighed the
+smaller cache at every measured long context on the WSL development host:
+
+| Context | FP32 decode | FP16 decode | Change | FP32 RSS | FP16 RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 8.65 tok/s | 8.39 tok/s | -3.0% | 179.8 MiB | 174.7 MiB |
+| 1024 | 4.59 tok/s | 4.49 tok/s | -2.2% | 194.4 MiB | 185.6 MiB |
+| 2048 | 2.47 tok/s | 2.20 tok/s | -10.8% | 225.4 MiB | 207.1 MiB |
+
+At context 2048, prefill also regressed 14.2%. The maximum memory saving was
+about 18.3 MiB, insufficient to justify slower inference and extra cache paths.
+The experiment was removed; FP32 KV storage remains the baseline. These are WSL
+development results and should not be interpreted as RK3566 measurements.
