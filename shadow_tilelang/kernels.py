@@ -886,8 +886,8 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
         raise ValueError("fingerprint width must be divisible by eight")
     tilelang, T = _imports()
     packed_width = features // 8
-    threads = 32
-    bytes_per_lane = T.ceildiv(packed_width, threads)
+    lanes = 32
+    rows_per_block = 8
     normalization = features ** -0.5
 
     @tilelang.jit(target="cuda")
@@ -897,23 +897,35 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
         bias: T.Tensor((vocabulary,), T.float32),
     ):
         output = T.empty((vocabulary,), T.float32)
-        with T.Kernel(vocabulary, threads=threads) as token:
+        with T.Kernel(
+            T.ceildiv(vocabulary, rows_per_block),
+            threads=(lanes, rows_per_block),
+        ) as block:
             lane = T.get_thread_binding(0)
+            row_lane = T.get_thread_binding(1)
+            token = block * rows_per_block + row_lane
+            shared_projected = T.alloc_shared((features,), T.bfloat16)
+            for tile in T.serial(T.ceildiv(features, lanes * rows_per_block)):
+                feature = tile * lanes * rows_per_block + row_lane * lanes + lane
+                if feature < features:
+                    shared_projected[feature] = projected[feature]
+            T.sync_threads()
             partial = T.alloc_local((1,), T.float32)
             reduced = T.alloc_local((1,), T.float32)
             T.clear(partial)
-            for byte_tile in T.serial(bytes_per_lane):
-                byte_index = byte_tile * threads + lane
-                if byte_index < packed_width:
-                    byte = packed[token, byte_index].astype(T.int32)
-                    for component in T.serial(8):
-                        bit = (byte >> (7 - component)) & 1
-                        value = projected[
-                            byte_index * 8 + component
-                        ].astype(T.float32)
-                        partial[0] += T.if_then_else(
-                            bit == 0, -value, value
-                        )
+            if token < vocabulary:
+                for byte_tile in T.serial(T.ceildiv(packed_width, lanes)):
+                    byte_index = byte_tile * lanes + lane
+                    if byte_index < packed_width:
+                        byte = packed[token, byte_index].astype(T.int32)
+                        for component in T.serial(8):
+                            bit = (byte >> (7 - component)) & 1
+                            value = shared_projected[
+                                byte_index * 8 + component
+                            ].astype(T.float32)
+                            partial[0] += T.if_then_else(
+                                bit == 0, -value, value
+                            )
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -921,7 +933,7 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
                 T.evaluate(T.tvm_thread_allreduce(
                     T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
                 ))
-            if lane == 0:
+            if lane == 0 and token < vocabulary:
                 output[token] = reduced[0] * normalization + bias[token]
         return output
 
