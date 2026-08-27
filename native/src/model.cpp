@@ -1034,6 +1034,95 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
 void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
                               std::span<float> y,
                               std::span<float> other_y) const {
+#if defined(SHADOW_ARM_DOTPROD) && defined(__aarch64__)
+  if (kind == WeightKind::ternary3 && other.kind == WeightKind::ternary3 &&
+      compact_dotprod_ffn() && !ternary_dotprod_compact.empty() &&
+      !other.ternary_dotprod_compact.empty() && in == other.in &&
+      out == other.out && x.size() == in && y.size() == out &&
+      other_y.size() == out) {
+    const std::size_t quant_group = dotprod_ffn_group();
+    const std::size_t group_count = (in + quant_group - 1) / quant_group;
+    std::vector<std::int8_t> quantized(in);
+    std::vector<float> quant_scales(group_count);
+    for (std::size_t begin = 0; begin < in; begin += quant_group) {
+      const std::size_t end = std::min(begin + quant_group, std::size_t(in));
+      float peak = 0;
+      for (std::size_t column = begin; column < end; ++column)
+        peak = std::max(peak, std::abs(x[column]));
+      const float scale = peak / 127.0f;
+      const float inverse = scale == 0 ? 0 : 1 / scale;
+      quant_scales[begin / quant_group] = scale;
+      for (std::size_t column = begin; column < end; ++column)
+        quantized[column] = static_cast<std::int8_t>(std::clamp(
+            std::nearbyint(x[column] * inverse), -127.0f, 127.0f));
+    }
+    const Tensor *weights[2] = {this, &other};
+    std::span<float> outputs[2] = {y, other_y};
+    parallel_rows(2 * out, [&](std::size_t begin, std::size_t end) {
+      const uint8x16_t mask = vdupq_n_u8(3), one = vdupq_n_u8(1);
+      for (std::size_t matrix = 0; matrix < 2; ++matrix) {
+        const std::size_t matrix_begin = matrix * out;
+        const std::size_t row_begin = begin > matrix_begin ? begin - matrix_begin : 0;
+        const std::size_t row_end = std::min(end, matrix_begin + out) > matrix_begin
+            ? std::min(end, matrix_begin + out) - matrix_begin : 0;
+        if (row_begin >= row_end) continue;
+        const Tensor &weight = *weights[matrix];
+        auto output_values = outputs[matrix];
+        for (std::size_t row = row_begin; row < row_end; row += 16) {
+          float32x4_t output[4];
+          for (auto &part : output) part = vdupq_n_f32(0);
+          for (std::size_t group_begin = 0; group_begin < in;
+               group_begin += quant_group) {
+            int32x4_t sums[4];
+            for (auto &sum : sums) sum = vdupq_n_s32(0);
+            const std::size_t group_end =
+                std::min(group_begin + quant_group, std::size_t(in));
+            for (std::size_t column = group_begin; column < group_end;
+                 column += 4) {
+              std::int32_t word;
+              std::memcpy(&word, quantized.data() + column, sizeof(word));
+              const int8x16_t activation =
+                  vreinterpretq_s8_s32(vdupq_n_s32(word));
+              const uint8x16_t packed = vld1q_u8(
+                  weight.ternary_dotprod_compact.data() +
+                  ternary_dotprod_compact_offset(row, column, in));
+              const int8x16_t q0 = vreinterpretq_s8_u8(
+                  vsubq_u8(vandq_u8(packed, mask), one));
+              const int8x16_t q1 = vreinterpretq_s8_u8(vsubq_u8(
+                  vandq_u8(vshrq_n_u8(packed, 2), mask), one));
+              const int8x16_t q2 = vreinterpretq_s8_u8(vsubq_u8(
+                  vandq_u8(vshrq_n_u8(packed, 4), mask), one));
+              const int8x16_t q3 = vreinterpretq_s8_u8(
+                  vsubq_u8(vshrq_n_u8(packed, 6), one));
+              const auto z01 = vzipq_s8(q0, q1), z23 = vzipq_s8(q2, q3);
+              const auto rows0 = vzipq_s16(vreinterpretq_s16_s8(z01.val[0]),
+                                           vreinterpretq_s16_s8(z23.val[0]));
+              const auto rows1 = vzipq_s16(vreinterpretq_s16_s8(z01.val[1]),
+                                           vreinterpretq_s16_s8(z23.val[1]));
+              const int8x16_t tile[4] = {
+                  vreinterpretq_s8_s16(rows0.val[0]),
+                  vreinterpretq_s8_s16(rows0.val[1]),
+                  vreinterpretq_s8_s16(rows1.val[0]),
+                  vreinterpretq_s8_s16(rows1.val[1])};
+              for (std::size_t lane = 0; lane < 4; ++lane)
+                sums[lane] = vdotq_s32(sums[lane], tile[lane], activation);
+            }
+            const float scale = quant_scales[group_begin / quant_group];
+            for (std::size_t lane = 0; lane < 4; ++lane)
+              output[lane] = vfmaq_n_f32(
+                  output[lane], vcvtq_f32_s32(sums[lane]), scale);
+          }
+          float values[16];
+          for (std::size_t lane = 0; lane < 4; ++lane)
+            vst1q_f32(values + lane * 4, output[lane]);
+          for (std::size_t lane = 0; lane < 16; ++lane)
+            output_values[row + lane] = values[lane] * weight.scales[row + lane];
+        }
+      }
+    });
+    return;
+  }
+#endif
   if (kind != WeightKind::ternary3 || other.kind != WeightKind::ternary3 ||
       in != other.in || out != other.out || x.size() != in || y.size() != out ||
       other_y.size() != out || ternary_reference_enabled() ||

@@ -464,3 +464,16 @@ At four threads the resulting Compact64 throughput was 236.04, 253.30, 250.28,
 and 235.14 prompt tok/s respectively. Raw measurements are in
 `rk3566_compact64_batch4_prefill_wsl.json`. These are Surface WSL development
 results; repeat the matrix on the physical RK3566 before publishing board claims.
+
+### Compact64 fused up/gate decode
+
+The paired up/gate path now dynamically quantizes their shared FFN input once and
+dispatches both Compact64 matrices together. Each matrix retains its own packed
+weights, FP32 group scaling, and output, so logits and generated tokens were
+byte-identical to two separate Compact64 matvec calls.
+
+At context 128 with four threads and 65 generated tokens, seven interleaved WSL
+runs improved median decode from 167.63 to 175.24 tok/s (+4.5%). The fused path
+won all seven pairs. This gain is additional to Compact64 itself and comes from
+removing duplicate activation quantization and one worker dispatch. Confirm on
+physical RK3566 before treating it as a board result.
