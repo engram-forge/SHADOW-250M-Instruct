@@ -254,7 +254,7 @@ class TileLangEngine:
             for suffix in ("q", "k", "v", "up", "gt"):
                 del weights[f"{prefix}.{suffix}"]
         if self.backend == "tilelang":
-            for name in ("step.cin", "step.cout"):
+            for name in ("step.Wq", "step.cin", "step.cout"):
                 packed = weights[name]
                 weights[name] = DenseDecodeRVQWeight(
                     packed.codebooks, packed.indices, packed.scales,
