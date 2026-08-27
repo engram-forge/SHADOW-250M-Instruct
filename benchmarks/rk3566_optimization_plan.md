@@ -404,6 +404,12 @@ decode improved 14.7%. These are three-run WSL development results.
 
 The 16-case/17-token screen produced 15/16 complete-sequence equality, 16/16
 first-token agreement, 98.53% stepwise argmax agreement, and median logit RMSE
-5.30e-6. One divergent trajectory reached RMSE 2.33, so the mode is approximate
-and remains opt-in. Full 472-case quality and physical-board matrices remain
-required before considering it as a default.
+5.30e-6. One divergent trajectory reached RMSE 2.33.
+
+The full 472-case/17-token evaluation produced 451/472 (95.55%) identical
+sequences and 471/472 (99.79%) first-token argmax agreement. Median identical
+prefix was all 17 tokens, median first-step RMSE was zero, and median first-step
+top-10 overlap was 1.0. The raw result is in
+`rk3566_fp16_qkv_generation.json`. This is strong approximate-quality evidence,
+but any divergence means the mode remains opt-in. The physical RK3566 performance
+matrix remains required before considering it as a default.
