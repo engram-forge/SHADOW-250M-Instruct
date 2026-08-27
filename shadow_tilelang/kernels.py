@@ -24,7 +24,7 @@ class PackedRVQWeight:
 
 @dataclass(frozen=True)
 class PackedTernaryWeight:
-    """CUDA-resident base-3 payload consumed directly by a GEMV kernel."""
+    """CUDA-resident 2-bit ternary payload consumed directly by GEMV kernels."""
 
     packed: object
     scales: object
@@ -843,6 +843,85 @@ def compile_circular_gather(max_context: int, width: int):
         return output
 
     return gather
+
+
+@lru_cache(maxsize=None)
+def compile_structural_softmax(max_context: int):
+    """Mask physical cache slots and compute FP32 softmax into BF16."""
+
+    tilelang, T = _imports()
+    threads = 256
+
+    @tilelang.jit(target="cuda")
+    def softmax(
+        scores: T.Tensor((max_context,), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((max_context,), T.bfloat16)
+        with T.Kernel(1, threads=threads):
+            lane = T.get_thread_binding(0)
+            partial_max = T.alloc_local((1,), T.float32)
+            maximum = T.alloc_local((1,), T.float32)
+            partial_sum = T.alloc_local((1,), T.float32)
+            total = T.alloc_local((1,), T.float32)
+            partial_max[0] = T.float32(float("-inf"))
+            for tile in T.serial(T.ceildiv(max_context, threads)):
+                slot = tile * threads + lane
+                if slot < max_context:
+                    valid = T.if_then_else(
+                        position[0] + 1 < max_context,
+                        slot <= position[0],
+                        True,
+                    )
+                    if valid:
+                        partial_max[0] = T.max(
+                            partial_max[0], scores[slot].astype(T.float32)
+                        )
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(float("-inf"))]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial_max[0], True, maximum[0], lane,
+                    dtype="handle",
+                ))
+            T.clear(partial_sum)
+            for tile in T.serial(T.ceildiv(max_context, threads)):
+                slot = tile * threads + lane
+                if slot < max_context:
+                    valid = T.if_then_else(
+                        position[0] + 1 < max_context,
+                        slot <= position[0],
+                        True,
+                    )
+                    if valid:
+                        partial_sum[0] += T.exp(
+                            scores[slot].astype(T.float32) - maximum[0]
+                        )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial_sum[0], True, total[0], lane,
+                    dtype="handle",
+                ))
+            for tile in T.serial(T.ceildiv(max_context, threads)):
+                slot = tile * threads + lane
+                if slot < max_context:
+                    valid = T.if_then_else(
+                        position[0] + 1 < max_context,
+                        slot <= position[0],
+                        True,
+                    )
+                    output[slot] = T.if_then_else(
+                        valid,
+                        T.exp(scores[slot].astype(T.float32) - maximum[0]) / total[0],
+                        T.float32(0),
+                    )
+        return output
+
+    return softmax
 
 
 @lru_cache(maxsize=None)

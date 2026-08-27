@@ -16,6 +16,7 @@ from .kernels import (
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
     compile_power_of_two_quantize, compile_rope,
+    compile_structural_softmax,
 )
 
 
@@ -109,9 +110,6 @@ class TileLangEngine:
                 self.max_context, D, device=self.device, dtype=self.dtype
             )
             self._trunk_cache_cuda.zero_()
-            self._trunk_slots_cuda = torch.arange(
-                self.max_context, device=self.device, dtype=torch.int32
-            )
             self._decode_graph = None
             self._decode_graph_logits = None
         else:
@@ -480,9 +478,9 @@ class TileLangEngine:
 
         query = self._projection("step.Wq", current)
         scores = self._trunk_cache_cuda @ query / math.sqrt(D)
-        valid = self._trunk_slots_cuda <= self._position_cuda[0]
-        scores = scores.masked_fill(~valid, float("-inf"))
-        probability = torch.softmax(scores.float(), dim=-1).to(self.dtype)
+        probability = compile_structural_softmax(self.max_context)(
+            scores, self._position_cuda
+        )
         recall = probability @ self._trunk_cache_cuda
         joined = torch.cat((current, recall))
         hidden = functional.silu(self._projection("step.cin", joined))

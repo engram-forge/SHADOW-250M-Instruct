@@ -272,6 +272,23 @@ def test_tilelang_structural_attention_is_invariant_to_cache_order(position):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("max_context,position", [(32, 3), (32, 34), (2048, 2050)])
+def test_tilelang_structural_softmax_is_bit_exact(max_context, position):
+    from shadow_tilelang.kernels import compile_structural_softmax
+
+    torch.manual_seed(max_context + position)
+    scores = torch.randn(
+        max_context, device="cuda", dtype=torch.bfloat16
+    )
+    position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
+    actual = compile_structural_softmax(max_context)(scores, position_cuda)
+    expected_scores = scores.clone()
+    if position + 1 < max_context:
+        expected_scores[position + 1:] = float("-inf")
+    expected = torch.softmax(expected_scores.float(), dim=-1).bfloat16()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("length", [2, 4, 7])
 def test_tilelang_batched_prefill_matches_reference_and_decode(length):
     from pathlib import Path
