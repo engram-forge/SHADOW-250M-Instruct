@@ -413,3 +413,19 @@ top-10 overlap was 1.0. The raw result is in
 `rk3566_fp16_qkv_generation.json`. This is strong approximate-quality evidence,
 but any divergence means the mode remains opt-in. The physical RK3566 performance
 matrix remains required before considering it as a default.
+
+### Rejected FP16 RVQ projection inputs
+
+An isolated `SHADOW_FP16_PROJECTION_INPUT` experiment converted the FP32 RMSNorm
+output once and reused it across Q/K/V, while mirroring RVQ codebooks as FP16 and
+using FP16FML with FP32 lookup/output accumulation. It was removed after the
+matched three-run, four-thread WSL screen: decode regressed 9.6% at context 32,
+7.3% at context 512, and 7.8% at context 1024. Prefill also regressed about 1--2%,
+and the generated trajectory diverged (full-logit RMSE 7.64 in the screen).
+
+RVQ codebooks are small and heavily reused, so FP16 codebook loads do not remove
+a material bandwidth bottleneck. Conversion, scalar FP16 broadcasts, and FP16FML
+lookup construction cost more than the existing four-way FP32 kernel. Do not
+retry persistent FP16 hidden/projection inputs without a materially different RVQ
+layout or physical-board evidence. The accepted FP16 QKV cache island is
+unaffected.
