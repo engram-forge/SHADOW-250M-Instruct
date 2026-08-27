@@ -1136,6 +1136,67 @@ def compile_rope(heads: int, head_dim: int):
     return rope
 
 
+@lru_cache(maxsize=None)
+def compile_rope_quantize(heads: int, head_dim: int):
+    """Apply BF16 RoPE then exact per-head power-of-two quantization."""
+
+    tilelang, T = _imports()
+    threads = min(256, 1 << (head_dim - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def rope_quantize(
+        x: T.Tensor((heads, head_dim), T.bfloat16),
+        cosine: T.Tensor((head_dim // 2,), T.bfloat16),
+        sine: T.Tensor((head_dim // 2,), T.bfloat16),
+    ):
+        output = T.empty((heads, head_dim), T.bfloat16)
+        with T.Kernel(heads, threads=threads) as head:
+            lane = T.get_thread_binding(0)
+            rotated = T.alloc_shared((head_dim,), T.bfloat16)
+            if lane < head_dim:
+                pair = lane // 2
+                even = x[head, pair * 2]
+                odd = x[head, pair * 2 + 1]
+                even_cosine = even * cosine[pair]
+                odd_sine = odd * sine[pair]
+                even_sine = even * sine[pair]
+                odd_cosine = odd * cosine[pair]
+                rotated[lane] = T.if_then_else(
+                    lane % 2 == 0,
+                    even_cosine - odd_sine,
+                    even_sine + odd_cosine,
+                )
+            T.sync_threads()
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            if lane < head_dim:
+                partial[0] = T.abs(rotated[lane]).astype(T.float32)
+            else:
+                partial[0] = 0.0
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane,
+                    dtype="handle",
+                ))
+            maximum = T.max(reduced[0], T.float32(1e-6)).astype(T.bfloat16)
+            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+            scale = T.exp2(exponent).astype(T.bfloat16)
+            if lane < head_dim:
+                rounded = T.round((rotated[lane] / scale).astype(T.float32))
+                clipped = T.min(
+                    T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+                ).astype(T.bfloat16)
+                output[head, lane] = clipped * scale
+        return output
+
+    return rope_quantize
+
+
 
 
 

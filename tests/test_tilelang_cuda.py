@@ -415,6 +415,23 @@ def test_tilelang_rope_is_bit_exact(heads):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("heads", [2, 24])
+def test_tilelang_rope_quantize_fusion_is_bit_exact(heads):
+    from shadow_tilelang.kernels import (
+        compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
+    )
+
+    torch.manual_seed(100 + heads)
+    x = torch.randn(heads, 64, device="cuda", dtype=torch.bfloat16)
+    angle = torch.randn(32, device="cuda")
+    cosine, sine = angle.cos().bfloat16(), angle.sin().bfloat16()
+    expected = compile_power_of_two_quantize(heads, 64)(
+        compile_rope(heads, 64)(x, cosine, sine)
+    )
+    actual = compile_rope_quantize(heads, 64)(x, cosine, sine)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_tilelang_projection_epilogues_are_bit_exact():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine

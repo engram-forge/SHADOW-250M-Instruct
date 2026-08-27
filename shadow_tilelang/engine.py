@@ -15,7 +15,7 @@ from .kernels import (
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
-    compile_power_of_two_quantize, compile_rope,
+    compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
     compile_structural_softmax,
 )
 
@@ -367,10 +367,12 @@ class TileLangEngine:
         v = qkv[q_end + kv_width :].reshape(KV_HEADS, HEAD_DIM)
         q = self._norm(q, self.weights[f"{prefix}.qn.w"])
         k = self._norm(k, self.weights[f"{prefix}.kn.w"])
-        q = self._rope(q, self.position, cosine, sine)
-        k = self._rope(k, self.position, cosine, sine)
-        q = self._quantize(q)
-        k = self._quantize(k)
+        if self.backend == "tilelang":
+            q = compile_rope_quantize(QUERY_HEADS, HEAD_DIM)(q, cosine, sine)
+            k = compile_rope_quantize(KV_HEADS, HEAD_DIM)(k, cosine, sine)
+        else:
+            q = self._quantize(self._rope(q, self.position, cosine, sine))
+            k = self._quantize(self._rope(k, self.position, cosine, sine))
         v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
