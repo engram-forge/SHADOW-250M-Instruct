@@ -21,7 +21,7 @@ from .kernels import (
     compile_fingerprint_embedding,
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
     compile_fingerprint_unpack_batch,
-    compile_prefill_attention, compile_rms_norm,
+    compile_double_rms_norm, compile_prefill_attention, compile_rms_norm,
     compile_residual_rms_norm,
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
     compile_rope_angles,
@@ -592,7 +592,7 @@ class TileLangEngine:
         output = current + self._projection("step.cout", hidden)
         return self._norm(output, self.weights["step.nf.w"])
 
-    def _structural_step_cuda(self, current):
+    def _structural_step_cuda(self, current, *, final_norm=False):
         import torch
         import torch.nn.functional as functional
 
@@ -608,6 +608,10 @@ class TileLangEngine:
         output = self.linear.rvq_residual(
             hidden, current, self.weights["step.cout"]
         )
+        if final_norm:
+            return compile_double_rms_norm(D)(
+                output, self.weights["step.nf.w"], self.weights["nf.w"]
+            )
         return self._norm(output, self.weights["step.nf.w"])
 
     def _decode_trunk_cuda(self, *, attention_parallelism=0):
@@ -643,8 +647,7 @@ class TileLangEngine:
         compile_circular_store(self.max_context, D)(
             hidden, self._trunk_cache_cuda, self._position_cuda
         )
-        hidden = self._structural_step_cuda(hidden)
-        hidden = self._norm(hidden, self.weights["nf.w"])
+        hidden = self._structural_step_cuda(hidden, final_norm=True)
         projected = self._projection("head.weight", hidden)
         return self._logits(projected)
 
@@ -779,10 +782,11 @@ class TileLangEngine:
         if not return_logits:
             return None
         hidden = (
-            self._structural_step_cuda(hidden)
+            self._structural_step_cuda(hidden, final_norm=True)
             if self.backend == "tilelang" else self._structural_step(hidden)
         )
-        hidden = self._norm(hidden, self.weights["nf.w"])
+        if self.backend != "tilelang":
+            hidden = self._norm(hidden, self.weights["nf.w"])
         projected = self._projection("head.weight", hidden)
         return self._logits(projected)
 

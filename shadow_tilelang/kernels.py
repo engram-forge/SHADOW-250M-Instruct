@@ -2135,6 +2135,80 @@ def compile_rms_norm(rows: int, width: int, epsilon: float = 1e-6):
 
 
 @lru_cache(maxsize=None)
+def compile_double_rms_norm(width: int, epsilon: float = 1e-6):
+    """Apply two exact BF16 RMSNorms without materializing the first."""
+
+    if width < 1:
+        raise ValueError("RMSNorm width must be positive")
+    tilelang, T = _imports()
+    threads = min(256, 1 << (width - 1).bit_length())
+    values_per_thread = T.ceildiv(width, threads)
+
+    @tilelang.jit(target="cuda")
+    def double_rms_norm(
+        x: T.Tensor((width,), T.bfloat16),
+        first_weight: T.Tensor((width,), T.float32),
+        second_weight: T.Tensor((width,), T.float32),
+    ):
+        output = T.empty((width,), T.bfloat16)
+        with T.Kernel(1, threads=threads):
+            lane = T.get_thread_binding(0)
+            values = T.alloc_local((values_per_thread,), T.bfloat16)
+            partial = T.alloc_local((1,), T.float32)
+            first_reduced = T.alloc_local((1,), T.float32)
+            second_reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile in T.serial(values_per_thread):
+                column = tile * threads + lane
+                if column < width:
+                    value = x[column].astype(T.float32)
+                    partial[0] += value * value
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, first_reduced[0], lane,
+                    dtype="handle",
+                ))
+            first_scale = T.rsqrt(first_reduced[0] / width + epsilon)
+            T.clear(partial)
+            for tile in T.serial(values_per_thread):
+                column = tile * threads + lane
+                if column < width:
+                    normalized = (
+                        x[column].astype(T.float32) * first_scale
+                    ).astype(T.bfloat16)
+                    value = (
+                        normalized * first_weight[column].astype(T.bfloat16)
+                    ).astype(T.bfloat16)
+                    values[tile] = value
+                    value_float = value.astype(T.float32)
+                    partial[0] += value_float * value_float
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, second_reduced[0], lane,
+                    dtype="handle",
+                ))
+            second_scale = T.rsqrt(second_reduced[0] / width + epsilon)
+            for tile in T.serial(values_per_thread):
+                column = tile * threads + lane
+                if column < width:
+                    normalized = (
+                        values[tile].astype(T.float32) * second_scale
+                    ).astype(T.bfloat16)
+                    output[column] = (
+                        normalized * second_weight[column].astype(T.bfloat16)
+                    )
+        return output
+
+    return double_rms_norm
+
+
+@lru_cache(maxsize=None)
 def compile_residual_rms_norm(width: int, epsilon: float = 1e-6):
     """Add a BF16 residual and return it together with its exact RMSNorm."""
 
