@@ -347,24 +347,22 @@ def compile_ternary_gemv(out_features: int, in_features: int):
             reduced = T.alloc_local((1,), T.float32)
             T.clear(partial)
             if row < out_features:
+                row_scale = scales[row].astype(T.bfloat16)
                 for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
                     byte_column = byte_tile * reduce_threads + lane_k
                     if byte_column < packed_width:
-                        byte = packed[row, byte_column].astype(T.int32)
-                        divisor = T.alloc_local((1,), T.int32)
-                        divisor[0] = 1
-                        for component in T.serial(5):
+                        remaining = T.alloc_local((1,), T.int32)
+                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                        for component in T.unroll(5):
                             column = byte_column * 5 + component
                             if column < in_features:
-                                trit = (byte // divisor[0]) % 3 - 1
-                                weight = (
-                                    trit.astype(T.float32) * scales[row]
-                                ).astype(T.bfloat16)
+                                trit = remaining[0] % 3 - 1
+                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (
                                     x[column].astype(T.float32)
                                     * weight.astype(T.float32)
                                 )
-                            divisor[0] *= 3
+                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope",
@@ -410,20 +408,20 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
             reduced = T.alloc_local((1,), T.float32)
             T.clear(partial)
             if row < out_features:
+                row_scale = scales[row].astype(T.bfloat16)
                 for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
                     byte_column = byte_tile * reduce_threads + lane_k
                     if byte_column < packed_width:
-                        byte = packed[row, byte_column].astype(T.int32)
-                        divisor = T.alloc_local((1,), T.int32)
-                        divisor[0] = 1
-                        for component in T.serial(5):
+                        remaining = T.alloc_local((1,), T.int32)
+                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                        for component in T.unroll(5):
                             column = byte_column * 5 + component
                             if column < in_features:
-                                trit = (byte // divisor[0]) % 3 - 1
-                                weight = (trit.astype(T.float32) * scales[row]).astype(T.bfloat16)
+                                trit = remaining[0] % 3 - 1
+                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[column].astype(T.float32)
                                                * weight.astype(T.float32))
-                            divisor[0] *= 3
+                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -662,20 +660,20 @@ def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
             reduced = T.alloc_local((1,), T.float32)
             T.clear(partial)
             if row < out_features:
+                row_scale = scales[row].astype(T.bfloat16)
                 for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
                     byte_column = byte_tile * reduce_threads + lane_k
                     if byte_column < packed_width:
-                        byte = packed[row, byte_column].astype(T.int32)
-                        divisor = T.alloc_local((1,), T.int32)
-                        divisor[0] = 1
-                        for component in T.serial(5):
+                        remaining = T.alloc_local((1,), T.int32)
+                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                        for component in T.unroll(5):
                             column = byte_column * 5 + component
                             if column < in_features:
-                                trit = (byte // divisor[0]) % 3 - 1
-                                weight = (trit.astype(T.float32) * scales[row]).astype(T.bfloat16)
+                                trit = remaining[0] % 3 - 1
+                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[token, column].astype(T.float32)
                                                * weight.astype(T.float32))
-                            divisor[0] *= 3
+                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
