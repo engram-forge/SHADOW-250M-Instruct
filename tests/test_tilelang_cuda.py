@@ -1,8 +1,13 @@
+import importlib.util
+
 import pytest
 
 
 torch = pytest.importorskip("torch")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or importlib.util.find_spec("tilelang") is None,
+    reason="CUDA GPU and TileLang required",
+)
 
 
 @pytest.mark.parametrize(
