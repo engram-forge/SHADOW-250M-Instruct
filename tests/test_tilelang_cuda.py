@@ -416,6 +416,35 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     assert int(actual.argmax()) == int(expected.argmax())
 
 
+@pytest.mark.parametrize("token", [0, 2, 925, 131071])
+def test_tilelang_packed_fingerprint_embedding_is_bit_exact(token):
+    from pathlib import Path
+    from shadow_tilelang.engine import D, FINGERPRINT_DIM, VOCAB_SIZE, TileLangEngine
+    from shadow_tilelang.kernels import compile_fingerprint_embedding
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (
+        root / "deployment/shadow250m_instruct.shdw",
+        root / "deployment/fp131072.npy",
+    )
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=16)
+        try:
+            engine._token_cuda.fill_(token)
+            expected = engine.linear(
+                engine._fingerprint_cuda(), engine.weights["emb.weight"]
+            )
+            actual = compile_fingerprint_embedding(
+                VOCAB_SIZE, FINGERPRINT_DIM, D
+            )(
+                engine.fingerprints, engine._token_cuda,
+                engine.weights["emb.weight"],
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            engine.close()
+
+
 def test_tilelang_decode_preserves_full_logits_and_tokens():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine

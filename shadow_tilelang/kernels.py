@@ -1039,6 +1039,60 @@ def compile_fingerprint_gather(vocabulary: int, features: int):
 
 
 @lru_cache(maxsize=None)
+def compile_fingerprint_embedding(
+    vocabulary: int, features: int, out_features: int
+):
+    """Project one packed token fingerprint with dense BF16 weights."""
+
+    if features % 8:
+        raise ValueError("fingerprint width must be divisible by eight")
+    tilelang, T = _imports()
+    packed_width = features // 8
+    n_partition, reduce_threads, vector = 8, 16, 8
+    block_k = reduce_threads * vector
+
+    @tilelang.jit(target="cuda")
+    def embedding(
+        packed: T.Tensor((vocabulary, packed_width), T.uint8),
+        token: T.Tensor((1,), T.int64),
+        weight: T.Tensor((out_features, features), T.bfloat16),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile_k in T.serial(T.ceildiv(features, block_k)):
+                for inner in T.serial(vector):
+                    feature = tile_k * block_k + lane_k * vector + inner
+                    byte = packed[token[0], feature // 8].astype(T.int32)
+                    bit = (byte >> (7 - feature % 8)) & 1
+                    sign = (bit * 2 - 1).astype(T.bfloat16)
+                    value = weight[
+                        block * n_partition + lane_n, feature
+                    ]
+                    partial[0] += sign.astype(T.float32) * value.astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                output[block * n_partition + lane_n] = reduced[0]
+        return output
+
+    return embedding
+
+
+@lru_cache(maxsize=None)
 def compile_circular_store(max_context: int, width: int):
     """Store one vector at a CUDA-selected circular-cache position."""
 

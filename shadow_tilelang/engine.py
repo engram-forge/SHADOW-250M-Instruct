@@ -12,6 +12,7 @@ from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpa
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
+    compile_fingerprint_embedding,
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
@@ -512,7 +513,12 @@ class TileLangEngine:
         angle = self._position_cuda.float() * self._inv_frequency
         cosine = angle.cos().to(self.dtype)
         sine = angle.sin().to(self.dtype)
-        hidden = self._projection("emb.weight", self._fingerprint_cuda())
+        hidden = compile_fingerprint_embedding(
+            VOCAB_SIZE, FINGERPRINT_DIM, D
+        )(
+            self.fingerprints, self._token_cuda,
+            self.weights["emb.weight"],
+        )
         for layer in range(LAYERS):
             hidden = self._block(layer, hidden, cosine, sine)
         return hidden
