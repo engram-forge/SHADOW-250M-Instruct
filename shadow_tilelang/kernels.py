@@ -500,23 +500,25 @@ def compile_attention(
             T.sync_threads()
             for token_tile in T.serial(T.ceildiv(total, token_parallel)):
                 token = token_tile * token_parallel + token_lane
+                T.clear(partial)
                 if token < total:
                     slot = (start + token) % max_context
                     partial[0] = (
                         query[head, lane].astype(T.float32)
                         * keys[kv_head, slot, lane].astype(T.float32)
                     )
-                    with T.attr(
-                        T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
-                        "reduce_scope",
-                        T.reinterpret(T.uint64(0), dtype="handle"),
-                    ):
-                        T.evaluate(
-                            T.tvm_thread_allreduce(
-                                T.uint32(1), partial[0], True, reduced[0], lane,
-                                dtype="handle",
-                            )
+                with T.attr(
+                    T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1), partial[0], True, reduced[0], lane,
+                            dtype="handle",
                         )
+                    )
+                if token < total:
                     if lane == 0:
                         dot = reduced[0].astype(T.bfloat16).astype(T.float32)
                         scores[token] = T.floor(dot * alpha[head])
@@ -535,10 +537,14 @@ def compile_attention(
                     denominator[0] += scores[token]
                 scores[max_context] = denominator[0]
             T.sync_threads()
-            if token_lane == 0:
-                attended = T.alloc_local((1,), T.float32)
-                T.clear(attended)
-                for token in T.serial(total):
+            attended_partials = T.alloc_shared(
+                (token_parallel, head_dim), T.float32
+            )
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for token_tile in T.serial(T.ceildiv(total, token_parallel)):
+                token = token_tile * token_parallel + token_lane
+                if token < total:
                     slot = (start + token) % max_context
                     probability = (
                         scores[token] / scores[max_context]
@@ -547,6 +553,12 @@ def compile_attention(
                         probability.astype(T.float32)
                         * values[kv_head, slot, lane].astype(T.float32)
                     )
+            attended_partials[token_lane, lane] = attended[0]
+            T.sync_threads()
+            if token_lane == 0:
+                T.clear(attended)
+                for segment in T.serial(token_parallel):
+                    attended[0] += attended_partials[segment, lane]
                 output[head, lane] = attended[0]
         return output
 

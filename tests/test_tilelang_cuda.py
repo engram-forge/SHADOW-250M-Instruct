@@ -184,7 +184,12 @@ def test_tilelang_engine_keeps_quantized_weights_packed():
 
 
 @pytest.mark.parametrize(
-    "max_context,position", [(12, 11), (12, 19), (512, 511), (512, 519)]
+    "max_context,position",
+    [
+        (12, 11), (12, 19),
+        (512, 511), (512, 519),
+        (2048, 2047), (2048, 2055),
+    ],
 )
 def test_tilelang_attention_matches_reference_with_circular_cache(
     max_context, position
