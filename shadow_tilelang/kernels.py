@@ -262,6 +262,71 @@ def compile_rvq_gemv(
 
 
 @lru_cache(maxsize=None)
+def compile_rvq_gemv_gated_residual(
+    out_features: int, in_features: int, group_size: int, stages: int
+):
+    """Compile RVQ GEMV with BF16 input gate and residual epilogues."""
+
+    if out_features <= 0 or out_features % 64:
+        raise ValueError("RVQ GEMV output width must be positive and 64-row aligned")
+    tilelang, T = _imports()
+    groups, chunks = in_features // group_size, out_features // 64
+    n_partition, reduce_threads = 8, 16
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        x: T.Tensor((in_features,), T.bfloat16),
+        gate: T.Tensor((in_features,), T.bfloat16),
+        residual: T.Tensor((out_features,), T.bfloat16),
+        codebooks: T.Tensor((chunks, stages, group_size, 16), T.float32),
+        indices: T.Tensor((stages, chunks, groups, 32), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            chunk, row_lane = row // 64, row % 64
+            packed_lane = T.if_then_else(row_lane < 32, row_lane, row_lane - 32)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
+                group = group_tile * reduce_threads + lane_k
+                if group < groups:
+                    codes = T.alloc_local((stages,), T.int32)
+                    for stage in T.serial(stages):
+                        byte = indices[stage, chunk, group, packed_lane].astype(T.int32)
+                        codes[stage] = T.if_then_else(row_lane < 32, byte & 15, byte >> 4)
+                    for component in T.serial(group_size):
+                        column = group * group_size + component
+                        value = T.alloc_local((1,), T.float32)
+                        value[0] = 0.0
+                        for stage in T.serial(stages):
+                            value[0] += codebooks[chunk, stage, component, codes[stage]]
+                        weight = (value[0] * scales[row]).astype(T.bfloat16)
+                        gated = (x[column] * gate[column]).astype(T.bfloat16)
+                        partial[0] += gated.astype(T.float32) * weight.astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k, dtype="handle"
+                ))
+            if lane_k == 0:
+                projected = reduced[0].astype(T.bfloat16)
+                output[row] = residual[row] + projected
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
 def compile_ternary_gemv(out_features: int, in_features: int):
     """Compile a fused five-trits-per-byte dequantization BF16 GEMV."""
 
@@ -319,6 +384,62 @@ def compile_ternary_gemv(out_features: int, in_features: int):
                 )
             if lane_k == 0 and row < out_features:
                 output[row] = reduced[0]
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
+def compile_ternary_gemv_residual(out_features: int, in_features: int):
+    """Compile base-3 GEMV with a BF16 residual output epilogue."""
+
+    tilelang, T = _imports()
+    packed_width = (in_features + 4) // 5
+    n_partition, reduce_threads = 8, 32
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        x: T.Tensor((in_features,), T.bfloat16),
+        residual: T.Tensor((out_features,), T.bfloat16),
+        packed: T.Tensor((out_features, packed_width), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            if row < out_features:
+                for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
+                    byte_column = byte_tile * reduce_threads + lane_k
+                    if byte_column < packed_width:
+                        byte = packed[row, byte_column].astype(T.int32)
+                        divisor = T.alloc_local((1,), T.int32)
+                        divisor[0] = 1
+                        for component in T.serial(5):
+                            column = byte_column * 5 + component
+                            if column < in_features:
+                                trit = (byte // divisor[0]) % 3 - 1
+                                weight = (trit.astype(T.float32) * scales[row]).astype(T.bfloat16)
+                                partial[0] += (x[column].astype(T.float32)
+                                               * weight.astype(T.float32))
+                            divisor[0] *= 3
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k, dtype="handle"
+                ))
+            if lane_k == 0 and row < out_features:
+                projected = reduced[0].astype(T.bfloat16)
+                output[row] = residual[row] + projected
         return output
 
     return gemv
@@ -860,6 +981,8 @@ def compile_rope(heads: int, head_dim: int):
 
 
 
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 
@@ -894,6 +1017,23 @@ class TileLangLinear:
         return compile_gemm(batch_size, weight.shape[0], weight.shape[1])(
             x.contiguous(), weight
         )
+
+    def gated_residual(self, x, gate, residual, weight):
+        if not isinstance(weight, PackedRVQWeight):
+            raise TypeError("gated residual projection requires packed RVQ weights")
+        return compile_rvq_gemv_gated_residual(
+            weight.out_features, weight.in_features, weight.group_size, weight.stages
+        )(
+            x.contiguous(), gate, residual, weight.codebooks, weight.indices,
+            weight.scales,
+        )
+
+    def residual(self, x, residual, weight):
+        if not isinstance(weight, PackedTernaryWeight):
+            raise TypeError("residual projection requires packed ternary weights")
+        return compile_ternary_gemv_residual(
+            weight.out_features, weight.in_features
+        )(x.contiguous(), residual, weight.packed, weight.scales)
 
 
 class TorchLinear:

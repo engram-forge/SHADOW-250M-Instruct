@@ -71,6 +71,8 @@ backends run on CUDA and use the same quantized weight values and caches.
 - Decode RoPE is a bit-exact TileLang kernel; its cosine and sine vectors are
   computed once per token and reused across all transformer layers. Static
   sigmoid gates and quantized attention scales are materialized once at load.
+- Packed attention-output and FFN-down projections include bit-exact BF16 gate
+  and residual epilogues, avoiding separate pointwise launches.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.

@@ -320,3 +320,33 @@ def test_tilelang_rope_is_bit_exact(heads):
         (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
     ).flatten(-2)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_tilelang_projection_epilogues_are_bit_exact():
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=16)
+        try:
+            torch.manual_seed(53)
+            attended = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+            gate = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+            residual = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+            actual = engine.linear.gated_residual(
+                attended, gate, residual, engine.weights["b.0.o"]
+            )
+            expected = residual + engine.linear(
+                attended * gate, engine.weights["b.0.o"]
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            hidden = torch.randn(4224, device="cuda", dtype=torch.bfloat16)
+            actual = engine.linear.residual(
+                hidden, residual, engine.weights["b.0.dn"]
+            )
+            expected = residual + engine.linear(hidden, engine.weights["b.0.dn"])
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            engine.close()
