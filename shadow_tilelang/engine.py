@@ -172,11 +172,11 @@ class TileLangEngine:
                         ]
                         remaining //= 3
                     packed_2bit = np.zeros(
-                        (record.out_features, (record.in_features + 3) // 4),
-                        dtype=np.uint8,
+                        (record.out_features, (record.in_features + 4) // 5),
+                        dtype=np.uint16,
                     )
-                    for component in range(4):
-                        values = trits[:, component::4]
+                    for component in range(5):
+                        values = trits[:, component::5].astype(np.uint16)
                         packed_2bit[:, :values.shape[1]] |= values << (component * 2)
                     packed = torch.from_numpy(packed_2bit).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)

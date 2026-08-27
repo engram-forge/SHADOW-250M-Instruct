@@ -314,18 +314,18 @@ def compile_rvq_gemv_gated_residual(
 
 @lru_cache(maxsize=None)
 def compile_ternary_gemv(out_features: int, in_features: int):
-    """Compile fused four-2-bit-trits-per-byte BF16 GEMV."""
+    """Compile fused five-2-bit-trits-per-word BF16 GEMV."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 3) // 4
     reduction_width = (in_features + 4) // 5
+    packed_width = reduction_width
     n_partition = 8
     reduce_threads = 32
 
     @tilelang.jit(target="cuda")
     def gemv(
         x: T.Tensor((in_features,), T.bfloat16),
-        packed: T.Tensor((out_features, packed_width), T.uint8),
+        packed: T.Tensor((out_features, packed_width), T.uint16),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((out_features,), T.bfloat16)
@@ -344,11 +344,11 @@ def compile_ternary_gemv(out_features: int, in_features: int):
                 for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
                     group = group_tile * reduce_threads + lane_k
                     if group < reduction_width:
+                        word = packed[row, group].astype(T.int32)
                         for component in T.unroll(5):
                             column = group * 5 + component
                             if column < in_features:
-                                byte = packed[row, column // 4].astype(T.int32)
-                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
+                                trit = ((word >> (component * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (
                                     x[column].astype(T.float32)
@@ -377,15 +377,15 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
     """Compile 2-bit ternary GEMV with a BF16 residual output epilogue."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 3) // 4
     reduction_width = (in_features + 4) // 5
+    packed_width = reduction_width
     n_partition, reduce_threads = 8, 32
 
     @tilelang.jit(target="cuda")
     def gemv(
         x: T.Tensor((in_features,), T.bfloat16),
         residual: T.Tensor((out_features,), T.bfloat16),
-        packed: T.Tensor((out_features, packed_width), T.uint8),
+        packed: T.Tensor((out_features, packed_width), T.uint16),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((out_features,), T.bfloat16)
@@ -404,11 +404,11 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
                 for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
                     group = group_tile * reduce_threads + lane_k
                     if group < reduction_width:
+                        word = packed[row, group].astype(T.int32)
                         for component in T.unroll(5):
                             column = group * 5 + component
                             if column < in_features:
-                                byte = packed[row, column // 4].astype(T.int32)
-                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
+                                trit = ((word >> (component * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[column].astype(T.float32)
                                                * weight.astype(T.float32))
@@ -652,14 +652,14 @@ def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
     """Compile fused packed 2-bit ternary GEMM for prompt ingestion."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 3) // 4
     reduction_width = (in_features + 4) // 5
+    packed_width = reduction_width
     n_partition, reduce_threads = 8, 32
 
     @tilelang.jit(target="cuda")
     def gemm(
         x: T.Tensor((batch_size, in_features), T.bfloat16),
-        packed: T.Tensor((out_features, packed_width), T.uint8),
+        packed: T.Tensor((out_features, packed_width), T.uint16),
         scales: T.Tensor((out_features,), T.float32),
     ):
         output = T.empty((batch_size, out_features), T.bfloat16)
@@ -678,11 +678,11 @@ def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
                 for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
                     group = group_tile * reduce_threads + lane_k
                     if group < reduction_width:
+                        word = packed[row, group].astype(T.int32)
                         for component in T.unroll(5):
                             column = group * 5 + component
                             if column < in_features:
-                                byte = packed[row, column // 4].astype(T.int32)
-                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
+                                trit = ((word >> (component * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[token, column].astype(T.float32)
                                                * weight.astype(T.float32))
