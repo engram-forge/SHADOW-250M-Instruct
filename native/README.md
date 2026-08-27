@@ -41,6 +41,22 @@ directly by FP16FML with FP32 accumulators. RMSNorm reductions, attention softma
 residuals, structural recurrence, and logits remain FP32. Do not enable a path
 that converts cached K/V back to FP32 inside the attention loop.
 
+Run the matched board matrix after an FP16-island switch exists, substituting its
+actual environment variable for `SHADOW_FP16_QKV=1`:
+
+    python3 benchmarks/rk3566_board_qualification.py \
+      --kernel build/linux-arm64/shadow \
+      --model deployment/shadow250m_instruct.shdw \
+      --table deployment/fp131072.npy \
+      --candidate-env SHADOW_FP16_QKV=1 \
+      --out benchmarks/rk3566_board_fp16_qkv.json
+
+The driver alternates control/candidate order and records the required
+32/128/512/1024/2048 contexts, 1/2/4 threads, median throughput, RSS, thermal
+readings, CPU information, and runtime capabilities. It refuses an FP16 candidate
+unless both required features are exposed. Quality/parity qualification remains a
+separate mandatory gate.
+
 Linux supports `--archive-backend auto` and `cpu`; both select the exact CPU
 scanner. Requesting `metal` fails explicitly. A QEMU user-mode smoke test must
 use a sysroot matching the binary's build userspace, for example Ubuntu 24.04:
