@@ -162,7 +162,24 @@ class TileLangEngine:
                     tensor = torch.from_numpy(unpack_rvq(record)).to(self.device, self.dtype)
             elif isinstance(record, TernaryRecord):
                 if self.backend == "tilelang":
-                    packed = torch.from_numpy(np.array(record.packed, copy=True)).to(self.device)
+                    source = np.array(record.packed, copy=True)
+                    trits = np.empty(
+                        (record.out_features, record.in_features), dtype=np.uint8
+                    )
+                    remaining = source.astype(np.int16)
+                    for component in range(5):
+                        trits[:, component::5] = (remaining % 3)[:, :
+                            trits[:, component::5].shape[1]
+                        ]
+                        remaining //= 3
+                    packed_2bit = np.zeros(
+                        (record.out_features, (record.in_features + 3) // 4),
+                        dtype=np.uint8,
+                    )
+                    for component in range(4):
+                        values = trits[:, component::4]
+                        packed_2bit[:, :values.shape[1]] |= values << (component * 2)
+                    packed = torch.from_numpy(packed_2bit).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)
                     tensor = PackedTernaryWeight(
                         packed, scales, record.out_features, record.in_features

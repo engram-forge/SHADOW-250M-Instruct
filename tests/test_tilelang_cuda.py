@@ -92,10 +92,15 @@ def test_tilelang_ternary_gemv_matches_materialized_weight():
     scales = rng.normal(size=64).astype(np.float32)
     record = TernaryRecord("test", 4, 64, 192, packed, scales)
     x = torch.randn(192, device="cuda", dtype=torch.bfloat16)
+    materialized = unpack_ternary(record)
+    trits = (materialized / scales[:, None] + 1).astype(np.uint8)
+    packed_2bit = np.zeros((64, 48), dtype=np.uint8)
+    for component in range(4):
+        packed_2bit |= trits[:, component::4] << (component * 2)
     actual = compile_ternary_gemv(64, 192)(
-        x, torch.from_numpy(packed).cuda(), torch.from_numpy(scales).cuda()
+        x, torch.from_numpy(packed_2bit).cuda(), torch.from_numpy(scales).cuda()
     )
-    weight = torch.from_numpy(unpack_ternary(record)).cuda().bfloat16()
+    weight = torch.from_numpy(materialized).cuda().bfloat16()
     expected = torch.nn.functional.linear(x, weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

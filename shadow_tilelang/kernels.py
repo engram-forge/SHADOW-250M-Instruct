@@ -314,10 +314,11 @@ def compile_rvq_gemv_gated_residual(
 
 @lru_cache(maxsize=None)
 def compile_ternary_gemv(out_features: int, in_features: int):
-    """Compile a fused five-trits-per-byte dequantization BF16 GEMV."""
+    """Compile fused four-2-bit-trits-per-byte BF16 GEMV."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 4) // 5
+    packed_width = (in_features + 3) // 4
+    reduction_width = (in_features + 4) // 5
     n_partition = 8
     reduce_threads = 32
 
@@ -340,21 +341,19 @@ def compile_ternary_gemv(out_features: int, in_features: int):
             T.clear(partial)
             if row < out_features:
                 row_scale = scales[row].astype(T.bfloat16)
-                for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
-                    byte_column = byte_tile * reduce_threads + lane_k
-                    if byte_column < packed_width:
-                        remaining = T.alloc_local((1,), T.int32)
-                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
+                    group = group_tile * reduce_threads + lane_k
+                    if group < reduction_width:
                         for component in T.unroll(5):
-                            column = byte_column * 5 + component
+                            column = group * 5 + component
                             if column < in_features:
-                                trit = remaining[0] % 3 - 1
+                                byte = packed[row, column // 4].astype(T.int32)
+                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (
                                     x[column].astype(T.float32)
                                     * weight.astype(T.float32)
                                 )
-                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope",
@@ -375,10 +374,11 @@ def compile_ternary_gemv(out_features: int, in_features: int):
 
 @lru_cache(maxsize=None)
 def compile_ternary_gemv_residual(out_features: int, in_features: int):
-    """Compile base-3 GEMV with a BF16 residual output epilogue."""
+    """Compile 2-bit ternary GEMV with a BF16 residual output epilogue."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 4) // 5
+    packed_width = (in_features + 3) // 4
+    reduction_width = (in_features + 4) // 5
     n_partition, reduce_threads = 8, 32
 
     @tilelang.jit(target="cuda")
@@ -401,19 +401,17 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
             T.clear(partial)
             if row < out_features:
                 row_scale = scales[row].astype(T.bfloat16)
-                for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
-                    byte_column = byte_tile * reduce_threads + lane_k
-                    if byte_column < packed_width:
-                        remaining = T.alloc_local((1,), T.int32)
-                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
+                    group = group_tile * reduce_threads + lane_k
+                    if group < reduction_width:
                         for component in T.unroll(5):
-                            column = byte_column * 5 + component
+                            column = group * 5 + component
                             if column < in_features:
-                                trit = remaining[0] % 3 - 1
+                                byte = packed[row, column // 4].astype(T.int32)
+                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[column].astype(T.float32)
                                                * weight.astype(T.float32))
-                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -624,10 +622,11 @@ def compile_rvq_gemm(
 
 @lru_cache(maxsize=None)
 def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
-    """Compile fused packed base-3 dequantization GEMM for prompt ingestion."""
+    """Compile fused packed 2-bit ternary GEMM for prompt ingestion."""
 
     tilelang, T = _imports()
-    packed_width = (in_features + 4) // 5
+    packed_width = (in_features + 3) // 4
+    reduction_width = (in_features + 4) // 5
     n_partition, reduce_threads = 8, 32
 
     @tilelang.jit(target="cuda")
@@ -649,19 +648,17 @@ def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
             T.clear(partial)
             if row < out_features:
                 row_scale = scales[row].astype(T.bfloat16)
-                for byte_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
-                    byte_column = byte_tile * reduce_threads + lane_k
-                    if byte_column < packed_width:
-                        remaining = T.alloc_local((1,), T.int32)
-                        remaining[0] = packed[row, byte_column].astype(T.int32)
+                for group_tile in T.serial(T.ceildiv(reduction_width, reduce_threads)):
+                    group = group_tile * reduce_threads + lane_k
+                    if group < reduction_width:
                         for component in T.unroll(5):
-                            column = byte_column * 5 + component
+                            column = group * 5 + component
                             if column < in_features:
-                                trit = remaining[0] % 3 - 1
+                                byte = packed[row, column // 4].astype(T.int32)
+                                trit = ((byte >> ((column % 4) * 2)) & 3) - 1
                                 weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[token, column].astype(T.float32)
                                                * weight.astype(T.float32))
-                            remaining[0] //= 3
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
