@@ -597,8 +597,10 @@ class TileLangEngine:
         import torch.nn.functional as functional
 
         query = self._projection("step.Wq", current)
-        scores = self._trunk_cache_cuda @ query / math.sqrt(D)
-        probability = compile_structural_softmax(self.max_context)(
+        scores = self._trunk_cache_cuda @ query
+        probability = compile_structural_softmax(
+            self.max_context, 1.0 / math.sqrt(D)
+        )(
             scores, self._position_cuda
         )
         recall = probability @ self._trunk_cache_cuda

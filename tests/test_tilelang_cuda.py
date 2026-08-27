@@ -478,6 +478,24 @@ def test_tilelang_structural_softmax_is_bit_exact(max_context, position):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_tilelang_scaled_structural_softmax_is_bit_exact():
+    from shadow_tilelang.engine import D
+    from shadow_tilelang.kernels import compile_structural_softmax
+
+    max_context = 2048
+    torch.manual_seed(451)
+    scores = torch.randn(max_context, device="cuda", dtype=torch.bfloat16)
+    position_cuda = torch.tensor([1023], device="cuda", dtype=torch.int32)
+    scale = D ** -0.5
+    actual = compile_structural_softmax(max_context, scale)(
+        scores, position_cuda
+    )
+    expected = compile_structural_softmax(max_context)(
+        scores / D ** 0.5, position_cuda
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("length", [2, 4, 7])
 def test_tilelang_batched_prefill_matches_reference_and_decode(length):
     from pathlib import Path

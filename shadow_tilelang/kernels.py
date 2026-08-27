@@ -1919,8 +1919,8 @@ def compile_circular_gather(max_context: int, width: int):
 
 
 @lru_cache(maxsize=None)
-def compile_structural_softmax(max_context: int):
-    """Mask physical cache slots and compute FP32 softmax into BF16."""
+def compile_structural_softmax(max_context: int, input_scale: float = 1.0):
+    """Scale BF16 scores, mask physical slots, and compute BF16 softmax."""
 
     tilelang, T = _imports()
     threads = 256
@@ -1947,8 +1947,11 @@ def compile_structural_softmax(max_context: int):
                         True,
                     )
                     if valid:
+                        scaled = (
+                            scores[slot].astype(T.float32) * input_scale
+                        ).astype(T.bfloat16)
                         partial_max[0] = T.max(
-                            partial_max[0], scores[slot].astype(T.float32)
+                            partial_max[0], scaled.astype(T.float32)
                         )
             with T.attr(
                 T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(float("-inf"))]),
@@ -1968,8 +1971,11 @@ def compile_structural_softmax(max_context: int):
                         True,
                     )
                     if valid:
+                        scaled = (
+                            scores[slot].astype(T.float32) * input_scale
+                        ).astype(T.bfloat16)
                         partial_sum[0] += T.exp(
-                            scores[slot].astype(T.float32) - maximum[0]
+                            scaled.astype(T.float32) - maximum[0]
                         )
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
@@ -1987,9 +1993,12 @@ def compile_structural_softmax(max_context: int):
                         slot <= position[0],
                         True,
                     )
+                    scaled = (
+                        scores[slot].astype(T.float32) * input_scale
+                    ).astype(T.bfloat16)
                     output[slot] = T.if_then_else(
                         valid,
-                        T.exp(scores[slot].astype(T.float32) - maximum[0]) / total[0],
+                        T.exp(scaled.astype(T.float32) - maximum[0]) / total[0],
                         T.float32(0),
                     )
         return output
