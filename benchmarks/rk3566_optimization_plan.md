@@ -494,3 +494,10 @@ Persistent thread-local quantization scratch was also tested and removed. Seven
 interleaved context-128 runs measured 180.44 tok/s with per-call vectors and
 180.74 tok/s with persistent buffers (+0.17%), with worse candidate variance.
 Allocation is not a meaningful Compact64 bottleneck on the development host.
+
+A fused SiLU plus down-input quantization interface was byte-identical to the
+established Compact64 path but was also removed. Seven interleaved context-128
+runs measured 178.61 tok/s control versus 180.84 tok/s candidate (+1.25%), while
+the control itself had substantial variance. The candidate duplicated the full
+down-projection kernel and expanded its API, so the uncertain marginal gain did
+not justify the maintenance cost.
