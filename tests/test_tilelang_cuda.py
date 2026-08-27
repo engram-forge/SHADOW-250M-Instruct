@@ -416,6 +416,29 @@ def test_tilelang_rms_norm_is_bit_exact(shape):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_tilelang_combined_qk_norm_is_bit_exact():
+    from shadow_tilelang.kernels import compile_qk_rms_norm, compile_rms_norm
+
+    query_heads, key_heads, head_dim = 24, 2, 64
+    torch.manual_seed(317)
+    qk = torch.randn(
+        query_heads + key_heads, head_dim,
+        device="cuda", dtype=torch.bfloat16,
+    )
+    query_weight = torch.randn(head_dim, device="cuda")
+    key_weight = torch.randn(head_dim, device="cuda")
+    expected = torch.cat((
+        compile_rms_norm(query_heads, head_dim)(
+            qk[:query_heads], query_weight
+        ),
+        compile_rms_norm(key_heads, head_dim)(qk[query_heads:], key_weight),
+    ))
+    actual = compile_qk_rms_norm(query_heads, key_heads, head_dim)(
+        qk, query_weight, key_weight
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(24, 64), (2, 64), (4, 64)])
 def test_tilelang_power_of_two_quantizer_is_bit_exact(shape):
     from shadow_tilelang.engine import _power_of_two_quantize

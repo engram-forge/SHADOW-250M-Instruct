@@ -16,6 +16,7 @@ from .kernels import (
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
+    compile_qk_rms_norm,
     compile_structural_softmax,
 )
 
@@ -362,15 +363,21 @@ class TileLangEngine:
         qkv = self._projection(f"{prefix}.qkv", z)
         q_end = QUERY_HEADS * HEAD_DIM
         kv_width = KV_HEADS * HEAD_DIM
-        q = qkv[:q_end].reshape(QUERY_HEADS, HEAD_DIM)
-        k = qkv[q_end : q_end + kv_width].reshape(KV_HEADS, HEAD_DIM)
+        qk = qkv[:q_end + kv_width].reshape(QUERY_HEADS + KV_HEADS, HEAD_DIM)
+        q = qk[:QUERY_HEADS]
+        k = qk[QUERY_HEADS:]
         v = qkv[q_end + kv_width :].reshape(KV_HEADS, HEAD_DIM)
-        q = self._norm(q, self.weights[f"{prefix}.qn.w"])
-        k = self._norm(k, self.weights[f"{prefix}.kn.w"])
         if self.backend == "tilelang":
-            q = compile_rope_quantize(QUERY_HEADS, HEAD_DIM)(q, cosine, sine)
-            k = compile_rope_quantize(KV_HEADS, HEAD_DIM)(k, cosine, sine)
+            qk = compile_qk_rms_norm(QUERY_HEADS, KV_HEADS, HEAD_DIM)(
+                qk, self.weights[f"{prefix}.qn.w"], self.weights[f"{prefix}.kn.w"]
+            )
+            qk = compile_rope_quantize(
+                QUERY_HEADS + KV_HEADS, HEAD_DIM
+            )(qk, cosine, sine)
+            q, k = qk[:QUERY_HEADS], qk[QUERY_HEADS:]
         else:
+            q = self._norm(q, self.weights[f"{prefix}.qn.w"])
+            k = self._norm(k, self.weights[f"{prefix}.kn.w"])
             q = self._quantize(self._rope(q, self.position, cosine, sine))
             k = self._quantize(self._rope(k, self.position, cosine, sine))
         if self.backend != "tilelang":

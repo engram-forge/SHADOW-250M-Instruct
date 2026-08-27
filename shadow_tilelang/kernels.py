@@ -1089,6 +1089,50 @@ def compile_rms_norm(rows: int, width: int, epsilon: float = 1e-6):
 
 
 @lru_cache(maxsize=None)
+def compile_qk_rms_norm(
+    query_heads: int, key_heads: int, head_dim: int, epsilon: float = 1e-6
+):
+    """Normalize contiguous Q/K heads with their respective shared weights."""
+
+    tilelang, T = _imports()
+    total_heads = query_heads + key_heads
+    threads = min(256, 1 << (head_dim - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def rms_norm(
+        qk: T.Tensor((total_heads, head_dim), T.bfloat16),
+        query_weight: T.Tensor((head_dim,), T.float32),
+        key_weight: T.Tensor((head_dim,), T.float32),
+    ):
+        output = T.empty((total_heads, head_dim), T.bfloat16)
+        with T.Kernel(total_heads, threads=threads) as head:
+            lane = T.get_thread_binding(0)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            value = qk[head, lane].astype(T.float32)
+            partial[0] = value * value
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane,
+                    dtype="handle",
+                ))
+            scale = T.rsqrt(reduced[0] / head_dim + epsilon)
+            normalized = (value * scale).astype(T.bfloat16)
+            weight = T.if_then_else(
+                head < query_heads,
+                query_weight[lane],
+                key_weight[lane],
+            ).astype(T.bfloat16)
+            output[head, lane] = normalized * weight
+        return output
+
+    return rms_norm
+
+
+@lru_cache(maxsize=None)
 def compile_power_of_two_quantize(rows: int, width: int):
     """Compile the exact per-row BF16 power-of-two activation quantizer."""
 
