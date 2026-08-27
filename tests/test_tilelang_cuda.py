@@ -557,5 +557,27 @@ def test_tilelang_projection_epilogues_are_bit_exact():
                 ffn_input, engine.weights["b.0.up_gate"]
             )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            recall = torch.randn(
+                1536, device="cuda", dtype=torch.bfloat16
+            )
+            expected = torch.nn.functional.silu(
+                engine.linear(
+                    torch.cat((residual, recall)), engine.weights["step.cin"]
+                )
+            )
+            actual = engine.linear.split_silu(
+                residual, recall, engine.weights["step.cin"]
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            structural_hidden = torch.randn(
+                4224, device="cuda", dtype=torch.bfloat16
+            )
+            expected = residual + engine.linear(
+                structural_hidden, engine.weights["step.cout"]
+            )
+            actual = engine.linear.rvq_residual(
+                structural_hidden, residual, engine.weights["step.cout"]
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             engine.close()

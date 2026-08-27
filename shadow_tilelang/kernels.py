@@ -254,6 +254,132 @@ def compile_rvq_gemv(
 
 
 @lru_cache(maxsize=None)
+def compile_rvq_gemv_split_silu(
+    out_features: int, input_features: int, group_size: int, stages: int
+):
+    """Project two contiguous logical inputs and apply exact BF16 SiLU."""
+
+    in_features = input_features * 2
+    if out_features <= 0 or out_features % 64:
+        raise ValueError("RVQ GEMV output width must be positive and 64-row aligned")
+    tilelang, T = _imports()
+    groups, chunks = in_features // group_size, out_features // 64
+    n_partition, reduce_threads = 8, 16
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        left: T.Tensor((input_features,), T.bfloat16),
+        right: T.Tensor((input_features,), T.bfloat16),
+        codebooks: T.Tensor((chunks, group_size, 256), T.float32),
+        indices: T.Tensor((chunks, 64, groups), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            chunk, row_lane = row // 64, row % 64
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            row_scale = scales[row]
+            for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
+                group = group_tile * reduce_threads + lane_k
+                if group < groups:
+                    pair_code = indices[chunk, row_lane, group].astype(T.int32)
+                    for component in T.serial(group_size):
+                        column = group * group_size + component
+                        activation = T.if_then_else(
+                            column < input_features,
+                            left[column],
+                            right[column - input_features],
+                        )
+                        value = codebooks[chunk, component, pair_code]
+                        weight = (value * row_scale).astype(T.bfloat16)
+                        partial[0] += (
+                            activation.astype(T.float32) * weight.astype(T.float32)
+                        )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                value = reduced[0].astype(T.bfloat16).astype(T.float32)
+                output[row] = value / (T.float32(1) + T.exp(-value))
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
+def compile_rvq_gemv_residual(
+    out_features: int, in_features: int, group_size: int, stages: int
+):
+    """Compile RVQ GEMV with an exact BF16 residual epilogue."""
+
+    if out_features <= 0 or out_features % 64:
+        raise ValueError("RVQ GEMV output width must be positive and 64-row aligned")
+    tilelang, T = _imports()
+    groups, chunks = in_features // group_size, out_features // 64
+    n_partition, reduce_threads = 8, 16
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        x: T.Tensor((in_features,), T.bfloat16),
+        residual: T.Tensor((out_features,), T.bfloat16),
+        codebooks: T.Tensor((chunks, group_size, 256), T.float32),
+        indices: T.Tensor((chunks, 64, groups), T.uint8),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            chunk, row_lane = row // 64, row % 64
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            row_scale = scales[row]
+            for group_tile in T.serial(T.ceildiv(groups, reduce_threads)):
+                group = group_tile * reduce_threads + lane_k
+                if group < groups:
+                    pair_code = indices[chunk, row_lane, group].astype(T.int32)
+                    for component in T.serial(group_size):
+                        column = group * group_size + component
+                        value = codebooks[chunk, component, pair_code]
+                        weight = (value * row_scale).astype(T.bfloat16)
+                        partial[0] += (
+                            x[column].astype(T.float32) * weight.astype(T.float32)
+                        )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                projected = reduced[0].astype(T.bfloat16)
+                output[row] = residual[row] + projected
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
 def compile_rvq_gemv_gated_residual(
     out_features: int, in_features: int, group_size: int, stages: int
 ):
@@ -1438,6 +1564,29 @@ class TileLangLinear:
             weight.out_features, weight.in_features, weight.group_size, weight.stages
         )(
             x.contiguous(), gate, residual, weight.codebooks, weight.indices,
+            weight.scales,
+        )
+
+    def split_silu(self, left, right, weight):
+        if not isinstance(weight, PackedRVQWeight):
+            raise TypeError("split SiLU projection requires packed RVQ weights")
+        if weight.in_features != left.numel() + right.numel():
+            raise ValueError("split SiLU inputs do not match projection width")
+        return compile_rvq_gemv_split_silu(
+            weight.out_features, left.numel(), weight.group_size, weight.stages
+        )(
+            left.contiguous(), right.contiguous(), weight.codebooks,
+            weight.indices, weight.scales,
+        )
+
+    def rvq_residual(self, x, residual, weight):
+        if not isinstance(weight, PackedRVQWeight):
+            raise TypeError("RVQ residual projection requires packed RVQ weights")
+        return compile_rvq_gemv_residual(
+            weight.out_features, weight.in_features, weight.group_size,
+            weight.stages,
+        )(
+            x.contiguous(), residual, weight.codebooks, weight.indices,
             weight.scales,
         )
 

@@ -500,9 +500,12 @@ class TileLangEngine:
             scores, self._position_cuda
         )
         recall = probability @ self._trunk_cache_cuda
-        joined = torch.cat((current, recall))
-        hidden = functional.silu(self._projection("step.cin", joined))
-        output = current + self._projection("step.cout", hidden)
+        hidden = self.linear.split_silu(
+            current, recall, self.weights["step.cin"]
+        )
+        output = self.linear.rvq_residual(
+            hidden, current, self.weights["step.cout"]
+        )
         return self._norm(output, self.weights["step.nf.w"])
 
     def _decode_trunk_cuda(self):
