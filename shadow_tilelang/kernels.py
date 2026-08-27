@@ -475,11 +475,11 @@ def compile_ternary_gemv(out_features: int, in_features: int):
                             column = group * 5 + component
                             if column < in_features:
                                 trit = ((word >> (component * 2)) & 3) - 1
-                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (
                                     x[column].astype(T.float32)
-                                    * weight.astype(T.float32)
+                                    * trit.astype(T.float32)
                                 )
+                partial[0] *= row_scale.astype(T.float32)
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope",
@@ -543,10 +543,10 @@ def compile_ternary_swiglu(out_features: int, in_features: int):
                                 activation = x[column].astype(T.float32)
                                 up_trit = ((up_word >> (component * 2)) & 3) - 1
                                 gate_trit = ((gate_word >> (component * 2)) & 3) - 1
-                                up_weight = up_trit.astype(T.bfloat16) * up_scale
-                                gate_weight = gate_trit.astype(T.bfloat16) * gate_scale
-                                up_partial[0] += activation * up_weight.astype(T.float32)
-                                gate_partial[0] += activation * gate_weight.astype(T.float32)
+                                up_partial[0] += activation * up_trit.astype(T.float32)
+                                gate_partial[0] += activation * gate_trit.astype(T.float32)
+                up_partial[0] *= up_scale.astype(T.float32)
+                gate_partial[0] *= gate_scale.astype(T.float32)
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -608,9 +608,9 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
                             column = group * 5 + component
                             if column < in_features:
                                 trit = ((word >> (component * 2)) & 3) - 1
-                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[column].astype(T.float32)
-                                               * weight.astype(T.float32))
+                                               * trit.astype(T.float32))
+                partial[0] *= row_scale.astype(T.float32)
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -905,9 +905,9 @@ def compile_ternary_gemm(batch_size: int, out_features: int, in_features: int):
                             column = group * 5 + component
                             if column < in_features:
                                 trit = ((word >> (component * 2)) & 3) - 1
-                                weight = trit.astype(T.bfloat16) * row_scale
                                 partial[0] += (x[token, column].astype(T.float32)
-                                               * weight.astype(T.float32))
+                                               * trit.astype(T.float32))
+                partial[0] *= row_scale.astype(T.float32)
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
