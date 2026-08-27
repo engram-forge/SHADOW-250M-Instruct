@@ -196,7 +196,7 @@ def test_tilelang_attention_matches_reference_with_circular_cache(
     max_context, position
 ):
     from shadow_tilelang.engine import _power_of_two_quantize
-    from shadow_tilelang.kernels import compile_attention
+    from shadow_tilelang.kernels import compile_attention, compile_attention_cache_update
 
     query_heads, kv_heads, head_dim = 4, 2, 64
     torch.manual_seed(31 + position)
@@ -216,11 +216,13 @@ def test_tilelang_attention_matches_reference_with_circular_cache(
     keys[:, slots] = chronological_keys
     values[:, slots] = chronological_values
     alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
+    compile_attention_cache_update(kv_heads, head_dim, max_context)(
+        chronological_keys[:, -1].contiguous(),
+        chronological_values[:, -1].contiguous(), keys, values, position_cuda,
+    )
     actual = compile_attention(query_heads, kv_heads, head_dim, max_context)(
-        query, chronological_keys[:, -1].contiguous(),
-        chronological_values[:, -1].contiguous(),
-        keys, values, alpha,
-        torch.tensor([position], device="cuda", dtype=torch.int32),
+        query, keys, values, alpha, position_cuda,
     )
     repeated_keys = chronological_keys.repeat_interleave(query_heads // kv_heads, dim=0)
     repeated_values = chronological_values.repeat_interleave(query_heads // kv_heads, dim=0)
@@ -238,7 +240,7 @@ def test_tilelang_attention_matches_reference_with_circular_cache(
 
 def test_tilelang_attention_quantizes_value_before_cache_write():
     from shadow_tilelang.engine import _power_of_two_quantize
-    from shadow_tilelang.kernels import compile_attention
+    from shadow_tilelang.kernels import compile_attention_cache_update
 
     query_heads, kv_heads, head_dim, max_context = 24, 2, 64, 32
     torch.manual_seed(91)
@@ -256,9 +258,8 @@ def test_tilelang_attention_quantizes_value_before_cache_write():
     )
     values = torch.zeros_like(keys)
     position = torch.tensor([7], device="cuda", dtype=torch.int32)
-    compile_attention(query_heads, kv_heads, head_dim, max_context)(
-        query, key, value, keys, values,
-        torch.ones(query_heads, device="cuda"), position,
+    compile_attention_cache_update(kv_heads, head_dim, max_context)(
+        key, value, keys, values, position,
     )
     torch.testing.assert_close(
         values[:, 7], _power_of_two_quantize(value), rtol=0, atol=0
@@ -522,6 +523,48 @@ def test_tilelang_combined_qk_norm_is_bit_exact():
         qk, query_weight, key_weight
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_tilelang_fused_qk_norm_rope_cache_is_bit_exact():
+    from shadow_tilelang.engine import _power_of_two_quantize
+    from shadow_tilelang.kernels import (
+        compile_qk_rms_norm, compile_rope_quantize,
+        compile_rope_quantize_cache,
+    )
+
+    query_heads, key_heads, head_dim, max_context = 24, 2, 64, 32
+    torch.manual_seed(881)
+    qk = torch.randn(
+        query_heads + key_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn(
+        key_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    query_weight = torch.randn(head_dim, device="cuda")
+    key_weight = torch.randn(head_dim, device="cuda")
+    cosine = torch.randn(head_dim // 2, device="cuda", dtype=torch.bfloat16)
+    sine = torch.randn_like(cosine)
+    keys = torch.zeros(
+        key_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = torch.zeros_like(keys)
+    position = torch.tensor([7], device="cuda", dtype=torch.int32)
+    normalized = compile_qk_rms_norm(query_heads, key_heads, head_dim)(
+        qk, query_weight, key_weight
+    )
+    expected = compile_rope_quantize(query_heads + key_heads, head_dim)(
+        normalized, cosine, sine
+    )
+    actual = compile_rope_quantize_cache(
+        query_heads, key_heads, head_dim, max_context
+    )(
+        qk, value, query_weight, key_weight, cosine, sine, keys, values, position
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(keys[:, 7], expected[query_heads:], rtol=0, atol=0)
+    torch.testing.assert_close(
+        values[:, 7], _power_of_two_quantize(value), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("shape", [(24, 64), (2, 64), (4, 64)])

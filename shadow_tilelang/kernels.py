@@ -627,6 +627,55 @@ def compile_ternary_gemv_residual(out_features: int, in_features: int):
 
 
 @lru_cache(maxsize=None)
+def compile_attention_cache_update(
+    kv_heads: int, head_dim: int, max_context: int
+):
+    """Quantize and store the current K/V pair once per KV head."""
+
+    tilelang, T = _imports()
+
+    @tilelang.jit(target="cuda")
+    def update(
+        current_key: T.Tensor((kv_heads, head_dim), T.bfloat16),
+        current_value_unquantized: T.Tensor((kv_heads, head_dim), T.bfloat16),
+        keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        with T.Kernel(kv_heads, threads=head_dim) as kv_head:
+            lane = T.get_thread_binding(0)
+            value_maximum = T.alloc_local((1,), T.float32)
+            value_reduced = T.alloc_local((1,), T.float32)
+            value_maximum[0] = T.abs(
+                current_value_unquantized[kv_head, lane]
+            ).astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), value_maximum[0], True, value_reduced[0], lane,
+                    dtype="handle",
+                ))
+            maximum = T.max(value_reduced[0], T.float32(1e-6)).astype(T.bfloat16)
+            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+            value_scale = T.exp2(exponent).astype(T.bfloat16)
+            rounded = T.round((
+                current_value_unquantized[kv_head, lane] / value_scale
+            ).astype(T.float32))
+            clipped = T.min(
+                T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+            ).astype(T.bfloat16)
+            current_slot = position[0] % max_context
+            keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
+            values[kv_head, current_slot, lane] = clipped * value_scale
+
+    return update
+
+
+@lru_cache(maxsize=None)
 def compile_attention(
     query_heads: int, kv_heads: int, head_dim: int, max_context: int
 ):
@@ -643,8 +692,6 @@ def compile_attention(
     @tilelang.jit(target="cuda")
     def attention(
         query: T.Tensor((query_heads, head_dim), T.bfloat16),
-        current_key: T.Tensor((kv_heads, head_dim), T.bfloat16),
-        current_value_unquantized: T.Tensor((kv_heads, head_dim), T.bfloat16),
         keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         alpha: T.Tensor((query_heads,), T.float32),
@@ -662,41 +709,6 @@ def compile_attention(
             total = T.if_then_else(position[0] + 1 < max_context, position[0] + 1, max_context)
             start = T.if_then_else(position[0] + 1 <= max_context, 0, (position[0] + 1) % max_context)
             kv_head = head // heads_per_kv
-            current_slot = position[0] % max_context
-            value_maximum = T.alloc_local((1,), T.float32)
-            value_reduced = T.alloc_local((1,), T.float32)
-            if token_lane == 0:
-                value_maximum[0] = T.abs(
-                    current_value_unquantized[kv_head, lane]
-                ).astype(T.float32)
-            else:
-                value_maximum[0] = 0.0
-            with T.attr(
-                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
-                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
-            ):
-                T.evaluate(T.tvm_thread_allreduce(
-                    T.uint32(1), value_maximum[0], True, value_reduced[0], lane,
-                    dtype="handle",
-                ))
-            if token_lane == 0:
-                maximum = T.max(
-                    value_reduced[0], T.float32(1e-6)
-                ).astype(T.bfloat16)
-                ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
-                logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
-                exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
-                value_scale = T.exp2(exponent).astype(T.bfloat16)
-                rounded = T.round((
-                    current_value_unquantized[kv_head, lane] / value_scale
-                ).astype(T.float32))
-                clipped = T.min(
-                    T.max(rounded, T.float32(-127.0)), T.float32(127.0)
-                ).astype(T.bfloat16)
-                current_value = clipped * value_scale
-                keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
-                values[kv_head, current_slot, lane] = current_value
-            T.sync_threads()
             for token_tile in T.serial(T.ceildiv(total, token_parallel)):
                 token = token_tile * token_parallel + token_lane
                 T.clear(partial)
@@ -1630,6 +1642,129 @@ def compile_rope_quantize(heads: int, head_dim: int):
         return output
 
     return rope_quantize
+
+
+@lru_cache(maxsize=None)
+def compile_rope_quantize_cache(
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int,
+    epsilon: float = 1e-6,
+):
+    """Normalize/quantize Q/K and store the current K/V cache entry."""
+
+    tilelang, T = _imports()
+    heads = query_heads + kv_heads
+    threads = min(256, 1 << (head_dim - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def rope_quantize_cache(
+        qk: T.Tensor((heads, head_dim), T.bfloat16),
+        value: T.Tensor((kv_heads, head_dim), T.bfloat16),
+        query_weight: T.Tensor((head_dim,), T.float32),
+        key_weight: T.Tensor((head_dim,), T.float32),
+        cosine: T.Tensor((head_dim // 2,), T.bfloat16),
+        sine: T.Tensor((head_dim // 2,), T.bfloat16),
+        keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((heads, head_dim), T.bfloat16)
+        with T.Kernel(heads, threads=threads) as head:
+            lane = T.get_thread_binding(0)
+            normalized_qk = T.alloc_shared((head_dim,), T.bfloat16)
+            rotated = T.alloc_shared((head_dim,), T.bfloat16)
+            norm_partial = T.alloc_local((1,), T.float32)
+            norm_reduced = T.alloc_local((1,), T.float32)
+            qk_value = qk[head, lane].astype(T.float32)
+            norm_partial[0] = qk_value * qk_value
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), norm_partial[0], True, norm_reduced[0], lane,
+                    dtype="handle",
+                ))
+            norm_scale = T.rsqrt(norm_reduced[0] / head_dim + epsilon)
+            normalized = (qk_value * norm_scale).astype(T.bfloat16)
+            norm_weight = T.if_then_else(
+                head < query_heads, query_weight[lane], key_weight[lane]
+            ).astype(T.bfloat16)
+            normalized_qk[lane] = normalized * norm_weight
+            T.sync_threads()
+            pair = lane // 2
+            even = normalized_qk[pair * 2]
+            odd = normalized_qk[pair * 2 + 1]
+            even_cosine = even * cosine[pair]
+            odd_sine = odd * sine[pair]
+            even_sine = even * sine[pair]
+            odd_cosine = odd * cosine[pair]
+            rotated[lane] = T.if_then_else(
+                lane % 2 == 0,
+                even_cosine - odd_sine,
+                even_sine + odd_cosine,
+            )
+            T.sync_threads()
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            partial[0] = T.abs(rotated[lane]).astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane,
+                    dtype="handle",
+                ))
+            maximum = T.max(reduced[0], T.float32(1e-6)).astype(T.bfloat16)
+            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+            scale = T.exp2(exponent).astype(T.bfloat16)
+            rounded = T.round((rotated[lane] / scale).astype(T.float32))
+            clipped = T.min(
+                T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+            ).astype(T.bfloat16)
+            quantized = clipped * scale
+            output[head, lane] = quantized
+            if head >= query_heads:
+                kv_head = head - query_heads
+                value_partial = T.alloc_local((1,), T.float32)
+                value_reduced = T.alloc_local((1,), T.float32)
+                value_partial[0] = T.abs(value[kv_head, lane]).astype(T.float32)
+                with T.attr(
+                    T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(T.tvm_thread_allreduce(
+                        T.uint32(1), value_partial[0], True, value_reduced[0], lane,
+                        dtype="handle",
+                    ))
+                value_maximum = T.max(
+                    value_reduced[0], T.float32(1e-6)
+                ).astype(T.bfloat16)
+                value_ratio = (
+                    value_maximum / T.bfloat16(127.0)
+                ).astype(T.float32)
+                value_logarithm = (
+                    T.log2(value_ratio).astype(T.bfloat16).astype(T.float32)
+                )
+                value_exponent = (
+                    T.ceil(value_logarithm).astype(T.bfloat16).astype(T.float32)
+                )
+                value_scale = T.exp2(value_exponent).astype(T.bfloat16)
+                value_rounded = T.round((
+                    value[kv_head, lane] / value_scale
+                ).astype(T.float32))
+                value_clipped = T.min(
+                    T.max(value_rounded, T.float32(-127.0)), T.float32(127.0)
+                ).astype(T.bfloat16)
+                slot = position[0] % max_context
+                keys[kv_head, slot, lane] = quantized
+                values[kv_head, slot, lane] = value_clipped * value_scale
+        return output
+
+    return rope_quantize_cache
 
 
 

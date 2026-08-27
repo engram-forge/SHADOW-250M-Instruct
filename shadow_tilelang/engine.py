@@ -11,13 +11,15 @@ import numpy as np
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
-    compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
+    compile_attention, compile_attention_cache_update,
+    compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_embedding,
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
     compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
     compile_residual_rms_norm,
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
+    compile_rope_quantize_cache,
     compile_qk_rms_norm,
     compile_structural_softmax,
     compile_token_store,
@@ -391,12 +393,13 @@ class TileLangEngine:
         k = qk[QUERY_HEADS:]
         v = qkv[q_end + kv_width :].reshape(KV_HEADS, HEAD_DIM)
         if self.backend == "tilelang":
-            qk = compile_qk_rms_norm(QUERY_HEADS, KV_HEADS, HEAD_DIM)(
-                qk, self.weights[f"{prefix}.qn.w"], self.weights[f"{prefix}.kn.w"]
+            qk = compile_rope_quantize_cache(
+                QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
+            )(
+                qk, v, self.weights[f"{prefix}.qn.w"],
+                self.weights[f"{prefix}.kn.w"], cosine, sine, self.k_cache[layer],
+                self.v_cache[layer], self._position_cuda,
             )
-            qk = compile_rope_quantize(
-                QUERY_HEADS + KV_HEADS, HEAD_DIM
-            )(qk, cosine, sine)
             q, k = qk[:QUERY_HEADS], qk[QUERY_HEADS:]
         else:
             q = self._norm(q, self.weights[f"{prefix}.qn.w"])
@@ -410,7 +413,7 @@ class TileLangEngine:
             attended = compile_attention(
                 QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
             )(
-                q, k, v, self.k_cache[layer], self.v_cache[layer], alpha,
+                q, self.k_cache[layer], self.v_cache[layer], alpha,
                 self._position_cuda,
             ).reshape(D)
         else:
