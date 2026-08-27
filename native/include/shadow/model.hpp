@@ -120,5 +120,7 @@ private:
 std::vector<std::uint32_t> parse_token_list(const std::string &text);
 std::uint32_t popcount_xor(std::span<const std::uint8_t> a,
                            std::span<const std::uint8_t> b);
+bool cpu_has_fp16_arithmetic();
+bool cpu_has_fp16_fml();
 
 } // namespace shadowrt

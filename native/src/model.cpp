@@ -17,6 +17,10 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#if defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #if defined(__APPLE__)
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -2481,6 +2485,22 @@ std::uint32_t popcount_xor(std::span<const std::uint8_t> a,
   for (std::size_t i = 0; i < a.size(); ++i)
     result += std::popcount(static_cast<unsigned>(a[i] ^ b[i]));
   return result;
+#endif
+}
+
+bool cpu_has_fp16_arithmetic() {
+#if defined(__linux__) && defined(__aarch64__) && defined(HWCAP_ASIMDHP)
+  return (getauxval(AT_HWCAP) & HWCAP_ASIMDHP) != 0;
+#else
+  return false;
+#endif
+}
+
+bool cpu_has_fp16_fml() {
+#if defined(__linux__) && defined(__aarch64__) && defined(HWCAP_ASIMDFHM)
+  return (getauxval(AT_HWCAP) & HWCAP_ASIMDFHM) != 0;
+#else
+  return false;
 #endif
 }
 

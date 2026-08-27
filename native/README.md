@@ -34,6 +34,13 @@ Run and inspect the selected backends:
     SHADOW_THREADS=4 build/linux-arm64/shadow \
       deployment/shadow250m_instruct.shdw deployment/fp131072.npy "2" 32 --bench
 
+Before qualifying persistent FP16 Q/K/V on RK3566, capabilities must report both
+`"fp16_arithmetic":true` and `"fp16_fml":true`. The intended precision island
+converts Q once and K/V once at cache insertion; stored FP16 operands are consumed
+directly by FP16FML with FP32 accumulators. RMSNorm reductions, attention softmax,
+residuals, structural recurrence, and logits remain FP32. Do not enable a path
+that converts cached K/V back to FP32 inside the attention loop.
+
 Linux supports `--archive-backend auto` and `cpu`; both select the exact CPU
 scanner. Requesting `metal` fails explicitly. A QEMU user-mode smoke test must
 use a sysroot matching the binary's build userspace, for example Ubuntu 24.04:

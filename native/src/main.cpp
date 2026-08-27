@@ -48,6 +48,10 @@ int main(int argc, char** argv) try {
         }
         std::cout << "],\"metal_available\":"
                   << (shadowrt::metal_available() ? "true" : "false")
+                  << ",\"fp16_arithmetic\":"
+                  << (shadowrt::cpu_has_fp16_arithmetic() ? "true" : "false")
+                  << ",\"fp16_fml\":"
+                  << (shadowrt::cpu_has_fp16_fml() ? "true" : "false")
                   << ",\"archive_auto_threshold_bytes\":67108864}\n";
         return 0;
     }
