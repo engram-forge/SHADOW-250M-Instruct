@@ -43,6 +43,13 @@ class PackedTernaryWeight:
         return self.out_features, self.in_features
 
 
+@dataclass(frozen=True)
+class InterleavedTernaryWeight(PackedTernaryWeight):
+    """Packed ternary pair layout for exact fused SwiGLU decode."""
+
+    paired: object
+
+
 def _imports():
     try:
         import tilelang
@@ -694,6 +701,80 @@ def compile_ternary_swiglu(out_features: int, in_features: int):
                     if group < packed_width:
                         up_word = packed[row, group].astype(T.int32)
                         gate_word = packed[hidden_features + row, group].astype(T.int32)
+                        for component in T.unroll(5):
+                            column = group * 5 + component
+                            if column < in_features:
+                                activation = x[column].astype(T.float32)
+                                up_trit = ((up_word >> (component * 2)) & 3) - 1
+                                gate_trit = ((gate_word >> (component * 2)) & 3) - 1
+                                up_partial[0] += activation * up_trit.astype(T.float32)
+                                gate_partial[0] += activation * gate_trit.astype(T.float32)
+                up_partial[0] *= up_scale.astype(T.float32)
+                gate_partial[0] *= gate_scale.astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), up_partial[0], True, up_reduced[0], lane_k,
+                    dtype="handle",
+                ))
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), gate_partial[0], True, gate_reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0 and row < hidden_features:
+                up = up_reduced[0].astype(T.bfloat16)
+                gate = gate_reduced[0].astype(T.bfloat16).astype(T.float32)
+                silu = (
+                    gate / (T.float32(1) + T.exp(-gate))
+                ).astype(T.bfloat16)
+                output[row] = up * silu
+        return output
+
+    return swiglu
+
+
+@lru_cache(maxsize=None)
+def compile_interleaved_ternary_swiglu(out_features: int, in_features: int):
+    """Project paired up/gate words from one interleaved 32-bit load."""
+
+    if out_features % 2:
+        raise ValueError("SwiGLU projection output width must be even")
+    tilelang, T = _imports()
+    hidden_features = out_features // 2
+    packed_width = (in_features + 4) // 5
+    n_partition, reduce_threads = 8, 32
+
+    @tilelang.jit(target="cuda")
+    def swiglu(
+        x: T.Tensor((in_features,), T.bfloat16),
+        paired: T.Tensor((hidden_features, packed_width), T.uint32),
+        scales: T.Tensor((out_features,), T.float32),
+    ):
+        output = T.empty((hidden_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(hidden_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            up_partial = T.alloc_local((1,), T.float32)
+            gate_partial = T.alloc_local((1,), T.float32)
+            up_reduced = T.alloc_local((1,), T.float32)
+            gate_reduced = T.alloc_local((1,), T.float32)
+            T.clear(up_partial)
+            T.clear(gate_partial)
+            if row < hidden_features:
+                up_scale = scales[row].astype(T.bfloat16)
+                gate_scale = scales[hidden_features + row].astype(T.bfloat16)
+                for group_tile in T.serial(T.ceildiv(packed_width, reduce_threads)):
+                    group = group_tile * reduce_threads + lane_k
+                    if group < packed_width:
+                        pair = paired[row, group]
+                        up_word = (pair & T.uint32(65535)).astype(T.int32)
+                        gate_word = (pair >> T.uint32(16)).astype(T.int32)
                         for component in T.unroll(5):
                             column = group * 5 + component
                             if column < in_features:
@@ -2321,6 +2402,10 @@ class TileLangLinear:
     def swiglu(self, x, weight):
         if not isinstance(weight, PackedTernaryWeight):
             raise TypeError("SwiGLU projection requires packed ternary weights")
+        if isinstance(weight, InterleavedTernaryWeight):
+            return compile_interleaved_ternary_swiglu(
+                weight.out_features, weight.in_features
+            )(x.contiguous(), weight.paired, weight.scales)
         return compile_ternary_swiglu(
             weight.out_features, weight.in_features
         )(x.contiguous(), weight.packed, weight.scales)

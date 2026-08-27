@@ -10,7 +10,8 @@ import numpy as np
 
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
-    DenseDecodeRVQWeight, PackedRVQWeight, PackedTernaryWeight,
+    DenseDecodeRVQWeight, InterleavedTernaryWeight, PackedRVQWeight,
+    PackedTernaryWeight,
     TileLangLinear, TorchLinear,
     compile_attention, compile_attention_cache_update, compile_attention_scores,
     compile_attention_probabilities, compile_attention_value_partials,
@@ -290,10 +291,24 @@ class TileLangEngine:
         first = weights[0]
         if any(weight.in_features != first.in_features for weight in weights):
             raise ValueError("cannot concatenate incompatible packed ternary matrices")
+        packed = torch.cat(
+            tuple(weight.packed for weight in weights), dim=0
+        ).contiguous()
+        scales = torch.cat(
+            tuple(weight.scales for weight in weights), dim=0
+        ).contiguous()
+        if len(weights) == 2 and weights[0].out_features == weights[1].out_features:
+            split = weights[0].out_features
+            paired = (
+                packed[:split].to(torch.int64)
+                | (packed[split:].to(torch.int64) << 16)
+            ).to(torch.uint32).contiguous()
+            return InterleavedTernaryWeight(
+                packed, scales, split * 2, first.in_features, paired
+            )
         return PackedTernaryWeight(
-            torch.cat(tuple(weight.packed for weight in weights), dim=0).contiguous(),
-            torch.cat(tuple(weight.scales for weight in weights), dim=0).contiguous(),
-            sum(weight.out_features for weight in weights), first.in_features,
+            packed, scales, sum(weight.out_features for weight in weights),
+            first.in_features,
         )
 
     @staticmethod
