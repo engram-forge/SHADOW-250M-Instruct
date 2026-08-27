@@ -2247,12 +2247,12 @@ def compile_fingerprint_logits(
 
 
 @lru_cache(maxsize=None)
-def compile_candidate_argmax(candidates: int, vocabulary: int):
+def compile_candidate_argmax(
+    candidates: int, vocabulary: int, threads: int = 512
+):
     """Reduce block maxima to the first exact vocabulary maximum."""
 
     tilelang, T = _imports()
-    threads = 256
-
     @tilelang.jit(target="cuda")
     def argmax(
         values: T.Tensor((candidates,), T.float32),
