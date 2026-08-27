@@ -17,6 +17,7 @@ from .kernels import (
     compile_attention_probabilities, compile_attention_value_partials,
     compile_attention_value_reduce, compile_attention_values,
     compile_attention_value_reduce_gate,
+    compile_candidate_argmax,
     compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_embedding,
     compile_circular_gather, compile_fingerprint_gather,
@@ -383,9 +384,11 @@ class TileLangEngine:
             )(self.fingerprints, padded)
         return self.fingerprints[indices]
 
-    def _logits(self, projected):
+    def _logits(self, projected, *, select_token=False):
         if self.backend == "tilelang":
-            return compile_fingerprint_logits(VOCAB_SIZE, FINGERPRINT_DIM)(
+            return compile_fingerprint_logits(
+                VOCAB_SIZE, FINGERPRINT_DIM, select_token
+            )(
                 projected, self.fingerprints, self.weights["tb"].float()
             )
         return (
@@ -660,13 +663,13 @@ class TileLangEngine:
                 hidden = result
         return hidden
 
-    def _decode_cuda(self, *, attention_parallelism=0):
+    def _decode_cuda(self, *, attention_parallelism=0, select_token=False):
         hidden = self._decode_trunk_cuda(
             attention_parallelism=attention_parallelism
         )
         hidden = self._structural_step_cuda(hidden, final_norm=True)
         projected = self._projection("head.weight", hidden)
-        return self._logits(projected)
+        return self._logits(projected, select_token=select_token)
 
     def _decode_graph_step(self):
         """Replay a complete dynamic-token model step as one CUDA graph."""
@@ -725,6 +728,12 @@ class TileLangEngine:
         graph = self._greedy_graphs.get(attention_parallelism)
         if graph is None:
             self._ensure_decode_graph(attention_parallelism)
+            logits, block_values, block_indices = self._decode_cuda(
+                attention_parallelism=attention_parallelism, select_token=True
+            )
+            compile_candidate_argmax(
+                block_values.numel(), VOCAB_SIZE
+            )(block_values, block_indices)
             torch.cuda.synchronize(self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -732,10 +741,14 @@ class TileLangEngine:
                     self._token_cuda, self._greedy_tokens_cuda,
                     self._position_cuda,
                 )
-                logits = self._decode_cuda(
-                    attention_parallelism=attention_parallelism
+                logits, block_values, block_indices = self._decode_cuda(
+                    attention_parallelism=attention_parallelism, select_token=True
                 )
-                self._token_cuda.copy_(logits.argmax().reshape(1))
+                self._token_cuda.copy_(compile_candidate_argmax(
+                    block_values.numel(), VOCAB_SIZE
+                )(
+                    block_values, block_indices
+                ))
                 self._position_cuda.add_(1)
             self._greedy_graphs[attention_parallelism] = graph
 

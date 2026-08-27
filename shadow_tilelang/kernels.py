@@ -2082,7 +2082,9 @@ def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features:
 
 
 @lru_cache(maxsize=None)
-def compile_fingerprint_logits(vocabulary: int, features: int):
+def compile_fingerprint_logits(
+    vocabulary: int, features: int, select_token: bool = False
+):
     """Project BF16 features directly against lane-paired signs."""
 
     if features % 512:
@@ -2092,6 +2094,7 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
     lanes = 32
     rows_per_block = 8
     normalization = features ** -0.5
+    blocks = (vocabulary + rows_per_block - 1) // rows_per_block
 
     @tilelang.jit(target="cuda")
     def logits(
@@ -2100,8 +2103,11 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
         bias: T.Tensor((vocabulary,), T.float32),
     ):
         output = T.empty((vocabulary,), T.float32)
+        if select_token:
+            block_values = T.empty((blocks,), T.float32)
+            block_indices = T.empty((blocks,), T.int32)
         with T.Kernel(
-            T.ceildiv(vocabulary, rows_per_block),
+            blocks,
             threads=(lanes, rows_per_block),
         ) as block:
             lane = T.get_thread_binding(0)
@@ -2142,11 +2148,99 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
                 T.evaluate(T.tvm_thread_allreduce(
                     T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
                 ))
-            if lane == 0 and token < vocabulary:
-                output[token] = reduced[0] * normalization + bias[token]
+            if select_token:
+                row_values = T.alloc_shared((rows_per_block,), T.float32)
+                row_indices = T.alloc_shared((rows_per_block,), T.int32)
+                if lane == 0:
+                    value = T.if_then_else(
+                        token < vocabulary,
+                        reduced[0] * normalization + bias[token],
+                        T.float32(float("-inf")),
+                    )
+                    if token < vocabulary:
+                        output[token] = value
+                    row_values[row_lane] = value
+                    row_indices[row_lane] = token
+                T.sync_threads()
+                if lane == 0 and row_lane == 0:
+                    best_value = T.alloc_local((1,), T.float32)
+                    best_index = T.alloc_local((1,), T.int32)
+                    best_value[0] = row_values[0]
+                    best_index[0] = row_indices[0]
+                    for row in T.serial(1, rows_per_block):
+                        if (
+                            row_values[row] > best_value[0]
+                            or (row_values[row] == best_value[0]
+                                and row_indices[row] < best_index[0])
+                        ):
+                            best_value[0] = row_values[row]
+                            best_index[0] = row_indices[row]
+                    block_values[block] = best_value[0]
+                    block_indices[block] = best_index[0]
+            else:
+                if lane == 0 and token < vocabulary:
+                    output[token] = reduced[0] * normalization + bias[token]
+        if select_token:
+            return output, block_values, block_indices
         return output
 
     return logits
+
+
+@lru_cache(maxsize=None)
+def compile_candidate_argmax(candidates: int, vocabulary: int):
+    """Reduce block maxima to the first exact vocabulary maximum."""
+
+    tilelang, T = _imports()
+    threads = 256
+
+    @tilelang.jit(target="cuda")
+    def argmax(
+        values: T.Tensor((candidates,), T.float32),
+        indices: T.Tensor((candidates,), T.int32),
+    ):
+        output = T.empty((1,), T.int64)
+        with T.Kernel(1, threads=threads):
+            lane = T.get_thread_binding(0)
+            local_max = T.alloc_local((1,), T.float32)
+            maximum = T.alloc_local((1,), T.float32)
+            local_max[0] = T.float32(float("-inf"))
+            for tile in T.serial(T.ceildiv(candidates, threads)):
+                candidate = tile * threads + lane
+                if candidate < candidates:
+                    local_max[0] = T.max(local_max[0], values[candidate])
+            with T.attr(
+                T.comm_reducer(
+                    lambda a, b: T.max(a, b), [T.float32(float("-inf"))]
+                ),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), local_max[0], True, maximum[0], lane,
+                    dtype="handle",
+                ))
+            local_index = T.alloc_local((1,), T.int32)
+            first_index = T.alloc_local((1,), T.int32)
+            local_index[0] = vocabulary
+            for tile in T.serial(T.ceildiv(candidates, threads)):
+                candidate = tile * threads + lane
+                if candidate < candidates and values[candidate] == maximum[0]:
+                    local_index[0] = T.min(
+                        local_index[0], indices[candidate]
+                    )
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.min(a, b), [T.int32(vocabulary)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), local_index[0], True, first_index[0], lane,
+                    dtype="handle",
+                ))
+            if lane == 0:
+                output[0] = first_index[0].astype(T.int64)
+        return output
+
+    return argmax
 
 
 @lru_cache(maxsize=None)

@@ -523,6 +523,7 @@ def test_tilelang_batched_prefill_matches_reference_and_decode(length):
 def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     import numpy as np
     from shadow_tilelang.kernels import (
+        compile_candidate_argmax,
         compile_fingerprint_gather, compile_fingerprint_logits,
         compile_fingerprint_unpack,
         compile_fingerprint_unpack_batch,
@@ -559,6 +560,35 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     expected = projected.float() @ (dense.float().T / (features ** 0.5)) + bias
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     assert int(actual.argmax()) == int(expected.argmax())
+
+    selected_logits, block_values, block_indices = compile_fingerprint_logits(
+        vocabulary, features, True
+    )(projected, packed_cuda, bias)
+    selected_token = compile_candidate_argmax(
+        block_values.numel(), vocabulary
+    )(block_values, block_indices)
+    torch.testing.assert_close(selected_logits, actual, rtol=0, atol=0)
+    assert int(selected_token) == int(actual.argmax())
+
+    projected.zero_()
+    bias.fill_(-1.0)
+    bias[1] = bias[7] = bias[8] = bias[37] = 3.0
+    tied_logits, block_values, block_indices = compile_fingerprint_logits(
+        vocabulary, features, True
+    )(projected, packed_cuda, bias)
+    tied_token = compile_candidate_argmax(
+        block_values.numel(), vocabulary
+    )(block_values, block_indices)
+    assert int(tied_token) == int(tied_logits.argmax()) == 1
+
+    bias.zero_()
+    equal_logits, block_values, block_indices = compile_fingerprint_logits(
+        vocabulary, features, True
+    )(projected, packed_cuda, bias)
+    equal_token = compile_candidate_argmax(
+        block_values.numel(), vocabulary
+    )(block_values, block_indices)
+    assert int(equal_token) == int(equal_logits.argmax()) == 0
 
 
 @pytest.mark.parametrize("token", [0, 2, 925, 131071])
