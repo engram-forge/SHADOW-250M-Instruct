@@ -52,11 +52,11 @@ def compile_gemv(out_features: int, in_features: int):
     """Compile one BF16-input/weight, FP32-accumulating CUDA GEMV shape."""
 
     tilelang, T = _imports()
-    # Every SHADOW deployment dimension is divisible by 128. Eight output
-    # lanes times sixteen K-reduction lanes fills one 128-thread CUDA block
-    # without a slow tail path, including the unusual 4224-wide FFN.
-    n_partition = 8
-    reduce_threads = 16
+    # Every SHADOW deployment dimension is divisible by 128. Four output
+    # lanes times 32 K-reduction lanes fills one 128-thread CUDA block and
+    # shortens each thread's serial loop for the wide BF16 FFN projections.
+    n_partition = 4
+    reduce_threads = 32
     vector = 8  # one 128-bit FP16 transaction
     block_k = reduce_threads * vector
 
