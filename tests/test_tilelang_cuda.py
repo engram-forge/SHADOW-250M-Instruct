@@ -183,12 +183,16 @@ def test_tilelang_engine_keeps_quantized_weights_packed():
         engine.close()
 
 
-@pytest.mark.parametrize("position", [11, 19])
-def test_tilelang_attention_matches_reference_with_circular_cache(position):
+@pytest.mark.parametrize(
+    "max_context,position", [(12, 11), (12, 19), (512, 511), (512, 519)]
+)
+def test_tilelang_attention_matches_reference_with_circular_cache(
+    max_context, position
+):
     from shadow_tilelang.engine import _power_of_two_quantize
     from shadow_tilelang.kernels import compile_attention
 
-    query_heads, kv_heads, head_dim, max_context = 4, 2, 64, 12
+    query_heads, kv_heads, head_dim = 4, 2, 64
     torch.manual_seed(31 + position)
     query = _power_of_two_quantize(
         torch.randn(query_heads, head_dim, device="cuda", dtype=torch.bfloat16)

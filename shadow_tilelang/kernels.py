@@ -439,6 +439,7 @@ def compile_attention(
         raise ValueError("attention head width exceeds a CUDA thread block")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
+    token_parallel = 16
 
     @tilelang.jit(target="cuda")
     def attention(
@@ -451,8 +452,11 @@ def compile_attention(
         position: T.Tensor((1,), T.int32),
     ):
         output = T.empty((query_heads, head_dim), T.bfloat16)
-        with T.Kernel(query_heads, threads=head_dim) as head:
+        with T.Kernel(
+            query_heads, threads=(head_dim, token_parallel)
+        ) as head:
             lane = T.get_thread_binding(0)
+            token_lane = T.get_thread_binding(1)
             scores = T.alloc_shared((max_context + 1,), T.float32)
             partial = T.alloc_local((1,), T.float32)
             reduced = T.alloc_local((1,), T.float32)
@@ -462,9 +466,12 @@ def compile_attention(
             current_slot = position[0] % max_context
             value_maximum = T.alloc_local((1,), T.float32)
             value_reduced = T.alloc_local((1,), T.float32)
-            value_maximum[0] = T.abs(
-                current_value_unquantized[kv_head, lane]
-            ).astype(T.float32)
+            if token_lane == 0:
+                value_maximum[0] = T.abs(
+                    current_value_unquantized[kv_head, lane]
+                ).astype(T.float32)
+            else:
+                value_maximum[0] = 0.0
             with T.attr(
                 T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
@@ -473,47 +480,50 @@ def compile_attention(
                     T.uint32(1), value_maximum[0], True, value_reduced[0], lane,
                     dtype="handle",
                 ))
-            maximum = T.max(
-                value_reduced[0], T.float32(1e-6)
-            ).astype(T.bfloat16)
-            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
-            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
-            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
-            value_scale = T.exp2(exponent).astype(T.bfloat16)
-            rounded = T.round((
-                current_value_unquantized[kv_head, lane] / value_scale
-            ).astype(T.float32))
-            clipped = T.min(
-                T.max(rounded, T.float32(-127.0)), T.float32(127.0)
-            ).astype(T.bfloat16)
-            current_value = clipped * value_scale
-            keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
-            values[kv_head, current_slot, lane] = current_value
+            if token_lane == 0:
+                maximum = T.max(
+                    value_reduced[0], T.float32(1e-6)
+                ).astype(T.bfloat16)
+                ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+                logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+                exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+                value_scale = T.exp2(exponent).astype(T.bfloat16)
+                rounded = T.round((
+                    current_value_unquantized[kv_head, lane] / value_scale
+                ).astype(T.float32))
+                clipped = T.min(
+                    T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+                ).astype(T.bfloat16)
+                current_value = clipped * value_scale
+                keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
+                values[kv_head, current_slot, lane] = current_value
             T.sync_threads()
-            for token in T.serial(total):
-                slot = (start + token) % max_context
-                partial[0] = (
-                    query[head, lane].astype(T.float32)
-                    * keys[kv_head, slot, lane].astype(T.float32)
-                )
-                with T.attr(
-                    T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
-                    "reduce_scope",
-                    T.reinterpret(T.uint64(0), dtype="handle"),
-                ):
-                    T.evaluate(
-                        T.tvm_thread_allreduce(
-                            T.uint32(1), partial[0], True, reduced[0], lane,
-                            dtype="handle",
-                        )
+            for token_tile in T.serial(T.ceildiv(total, token_parallel)):
+                token = token_tile * token_parallel + token_lane
+                if token < total:
+                    slot = (start + token) % max_context
+                    partial[0] = (
+                        query[head, lane].astype(T.float32)
+                        * keys[kv_head, slot, lane].astype(T.float32)
                     )
-                if lane == 0:
-                    dot = reduced[0].astype(T.bfloat16).astype(T.float32)
-                    scores[token] = T.floor(dot * alpha[head])
+                    with T.attr(
+                        T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                        "reduce_scope",
+                        T.reinterpret(T.uint64(0), dtype="handle"),
+                    ):
+                        T.evaluate(
+                            T.tvm_thread_allreduce(
+                                T.uint32(1), partial[0], True, reduced[0], lane,
+                                dtype="handle",
+                            )
+                        )
+                    if lane == 0:
+                        dot = reduced[0].astype(T.bfloat16).astype(T.float32)
+                        scores[token] = T.floor(dot * alpha[head])
             T.sync_threads()
             maximum = T.alloc_local((1,), T.float32)
             denominator = T.alloc_local((1,), T.float32)
-            if lane == 0:
+            if lane == 0 and token_lane == 0:
                 maximum[0] = scores[0]
                 for token in T.serial(1, total):
                     maximum[0] = T.max(maximum[0], scores[token])
@@ -525,18 +535,19 @@ def compile_attention(
                     denominator[0] += scores[token]
                 scores[max_context] = denominator[0]
             T.sync_threads()
-            attended = T.alloc_local((1,), T.float32)
-            T.clear(attended)
-            for token in T.serial(total):
-                slot = (start + token) % max_context
-                probability = (
-                    scores[token] / scores[max_context]
-                ).astype(T.bfloat16)
-                attended[0] += (
-                    probability.astype(T.float32)
-                    * values[kv_head, slot, lane].astype(T.float32)
-                )
-            output[head, lane] = attended[0]
+            if token_lane == 0:
+                attended = T.alloc_local((1,), T.float32)
+                T.clear(attended)
+                for token in T.serial(total):
+                    slot = (start + token) % max_context
+                    probability = (
+                        scores[token] / scores[max_context]
+                    ).astype(T.bfloat16)
+                    attended[0] += (
+                        probability.astype(T.float32)
+                        * values[kv_head, slot, lane].astype(T.float32)
+                    )
+                output[head, lane] = attended[0]
         return output
 
     return attention
