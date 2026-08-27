@@ -480,16 +480,19 @@ class TileLangEngine:
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
             if attention_parallelism > 0:
+                score_capacity = self._structural_capacity(attention_parallelism)
                 scores = compile_attention_scores(
-                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
+                    QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,
+                    score_capacity,
                 )(q, self.k_cache[layer], alpha, self._position_cuda)
                 probability = compile_attention_probabilities(
                     QUERY_HEADS, self.max_context,
                     8 if attention_parallelism <= 128 else 16,
+                    score_capacity,
                 )(scores, self._position_cuda)
                 partials = compile_attention_value_partials(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,
-                    attention_parallelism,
+                    attention_parallelism, score_capacity,
                 )(
                     probability, self.v_cache[layer], self._position_cuda
                 )

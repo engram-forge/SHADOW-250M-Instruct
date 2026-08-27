@@ -466,6 +466,65 @@ def test_tilelang_split_attention_is_bit_exact(max_context, position):
     torch.testing.assert_close(parallel_actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("position,capacity,token_parallel", [(327, 328, 64), (975, 976, 128)])
+def test_tilelang_bounded_split_attention_is_bit_exact(
+    position, capacity, token_parallel
+):
+    from shadow_tilelang.kernels import (
+        compile_attention_probabilities, compile_attention_scores,
+        compile_attention_value_partials, compile_attention_value_reduce,
+    )
+
+    query_heads, kv_heads, head_dim, max_context = 24, 2, 64, 2048
+    torch.manual_seed(2300 + position)
+    query = torch.randn(
+        query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    keys = torch.randn(
+        kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = torch.randn_like(keys)
+    alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
+
+    full_scores = compile_attention_scores(
+        query_heads, kv_heads, head_dim, max_context
+    )(query, keys, alpha, position_cuda)
+    bounded_scores = compile_attention_scores(
+        query_heads, kv_heads, head_dim, max_context, capacity
+    )(query, keys, alpha, position_cuda)
+    torch.testing.assert_close(
+        bounded_scores, full_scores[:, :capacity], rtol=0, atol=0
+    )
+
+    full_probability = compile_attention_probabilities(
+        query_heads, max_context,
+        8 if token_parallel <= 128 else 16,
+    )(full_scores, position_cuda)
+    bounded_probability = compile_attention_probabilities(
+        query_heads, max_context,
+        8 if token_parallel <= 128 else 16, capacity,
+    )(bounded_scores, position_cuda)
+    torch.testing.assert_close(
+        bounded_probability, full_probability[:, :capacity], rtol=0, atol=0
+    )
+
+    full_partials = compile_attention_value_partials(
+        query_heads, kv_heads, head_dim, max_context, token_parallel
+    )(full_probability, values, position_cuda)
+    bounded_partials = compile_attention_value_partials(
+        query_heads, kv_heads, head_dim, max_context, token_parallel, capacity
+    )(bounded_probability, values, position_cuda)
+    torch.testing.assert_close(bounded_partials, full_partials, rtol=0, atol=0)
+    full_output = compile_attention_value_reduce(
+        query_heads, head_dim, token_parallel
+    )(full_partials)
+    bounded_output = compile_attention_value_reduce(
+        query_heads, head_dim, token_parallel
+    )(bounded_partials)
+    torch.testing.assert_close(bounded_output, full_output, rtol=0, atol=0)
+
+
 def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine

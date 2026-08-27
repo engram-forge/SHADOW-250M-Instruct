@@ -922,13 +922,17 @@ def compile_attention_cache_update(
 
 @lru_cache(maxsize=None)
 def compile_attention_scores(
-    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int,
+    score_capacity: int | None = None,
 ):
     """Compute exact decode attention scores with token-parallel blocks."""
 
     if query_heads % kv_heads:
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
+    capacity = max_context if score_capacity is None else score_capacity
+    if capacity < 1 or capacity > max_context:
+        raise ValueError("attention score capacity must be inside the cache")
     heads_per_kv = query_heads // kv_heads
     tokens_per_block = 4
     query_heads_per_block = 6
@@ -940,17 +944,17 @@ def compile_attention_scores(
         alpha: T.Tensor((query_heads,), T.float32),
         position: T.Tensor((1,), T.int32),
     ):
-        scores = T.empty((query_heads, max_context), T.float32)
+        scores = T.empty((query_heads, capacity), T.float32)
         with T.Kernel(
             kv_heads, T.ceildiv(heads_per_kv, query_heads_per_block),
-            T.ceildiv(max_context, tokens_per_block),
+            T.ceildiv(capacity, tokens_per_block),
             threads=(head_dim, tokens_per_block),
         ) as (kv_head, head_block, token_block):
             lane = T.get_thread_binding(0)
             token_lane = T.get_thread_binding(1)
             token = token_block * tokens_per_block + token_lane
             total = T.if_then_else(
-                position[0] + 1 < max_context, position[0] + 1, max_context
+                position[0] + 1 < capacity, position[0] + 1, capacity
             )
             start = T.if_then_else(
                 position[0] + 1 <= max_context,
@@ -1162,28 +1166,32 @@ def compile_attention_values(
 
 @lru_cache(maxsize=None)
 def compile_attention_probabilities(
-    query_heads: int, max_context: int, token_parallel: int = 16
+    query_heads: int, max_context: int, token_parallel: int = 16,
+    score_capacity: int | None = None,
 ):
     """Normalize split attention scores into exact BF16 probabilities."""
 
     tilelang, T = _imports()
+    capacity = max_context if score_capacity is None else score_capacity
+    if capacity < 1 or capacity > max_context:
+        raise ValueError("attention probability capacity must be inside the cache")
     head_dim = 64
     score_threads = head_dim * token_parallel
 
     @tilelang.jit(target="cuda")
     def probabilities(
-        input_scores: T.Tensor((query_heads, max_context), T.float32),
+        input_scores: T.Tensor((query_heads, capacity), T.float32),
         position: T.Tensor((1,), T.int32),
     ):
-        output = T.empty((query_heads, max_context), T.bfloat16)
+        output = T.empty((query_heads, capacity), T.bfloat16)
         with T.Kernel(
             query_heads, threads=(head_dim, token_parallel)
         ) as head:
             lane = T.get_thread_binding(0)
             token_lane = T.get_thread_binding(1)
-            scores = T.alloc_shared((max_context + 1,), T.float32)
+            scores = T.alloc_shared((capacity + 1,), T.float32)
             total = T.if_then_else(
-                position[0] + 1 < max_context, position[0] + 1, max_context
+                position[0] + 1 < capacity, position[0] + 1, capacity
             )
             for token_tile in T.serial(T.ceildiv(total, score_threads)):
                 token = (
@@ -1210,7 +1218,7 @@ def compile_attention_probabilities(
                     lane, token_lane, dtype="handle",
                 ))
             if lane == 0 and token_lane == 0:
-                scores[max_context] = maximum_reduced[0]
+                scores[capacity] = maximum_reduced[0]
             T.sync_threads()
             for token_tile in T.serial(T.ceildiv(total, score_threads)):
                 token = (
@@ -1218,7 +1226,7 @@ def compile_attention_probabilities(
                 )
                 if token < total:
                     scores[token] = T.exp2(T.max(
-                        scores[token] - scores[max_context], T.float32(-15.0)
+                        scores[token] - scores[capacity], T.float32(-15.0)
                     ))
             T.sync_threads()
             denominator = T.alloc_local((1,), T.float32)
@@ -1239,7 +1247,7 @@ def compile_attention_probabilities(
                     lane, token_lane, dtype="handle",
                 ))
             if lane == 0 and token_lane == 0:
-                scores[max_context] = denominator_reduced[0]
+                scores[capacity] = denominator_reduced[0]
             T.sync_threads()
             for token_tile in T.serial(T.ceildiv(total, score_threads)):
                 token = (
@@ -1247,7 +1255,7 @@ def compile_attention_probabilities(
                 )
                 if token < total:
                     output[head, token] = (
-                        scores[token] / scores[max_context]
+                        scores[token] / scores[capacity]
                     ).astype(T.bfloat16)
         return output
 
@@ -1257,13 +1265,16 @@ def compile_attention_probabilities(
 @lru_cache(maxsize=None)
 def compile_attention_value_partials(
     query_heads: int, kv_heads: int, head_dim: int, max_context: int,
-    token_parallel: int = 64,
+    token_parallel: int = 64, score_capacity: int | None = None,
 ):
     """Accumulate the proven 16 decode-value token segments in parallel."""
 
     if query_heads % kv_heads:
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
+    capacity = max_context if score_capacity is None else score_capacity
+    if capacity < 1 or capacity > max_context:
+        raise ValueError("attention value capacity must be inside the cache")
     heads_per_kv = query_heads // kv_heads
     query_heads_per_block = 4
     if token_parallel < 1:
@@ -1271,7 +1282,7 @@ def compile_attention_value_partials(
 
     @tilelang.jit(target="cuda")
     def value_partials(
-        probability: T.Tensor((query_heads, max_context), T.bfloat16),
+        probability: T.Tensor((query_heads, capacity), T.bfloat16),
         values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         position: T.Tensor((1,), T.int32),
     ):
@@ -1288,7 +1299,7 @@ def compile_attention_value_partials(
             head_2 = head_0 + 2
             head_3 = head_0 + 3
             total = T.if_then_else(
-                position[0] + 1 < max_context, position[0] + 1, max_context
+                position[0] + 1 < capacity, position[0] + 1, capacity
             )
             start = T.if_then_else(
                 position[0] + 1 <= max_context,
