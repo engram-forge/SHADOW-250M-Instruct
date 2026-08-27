@@ -10,7 +10,8 @@ import numpy as np
 
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
-    PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
+    DenseDecodeRVQWeight, PackedRVQWeight, PackedTernaryWeight,
+    TileLangLinear, TorchLinear,
     compile_attention, compile_attention_cache_update, compile_attention_scores,
     compile_attention_probabilities, compile_attention_value_partials,
     compile_attention_value_reduce, compile_attention_values,
@@ -233,6 +234,12 @@ class TileLangEngine:
                     weights[f"{prefix}.q"], weights[f"{prefix}.k"],
                     weights[f"{prefix}.v"],
                 )
+                qkv = weights[f"{prefix}.qkv"]
+                weights[f"{prefix}.qkv"] = DenseDecodeRVQWeight(
+                    qkv.codebooks, qkv.indices, qkv.scales, qkv.out_features,
+                    qkv.in_features, qkv.group_size, qkv.stages,
+                    self._materialize_rvq(qkv),
+                )
                 weights[f"{prefix}.up_gate"] = self._join_ternary(
                     weights[f"{prefix}.up"], weights[f"{prefix}.gt"]
                 )
@@ -280,6 +287,22 @@ class TileLangEngine:
             torch.cat(tuple(weight.scales for weight in weights), dim=0).contiguous(),
             sum(weight.out_features for weight in weights), first.in_features,
         )
+
+    @staticmethod
+    def _materialize_rvq(weight: PackedRVQWeight):
+        """Build the BF16 values used by the packed decode GEMV exactly."""
+
+        import torch
+
+        rows = torch.arange(weight.out_features, device=weight.indices.device)
+        chunks = rows // 64
+        pair_indices = weight.indices[chunks, rows % 64].long()
+        codebooks = weight.codebooks[chunks]
+        values = torch.gather(
+            codebooks, 2,
+            pair_indices[:, None, :].expand(-1, weight.group_size, -1),
+        ).transpose(1, 2).reshape(weight.out_features, weight.in_features)
+        return (values * weight.scales[:, None]).to(torch.bfloat16).contiguous()
 
     def _load_fingerprints(self, path: str | Path):
         import torch

@@ -23,6 +23,13 @@ class PackedRVQWeight:
 
 
 @dataclass(frozen=True)
+class DenseDecodeRVQWeight(PackedRVQWeight):
+    """Dense exact-decode view paired with packed RVQ prefill storage."""
+
+    dense: object
+
+
+@dataclass(frozen=True)
 class PackedTernaryWeight:
     """CUDA-resident 2-bit ternary payload consumed directly by GEMV kernels."""
 
@@ -99,6 +106,53 @@ def compile_gemv(out_features: int, in_features: int):
                 )
             if lane_k == 0:
                 output[block * n_partition + lane_n] = reduced[0]
+        return output
+
+    return gemv
+
+
+@lru_cache(maxsize=None)
+def compile_rvq_dense_gemv(out_features: int, in_features: int):
+    """Compile a dense BF16 GEMV with RVQ's exact reduction order."""
+
+    tilelang, T = _imports()
+    n_partition, reduce_threads, vector = 8, 16, 8
+    block_k = reduce_threads * vector
+
+    @tilelang.jit(target="cuda")
+    def gemv(
+        x: T.Tensor((in_features,), T.bfloat16),
+        weight: T.Tensor((out_features, in_features), T.bfloat16),
+    ):
+        output = T.empty((out_features,), T.bfloat16)
+        with T.Kernel(
+            T.ceildiv(out_features, n_partition),
+            threads=(reduce_threads, n_partition),
+        ) as block:
+            lane_k = T.get_thread_binding(0)
+            lane_n = T.get_thread_binding(1)
+            row = block * n_partition + lane_n
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile_k in T.serial(T.ceildiv(in_features, block_k)):
+                for inner in T.serial(vector):
+                    column = tile_k * block_k + lane_k * vector + inner
+                    partial[0] += (
+                        x[column].astype(T.float32)
+                        * weight[row, column].astype(T.float32)
+                    )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane_k,
+                    dtype="handle",
+                ))
+            if lane_k == 0:
+                output[row] = reduced[0]
         return output
 
     return gemv
@@ -2126,6 +2180,10 @@ class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 
     def __call__(self, x, weight):
+        if isinstance(weight, DenseDecodeRVQWeight):
+            return compile_rvq_dense_gemv(*weight.shape)(
+                x.contiguous(), weight.dense
+            )
         if isinstance(weight, PackedRVQWeight):
             kernel = compile_rvq_gemv(
                 weight.out_features, weight.in_features, weight.group_size,
