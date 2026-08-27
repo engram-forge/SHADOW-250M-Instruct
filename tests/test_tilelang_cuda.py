@@ -113,9 +113,13 @@ def test_tilelang_rvq_gemv_matches_materialized_sections():
     pair_codebooks = (
         codebooks[:, 0, :, None, :] + codebooks[:, 1, :, :, None]
     ).reshape(2, 8, 256)
+    low, high = indices & 15, indices >> 4
+    pair_indices = np.concatenate(
+        (low[0] | (low[1] << 4), high[0] | (high[1] << 4)), axis=2
+    ).transpose(0, 2, 1)
     actual = compile_rvq_gemv(128, 192, 8, 2)(
         x, torch.from_numpy(pair_codebooks).cuda(),
-        torch.from_numpy(indices).cuda().permute(0, 1, 3, 2).contiguous(),
+        torch.from_numpy(pair_indices.copy()).cuda(),
         torch.from_numpy(scales).cuda(),
     )
     sections = []

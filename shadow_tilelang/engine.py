@@ -141,13 +141,20 @@ class TileLangEngine:
                     pair_codebooks = (
                         codebooks[0][:, None, :] + codebooks[1][:, :, None]
                     ).reshape(record.group_size, 256)
-                    indices = torch.from_numpy(np.array(record.indices, copy=True)).to(self.device)
+                    packed_indices = np.array(record.indices, copy=True)
+                    low = (packed_indices[:, :, :, :] & 15)
+                    high = packed_indices[:, :, :, :] >> 4
+                    pair_indices = np.concatenate(
+                        (low[0] | (low[1] << 4), high[0] | (high[1] << 4)),
+                        axis=2,
+                    ).transpose(0, 2, 1)
+                    indices = torch.from_numpy(pair_indices).to(self.device)
                     scales = torch.from_numpy(np.array(record.scales, copy=True)).to(self.device)
                     tensor = PackedRVQWeight(
                         pair_codebooks.unsqueeze(0).expand(
                             record.out_features // 64, -1, -1
                         ).contiguous(),
-                        indices.permute(0, 1, 3, 2).contiguous(), scales,
+                        indices.contiguous(), scales,
                         record.out_features, record.in_features,
                         record.group_size, record.stages,
                     )
@@ -217,7 +224,7 @@ class TileLangEngine:
             raise ValueError("cannot concatenate incompatible packed RVQ matrices")
         return PackedRVQWeight(
             torch.cat(tuple(weight.codebooks for weight in weights), dim=0).contiguous(),
-            torch.cat(tuple(weight.indices for weight in weights), dim=1).contiguous(),
+            torch.cat(tuple(weight.indices for weight in weights), dim=0).contiguous(),
             torch.cat(tuple(weight.scales for weight in weights), dim=0).contiguous(),
             sum(weight.out_features for weight in weights),
             first.in_features, first.group_size, first.stages,
