@@ -1349,6 +1349,37 @@ def compile_attention_value_reduce(
 
 
 @lru_cache(maxsize=None)
+def compile_attention_value_reduce_gate(
+    query_heads: int, head_dim: int, token_parallel: int = 64
+):
+    """Reduce value segments and apply the exact BF16 output gate once."""
+
+    tilelang, T = _imports()
+    if token_parallel < 1:
+        raise ValueError("attention value parallelism must be positive")
+
+    @tilelang.jit(target="cuda")
+    def value_reduce_gate(
+        partials: T.Tensor(
+            (query_heads, token_parallel, head_dim), T.float32
+        ),
+        gate: T.Tensor((query_heads * head_dim,), T.bfloat16),
+    ):
+        output = T.empty((query_heads, head_dim), T.bfloat16)
+        with T.Kernel(query_heads, threads=head_dim) as head:
+            lane = T.get_thread_binding(0)
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for segment in T.serial(token_parallel):
+                attended[0] += partials[head, segment, lane]
+            rounded = attended[0].astype(T.bfloat16)
+            output[head, lane] = rounded * gate[head * head_dim + lane]
+        return output
+
+    return value_reduce_gate
+
+
+@lru_cache(maxsize=None)
 def compile_attention(
     query_heads: int, kv_heads: int, head_dim: int, max_context: int
 ):

@@ -16,6 +16,7 @@ from .kernels import (
     compile_attention, compile_attention_cache_update, compile_attention_scores,
     compile_attention_probabilities, compile_attention_value_partials,
     compile_attention_value_reduce, compile_attention_values,
+    compile_attention_value_reduce_gate,
     compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_embedding,
     compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
@@ -472,9 +473,6 @@ class TileLangEngine:
                 )(
                     probability, self.v_cache[layer], self._position_cuda
                 )
-                attended = compile_attention_value_reduce(
-                    QUERY_HEADS, HEAD_DIM, attention_parallelism
-                )(partials).reshape(D)
             else:
                 attended = compile_attention(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
@@ -503,9 +501,17 @@ class TileLangEngine:
             ).reshape(D)
         gate = self.weights[f"{prefix}.gate"]
         if self.backend == "tilelang":
-            x = self.linear.gated_residual(
-                attended, gate, x, self.weights[f"{prefix}.o"]
-            )
+            if attention_parallelism:
+                attended = compile_attention_value_reduce_gate(
+                    QUERY_HEADS, HEAD_DIM, attention_parallelism
+                )(partials, gate).reshape(D)
+                x = self.linear.rvq_residual(
+                    attended, x, self.weights[f"{prefix}.o"]
+                )
+            else:
+                x = self.linear.gated_residual(
+                    attended, gate, x, self.weights[f"{prefix}.o"]
+                )
         else:
             x = x + self._projection(f"{prefix}.o", attended * gate)
         hidden = self._norm(x, self.weights[f"{prefix}.n2.w"])
