@@ -96,8 +96,12 @@ def test_tilelang_greedy_generation_crosses_split_attention_boundary(boundary_in
             generated = engine._generate_greedy_cuda(logits, 4)
             assert len(generated) == 4
             assert engine.position == boundary + 3
-            assert previous_parallelism in engine._greedy_graphs
-            assert next_parallelism in engine._greedy_graphs
+            graph_parallelism = {
+                key[0] if isinstance(key, tuple) else key
+                for key in engine._greedy_graphs
+            }
+            assert previous_parallelism in graph_parallelism
+            assert next_parallelism in graph_parallelism
         finally:
             engine.close()
 
@@ -153,6 +157,36 @@ def test_tilelang_structural_capacity_covers_decode_graph_range(
             parallelism = engine._attention_parallelism(position)
             capacity = engine._structural_capacity(parallelism)
             assert capacity == expected
+            assert capacity >= min(position + 1, engine.max_context)
+        finally:
+            engine.close()
+
+
+@pytest.mark.parametrize(
+    "position,expected",
+    [(127, 0), (128, (64, 192)), (191, (64, 192)), (192, 64),
+     (327, 64), (328, (128, 512)), (511, (128, 512)),
+     (512, (128, 768)), (767, (128, 768)), (768, 128), (975, 128),
+     (976, (256, 1280)), (1279, (256, 1280)),
+     (1280, (256, 1536)), (1535, (256, 1536)), (1536, 256)],
+)
+def test_tilelang_decode_graph_uses_targeted_attention_capacities(
+    position, expected
+):
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (
+        root / "deployment/shadow250m_instruct.shdw",
+        root / "deployment/fp131072.npy",
+    )
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=2048)
+        try:
+            assert engine._decode_graph_key(position) == expected
+            parallelism, capacity = engine._graph_parameters(expected)
+            assert parallelism == engine._attention_parallelism(position)
             assert capacity >= min(position + 1, engine.max_context)
         finally:
             engine.close()

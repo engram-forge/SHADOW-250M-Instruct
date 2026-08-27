@@ -444,7 +444,8 @@ class TileLangEngine:
 
     def _block(
         self, layer: int, x, cosine, sine, *, normalized=None,
-        next_norm_weight=None, attention_parallelism=0, trunk_cache=None,
+        next_norm_weight=None, attention_parallelism=0, context_capacity=None,
+        trunk_cache=None,
     ):
         import torch
         import torch.nn.functional as functional
@@ -480,7 +481,10 @@ class TileLangEngine:
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
             if attention_parallelism > 0:
-                score_capacity = self._structural_capacity(attention_parallelism)
+                score_capacity = (
+                    self._structural_capacity(attention_parallelism)
+                    if context_capacity is None else context_capacity
+                )
                 scores = compile_attention_scores(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,
                     score_capacity,
@@ -645,7 +649,9 @@ class TileLangEngine:
             )
         return self._norm(output, self.weights["step.nf.w"])
 
-    def _decode_trunk_cuda(self, *, attention_parallelism=0):
+    def _decode_trunk_cuda(
+        self, *, attention_parallelism=0, context_capacity=None
+    ):
         cosine, sine = compile_rope_angles(HEAD_DIM // 2)(
             self._position_cuda, self._inv_frequency
         )
@@ -660,6 +666,7 @@ class TileLangEngine:
             result = self._block(
                 layer, hidden, cosine, sine, normalized=normalized,
                 attention_parallelism=attention_parallelism,
+                context_capacity=context_capacity,
                 next_norm_weight=(
                     self.weights[f"b.{layer + 1}.n1.w"]
                     if layer + 1 < LAYERS else None
@@ -675,14 +682,19 @@ class TileLangEngine:
         return hidden
 
     def _decode_cuda(
-        self, *, attention_parallelism=0, select_token=False, output_logits=True
+        self, *, attention_parallelism=0, context_capacity=None,
+        select_token=False, output_logits=True
     ):
         hidden = self._decode_trunk_cuda(
-            attention_parallelism=attention_parallelism
+            attention_parallelism=attention_parallelism,
+            context_capacity=context_capacity,
         )
         hidden = self._structural_step_cuda(
             hidden, final_norm=True,
-            context_capacity=self._structural_capacity(attention_parallelism),
+            context_capacity=(
+                self._structural_capacity(attention_parallelism)
+                if context_capacity is None else context_capacity
+            ),
         )
         projected = self._projection("head.weight", hidden)
         return self._logits(
@@ -694,14 +706,14 @@ class TileLangEngine:
 
         import torch
 
-        attention_parallelism = self._attention_parallelism(self.position)
-        self._ensure_decode_graph(attention_parallelism)
-        graph = self._decode_graphs[attention_parallelism]
+        graph_key = self._decode_graph_key(self.position)
+        self._ensure_decode_graph(graph_key)
+        graph = self._decode_graphs[graph_key]
         graph.replay()
         # Graph outputs have stable storage and are overwritten by the next
         # replay. Preserve normal step() value semantics for callers retaining
         # logits from more than one token.
-        return self._decode_graph_logits[attention_parallelism].clone()
+        return self._decode_graph_logits[graph_key].clone()
 
     def _attention_parallelism(self, position: int) -> int:
         for threshold, parallelism in EARLY_ATTENTION_PARALLELISM:
@@ -731,39 +743,81 @@ class TileLangEngine:
             )
         )
 
-    def _ensure_decode_graph(self, attention_parallelism=0):
+    def _decode_graph_key(self, position: int):
+        """Select attention parallelism and its static valid-row ceiling."""
+
+        parallelism = self._attention_parallelism(position)
+        coarse = self._structural_capacity(parallelism)
+        if parallelism == 64 and position < 192:
+            capacity = min(self.max_context, 192)
+            if capacity < coarse:
+                return parallelism, capacity
+        if parallelism == 128 and position < 512:
+            capacity = min(self.max_context, 512)
+            if capacity < coarse:
+                return parallelism, capacity
+        if parallelism == 128 and position < 768:
+            capacity = min(self.max_context, 768)
+            if capacity < coarse:
+                return parallelism, capacity
+        if parallelism == 256 and position < 1280:
+            capacity = min(self.max_context, 1280)
+            if capacity < coarse:
+                return parallelism, capacity
+        if parallelism == 256 and position < 1536:
+            capacity = min(self.max_context, 1536)
+            if capacity < coarse:
+                return parallelism, capacity
+        return parallelism
+
+    def _graph_parameters(self, graph_key) -> tuple[int, int]:
+        if isinstance(graph_key, tuple):
+            return graph_key
+        return graph_key, self._structural_capacity(graph_key)
+
+    def _ensure_decode_graph(self, graph_key=0):
         """Capture the dynamic decode graph without changing logical position."""
 
         import torch
 
-        graph = self._decode_graphs.get(attention_parallelism)
+        graph = self._decode_graphs.get(graph_key)
         if graph is None:
+            attention_parallelism, context_capacity = self._graph_parameters(
+                graph_key
+            )
             # Compile every lazy TileLang specialization before capture. The
             # warm execution writes the same dynamic cache slot that capture
             # immediately overwrites, so it does not advance model state.
-            self._decode_cuda(attention_parallelism=attention_parallelism)
+            self._decode_cuda(
+                attention_parallelism=attention_parallelism,
+                context_capacity=context_capacity,
+            )
             torch.cuda.synchronize(self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 logits = self._decode_cuda(
-                    attention_parallelism=attention_parallelism
+                    attention_parallelism=attention_parallelism,
+                    context_capacity=context_capacity,
                 )
-            self._decode_graphs[attention_parallelism] = graph
-            self._decode_graph_logits[attention_parallelism] = logits
+            self._decode_graphs[graph_key] = graph
+            self._decode_graph_logits[graph_key] = logits
             # Capture records work but does not execute it. Replay immediately
             # so the first graphed token observes populated output storage.
 
-    def _ensure_greedy_graph(self, attention_parallelism=0):
+    def _ensure_greedy_graph(self, graph_key=0):
         """Capture token selection, state advance, and one complete decode."""
 
         import torch
 
-        graph = self._greedy_graphs.get(attention_parallelism)
+        graph = self._greedy_graphs.get(graph_key)
         if graph is None:
-            self._ensure_decode_graph(attention_parallelism)
+            attention_parallelism, context_capacity = self._graph_parameters(
+                graph_key
+            )
+            self._ensure_decode_graph(graph_key)
             block_values, block_indices = self._decode_cuda(
                 attention_parallelism=attention_parallelism, select_token=True,
-                output_logits=False,
+                output_logits=False, context_capacity=context_capacity,
             )
             warm_token = torch.empty_like(self._token_cuda)
             compile_candidate_argmax(
@@ -778,7 +832,7 @@ class TileLangEngine:
                 )
                 block_values, block_indices = self._decode_cuda(
                     attention_parallelism=attention_parallelism, select_token=True,
-                    output_logits=False,
+                    output_logits=False, context_capacity=context_capacity,
                 )
                 compile_candidate_argmax(
                     block_values.numel(), VOCAB_SIZE, store_output=True,
@@ -787,7 +841,7 @@ class TileLangEngine:
                     block_values, block_indices, self._token_cuda,
                     self._position_cuda,
                 )
-            self._greedy_graphs[attention_parallelism] = graph
+            self._greedy_graphs[graph_key] = graph
 
     def _generate_greedy_cuda(self, logits, token_count: int) -> list[int]:
         """Generate fixed-length greedy tokens with one final host transfer."""
@@ -804,9 +858,9 @@ class TileLangEngine:
             chunk = min(self.max_context, token_count - completed)
             for _ in range(chunk):
                 position = start_position + completed
-                attention_parallelism = self._attention_parallelism(position)
-                self._ensure_greedy_graph(attention_parallelism)
-                graph = self._greedy_graphs[attention_parallelism]
+                graph_key = self._decode_graph_key(position)
+                self._ensure_greedy_graph(graph_key)
+                graph = self._greedy_graphs[graph_key]
                 graph.replay()
                 completed += 1
             slots = torch.arange(
