@@ -924,6 +924,7 @@ def compile_attention_scores(
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
     tokens_per_block = 4
+    query_heads_per_block = 2
 
     @tilelang.jit(target="cuda")
     def attention_scores(
@@ -934,9 +935,10 @@ def compile_attention_scores(
     ):
         scores = T.empty((query_heads, max_context), T.float32)
         with T.Kernel(
-            query_heads, T.ceildiv(max_context, tokens_per_block),
+            kv_heads, T.ceildiv(heads_per_kv, query_heads_per_block),
+            T.ceildiv(max_context, tokens_per_block),
             threads=(head_dim, tokens_per_block),
-        ) as (head, token_block):
+        ) as (kv_head, head_block, token_block):
             lane = T.get_thread_binding(0)
             token_lane = T.get_thread_binding(1)
             token = token_block * tokens_per_block + token_lane
@@ -947,26 +949,40 @@ def compile_attention_scores(
                 position[0] + 1 <= max_context,
                 0, (position[0] + 1) % max_context,
             )
-            partial = T.alloc_local((1,), T.float32)
-            reduced = T.alloc_local((1,), T.float32)
-            T.clear(partial)
+            partial_0 = T.alloc_local((1,), T.float32)
+            partial_1 = T.alloc_local((1,), T.float32)
+            reduced_0 = T.alloc_local((1,), T.float32)
+            reduced_1 = T.alloc_local((1,), T.float32)
+            T.clear(partial_0)
+            T.clear(partial_1)
+            head_0 = kv_head * heads_per_kv + head_block * query_heads_per_block
+            head_1 = head_0 + 1
             if token < total:
                 slot = (start + token) % max_context
-                partial[0] = (
-                    query[head, lane].astype(T.float32)
-                    * keys[head // heads_per_kv, slot, lane].astype(T.float32)
-                )
+                key = keys[kv_head, slot, lane].astype(T.float32)
+                partial_0[0] = query[head_0, lane].astype(T.float32) * key
+                partial_1[0] = query[head_1, lane].astype(T.float32) * key
             with T.attr(
                 T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
                 "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
             ):
                 T.evaluate(T.tvm_thread_allreduce(
-                    T.uint32(1), partial[0], True, reduced[0], lane,
+                    T.uint32(1), partial_0[0], True, reduced_0[0], lane,
+                    dtype="handle",
+                ))
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial_1[0], True, reduced_1[0], lane,
                     dtype="handle",
                 ))
             if lane == 0 and token < total:
-                dot = reduced[0].astype(T.bfloat16).astype(T.float32)
-                scores[head, token] = T.floor(dot * alpha[head])
+                dot_0 = reduced_0[0].astype(T.bfloat16).astype(T.float32)
+                dot_1 = reduced_1[0].astype(T.bfloat16).astype(T.float32)
+                scores[head_0, token] = T.floor(dot_0 * alpha[head_0])
+                scores[head_1, token] = T.floor(dot_1 * alpha[head_1])
         return scores
 
     return attention_scores
