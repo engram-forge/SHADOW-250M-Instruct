@@ -676,6 +676,170 @@ def compile_attention_cache_update(
 
 
 @lru_cache(maxsize=None)
+def compile_attention_scores(
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+):
+    """Compute exact decode attention scores with token-parallel blocks."""
+
+    if query_heads % kv_heads:
+        raise ValueError("query head count must be divisible by KV head count")
+    tilelang, T = _imports()
+    heads_per_kv = query_heads // kv_heads
+    tokens_per_block = 16
+
+    @tilelang.jit(target="cuda")
+    def attention_scores(
+        query: T.Tensor((query_heads, head_dim), T.bfloat16),
+        keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        alpha: T.Tensor((query_heads,), T.float32),
+        position: T.Tensor((1,), T.int32),
+    ):
+        scores = T.empty((query_heads, max_context), T.float32)
+        with T.Kernel(
+            query_heads, T.ceildiv(max_context, tokens_per_block),
+            threads=(head_dim, tokens_per_block),
+        ) as (head, token_block):
+            lane = T.get_thread_binding(0)
+            token_lane = T.get_thread_binding(1)
+            token = token_block * tokens_per_block + token_lane
+            total = T.if_then_else(
+                position[0] + 1 < max_context, position[0] + 1, max_context
+            )
+            start = T.if_then_else(
+                position[0] + 1 <= max_context,
+                0, (position[0] + 1) % max_context,
+            )
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            if token < total:
+                slot = (start + token) % max_context
+                partial[0] = (
+                    query[head, lane].astype(T.float32)
+                    * keys[head // heads_per_kv, slot, lane].astype(T.float32)
+                )
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane,
+                    dtype="handle",
+                ))
+            if lane == 0 and token < total:
+                dot = reduced[0].astype(T.bfloat16).astype(T.float32)
+                scores[head, token] = T.floor(dot * alpha[head])
+        return scores
+
+    return attention_scores
+
+
+@lru_cache(maxsize=None)
+def compile_attention_values(
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+):
+    """Normalize precomputed scores and accumulate exact decode values."""
+
+    if query_heads % kv_heads:
+        raise ValueError("query head count must be divisible by KV head count")
+    tilelang, T = _imports()
+    heads_per_kv = query_heads // kv_heads
+    token_parallel = 16
+
+    @tilelang.jit(target="cuda")
+    def attention_values(
+        input_scores: T.Tensor((query_heads, max_context), T.float32),
+        values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((query_heads, head_dim), T.bfloat16)
+        with T.Kernel(
+            query_heads, threads=(head_dim, token_parallel)
+        ) as head:
+            lane = T.get_thread_binding(0)
+            token_lane = T.get_thread_binding(1)
+            scores = T.alloc_shared((max_context + 1,), T.float32)
+            total = T.if_then_else(
+                position[0] + 1 < max_context, position[0] + 1, max_context
+            )
+            start = T.if_then_else(
+                position[0] + 1 <= max_context,
+                0, (position[0] + 1) % max_context,
+            )
+            score_threads = head_dim * token_parallel
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    scores[token] = input_scores[head, token]
+            T.sync_threads()
+            maximum = T.alloc_local((1,), T.float32)
+            denominator = T.alloc_local((1,), T.float32)
+            if lane == 0 and token_lane == 0:
+                maximum[0] = scores[0]
+                for token in T.serial(1, total):
+                    maximum[0] = T.max(maximum[0], scores[token])
+                scores[max_context] = maximum[0]
+            T.sync_threads()
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    scores[token] = T.exp2(T.max(
+                        scores[token] - scores[max_context], T.float32(-15.0)
+                    ))
+            T.sync_threads()
+            T.clear(denominator)
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
+                    denominator[0] += scores[token]
+            denominator_reduced = T.alloc_local((1,), T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), denominator[0], True, denominator_reduced[0],
+                    lane, token_lane, dtype="handle",
+                ))
+            if lane == 0 and token_lane == 0:
+                scores[max_context] = denominator_reduced[0]
+            T.sync_threads()
+            attended_partials = T.alloc_shared(
+                (token_parallel, head_dim), T.float32
+            )
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            kv_head = head // heads_per_kv
+            for token_tile in T.serial(T.ceildiv(total, token_parallel)):
+                token = token_tile * token_parallel + token_lane
+                if token < total:
+                    slot = (start + token) % max_context
+                    probability = (
+                        scores[token] / scores[max_context]
+                    ).astype(T.bfloat16)
+                    attended[0] += (
+                        probability.astype(T.float32)
+                        * values[kv_head, slot, lane].astype(T.float32)
+                    )
+            attended_partials[token_lane, lane] = attended[0]
+            T.sync_threads()
+            if token_lane == 0:
+                T.clear(attended)
+                for segment in T.serial(token_parallel):
+                    attended[0] += attended_partials[segment, lane]
+                output[head, lane] = attended[0]
+        return output
+
+    return attention_values
+
+
+@lru_cache(maxsize=None)
 def compile_attention(
     query_heads: int, kv_heads: int, head_dim: int, max_context: int
 ):

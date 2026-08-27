@@ -74,6 +74,27 @@ def test_tilelang_async_greedy_generation_matches_reference(
             native.close()
 
 
+def test_tilelang_greedy_generation_crosses_split_attention_boundary():
+    from pathlib import Path
+    from shadow_tilelang.engine import SPLIT_ATTENTION_POSITION, TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=512)
+        try:
+            engine.position = SPLIT_ATTENTION_POSITION - 2
+            engine._position_cuda.fill_(engine.position)
+            logits = engine.step(925)
+            generated = engine._generate_greedy_cuda(logits, 4)
+            assert len(generated) == 4
+            assert engine.position == SPLIT_ATTENTION_POSITION + 3
+            assert engine._greedy_graph is not None
+            assert engine._greedy_graph_split is not None
+        finally:
+            engine.close()
+
+
 def test_tilelang_ternary_unpack_matches_cpu():
     import numpy as np
     from shadow_tilelang.format import TernaryRecord, unpack_ternary
@@ -286,6 +307,35 @@ def test_tilelang_attention_full_context_equal_scores_are_bit_exact():
     expected = values.float().mean(dim=1).bfloat16().repeat_interleave(
         query_heads // kv_heads, dim=0
     )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("max_context,position", [(12, 19), (512, 519), (2048, 2055)])
+def test_tilelang_split_attention_is_bit_exact(max_context, position):
+    from shadow_tilelang.kernels import (
+        compile_attention, compile_attention_scores, compile_attention_values,
+    )
+
+    query_heads, kv_heads, head_dim = 24, 2, 64
+    torch.manual_seed(1700 + position)
+    query = torch.randn(
+        query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    keys = torch.randn(
+        kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = torch.randn_like(keys)
+    alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    position_cuda = torch.tensor([position], device="cuda", dtype=torch.int32)
+    expected = compile_attention(
+        query_heads, kv_heads, head_dim, max_context
+    )(query, keys, values, alpha, position_cuda)
+    scores = compile_attention_scores(
+        query_heads, kv_heads, head_dim, max_context
+    )(query, keys, alpha, position_cuda)
+    actual = compile_attention_values(
+        query_heads, kv_heads, head_dim, max_context
+    )(scores, values, position_cuda)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
