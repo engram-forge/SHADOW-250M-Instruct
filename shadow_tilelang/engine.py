@@ -465,7 +465,8 @@ class TileLangEngine:
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
                 )(q, self.k_cache[layer], alpha, self._position_cuda)
                 probability = compile_attention_probabilities(
-                    QUERY_HEADS, self.max_context
+                    QUERY_HEADS, self.max_context,
+                    8 if attention_parallelism <= 128 else 16,
                 )(scores, self._position_cuda)
                 partials = compile_attention_value_partials(
                     QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context,

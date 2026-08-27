@@ -1154,11 +1154,13 @@ def compile_attention_values(
 
 
 @lru_cache(maxsize=None)
-def compile_attention_probabilities(query_heads: int, max_context: int):
+def compile_attention_probabilities(
+    query_heads: int, max_context: int, token_parallel: int = 16
+):
     """Normalize split attention scores into exact BF16 probabilities."""
 
     tilelang, T = _imports()
-    head_dim, token_parallel = 64, 16
+    head_dim = 64
     score_threads = head_dim * token_parallel
 
     @tilelang.jit(target="cuda")
