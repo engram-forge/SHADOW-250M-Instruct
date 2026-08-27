@@ -2248,7 +2248,8 @@ def compile_fingerprint_logits(
 
 @lru_cache(maxsize=None)
 def compile_candidate_argmax(
-    candidates: int, vocabulary: int, threads: int = 512
+    candidates: int, vocabulary: int, threads: int = 512,
+    store_output: bool = False,
 ):
     """Reduce block maxima to the first exact vocabulary maximum."""
 
@@ -2257,8 +2258,10 @@ def compile_candidate_argmax(
     def argmax(
         values: T.Tensor((candidates,), T.float32),
         indices: T.Tensor((candidates,), T.int32),
+        destination: T.Tensor((1,), T.int64) = None,
     ):
-        output = T.empty((1,), T.int64)
+        if not store_output:
+            output = T.empty((1,), T.int64)
         with T.Kernel(1, threads=threads):
             lane = T.get_thread_binding(0)
             local_max = T.alloc_local((1,), T.float32)
@@ -2296,7 +2299,12 @@ def compile_candidate_argmax(
                     dtype="handle",
                 ))
             if lane == 0:
-                output[0] = first_index[0].astype(T.int64)
+                if store_output:
+                    destination[0] = first_index[0].astype(T.int64)
+                else:
+                    output[0] = first_index[0].astype(T.int64)
+        if store_output:
+            return
         return output
 
     return argmax

@@ -598,11 +598,16 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     selected_token = compile_candidate_argmax(
         block_values.numel(), vocabulary
     )(block_values, block_indices)
+    stored_token = torch.full_like(selected_token, -1)
+    compile_candidate_argmax(
+        block_values.numel(), vocabulary, store_output=True
+    )(block_values, block_indices, stored_token)
     legacy_selected_token = compile_candidate_argmax(
         block_values.numel(), vocabulary, 256
     )(block_values, block_indices)
     torch.testing.assert_close(selected_logits, actual, rtol=0, atol=0)
     assert int(selected_token) == int(actual.argmax())
+    assert int(stored_token) == int(selected_token)
     assert int(selected_token) == int(legacy_selected_token)
     candidate_values, candidate_indices = compile_fingerprint_logits(
         vocabulary, features, True, False

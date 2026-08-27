@@ -740,9 +740,10 @@ class TileLangEngine:
                 attention_parallelism=attention_parallelism, select_token=True,
                 output_logits=False,
             )
+            warm_token = torch.empty_like(self._token_cuda)
             compile_candidate_argmax(
-                block_values.numel(), VOCAB_SIZE
-            )(block_values, block_indices)
+                block_values.numel(), VOCAB_SIZE, store_output=True
+            )(block_values, block_indices, warm_token)
             torch.cuda.synchronize(self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -754,11 +755,9 @@ class TileLangEngine:
                     attention_parallelism=attention_parallelism, select_token=True,
                     output_logits=False,
                 )
-                self._token_cuda.copy_(compile_candidate_argmax(
-                    block_values.numel(), VOCAB_SIZE
-                )(
-                    block_values, block_indices
-                ))
+                compile_candidate_argmax(
+                    block_values.numel(), VOCAB_SIZE, store_output=True
+                )(block_values, block_indices, self._token_cuda)
                 self._position_cuda.add_(1)
             self._greedy_graphs[attention_parallelism] = graph
 
