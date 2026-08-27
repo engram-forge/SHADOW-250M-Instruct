@@ -119,11 +119,13 @@ def compile_gemv(out_features: int, in_features: int):
 
 
 @lru_cache(maxsize=None)
-def compile_rvq_dense_gemv(out_features: int, in_features: int):
+def compile_rvq_dense_gemv(
+    out_features: int, in_features: int, rows_per_block: int = 8
+):
     """Compile a dense BF16 GEMV with RVQ's exact reduction order."""
 
     tilelang, T = _imports()
-    n_partition, reduce_threads, vector = 8, 16, 8
+    n_partition, reduce_threads, vector = rows_per_block, 16, 8
     block_k = reduce_threads * vector
 
     @tilelang.jit(target="cuda")
@@ -221,11 +223,13 @@ def compile_rvq_dense_gemv_split_silu(
 
 
 @lru_cache(maxsize=None)
-def compile_rvq_dense_gemv_residual(out_features: int, in_features: int):
+def compile_rvq_dense_gemv_residual(
+    out_features: int, in_features: int, rows_per_block: int = 8
+):
     """Dense exact-order RVQ projection with a BF16 residual epilogue."""
 
     tilelang, T = _imports()
-    n_partition, reduce_threads, vector = 8, 16, 8
+    n_partition, reduce_threads, vector = rows_per_block, 16, 8
     block_k = reduce_threads * vector
 
     @tilelang.jit(target="cuda")
@@ -2653,7 +2657,7 @@ class TileLangLinear:
 
     def __call__(self, x, weight):
         if isinstance(weight, DenseDecodeRVQWeight):
-            return compile_rvq_dense_gemv(*weight.shape)(
+            return compile_rvq_dense_gemv(*weight.shape, 2)(
                 x.contiguous(), weight.dense
             )
         if isinstance(weight, PackedRVQWeight):
@@ -2728,7 +2732,7 @@ class TileLangLinear:
         if not isinstance(weight, PackedRVQWeight):
             raise TypeError("RVQ residual projection requires packed RVQ weights")
         if isinstance(weight, DenseDecodeRVQWeight):
-            return compile_rvq_dense_gemv_residual(*weight.shape)(
+            return compile_rvq_dense_gemv_residual(*weight.shape, 2)(
                 x.contiguous(), residual, weight.dense
             )
         return compile_rvq_gemv_residual(

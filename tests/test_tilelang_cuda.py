@@ -847,3 +847,25 @@ def test_tilelang_projection_epilogues_are_bit_exact():
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             engine.close()
+
+
+def test_tilelang_dense_rvq_row_geometries_are_bit_exact():
+    from shadow_tilelang.kernels import (
+        compile_rvq_dense_gemv, compile_rvq_dense_gemv_residual,
+    )
+
+    torch.manual_seed(903)
+    x = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(1792, 1536, device="cuda", dtype=torch.bfloat16)
+    expected = compile_rvq_dense_gemv(1792, 1536, 8)(x, weight)
+    actual = compile_rvq_dense_gemv(1792, 1536, 2)(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    residual = torch.randn(1792, device="cuda", dtype=torch.bfloat16)
+    expected = compile_rvq_dense_gemv_residual(1792, 1536, 8)(
+        x, residual, weight
+    )
+    actual = compile_rvq_dense_gemv_residual(1792, 1536, 2)(
+        x, residual, weight
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
