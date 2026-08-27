@@ -279,3 +279,16 @@ def test_tilelang_decode_preserves_full_logits_and_tokens():
         finally:
             reference.close()
             native.close()
+
+
+@pytest.mark.parametrize("shape", [(1, 64), (2, 64), (1, 1536), (4, 1536)])
+def test_tilelang_rms_norm_is_bit_exact(shape):
+    from shadow_tilelang.engine import _rms_norm
+    from shadow_tilelang.kernels import compile_rms_norm
+
+    torch.manual_seed(sum(shape))
+    x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(shape[-1], device="cuda")
+    actual = compile_rms_norm(*shape)(x, weight)
+    expected = _rms_norm(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

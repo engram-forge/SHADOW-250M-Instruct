@@ -63,6 +63,8 @@ backends run on CUDA and use the same quantized weight values and caches.
   TileLang expands only selected input tokens and computes vocabulary logits
   directly against packed signs, avoiding a persistent 128 MiB BF16 table and
   its per-token FP32 conversion.
+- FP32-accumulating RMSNorm is a shape-specialized TileLang kernel and remains
+  bit-exact with the CUDA reference implementation.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.

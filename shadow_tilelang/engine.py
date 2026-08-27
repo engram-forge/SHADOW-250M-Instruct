@@ -12,7 +12,7 @@ from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpa
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
-    compile_fingerprint_unpack_batch, compile_prefill_attention,
+    compile_fingerprint_unpack_batch, compile_prefill_attention, compile_rms_norm,
 )
 
 
@@ -258,6 +258,15 @@ class TileLangEngine:
     def _projection(self, name: str, x):
         return self.linear(x, self.weights[name])
 
+    def _norm(self, x, weight):
+        if self.backend != "tilelang":
+            return _rms_norm(x, weight)
+        shape = x.shape
+        width = shape[-1]
+        rows = x.numel() // width
+        output = compile_rms_norm(rows, width)(x.reshape(rows, width), weight)
+        return output.reshape(shape)
+
     def _batch_projection(self, name: str, x):
         if self.backend == "tilelang":
             return self.linear.batch(x, self.weights[name])
@@ -278,15 +287,15 @@ class TileLangEngine:
         import torch.nn.functional as functional
 
         prefix = f"b.{layer}"
-        z = _rms_norm(x, self.weights[f"{prefix}.n1.w"])
+        z = self._norm(x, self.weights[f"{prefix}.n1.w"])
         qkv = self._projection(f"{prefix}.qkv", z)
         q_end = QUERY_HEADS * HEAD_DIM
         kv_width = KV_HEADS * HEAD_DIM
         q = qkv[:q_end].reshape(QUERY_HEADS, HEAD_DIM)
         k = qkv[q_end : q_end + kv_width].reshape(KV_HEADS, HEAD_DIM)
         v = qkv[q_end + kv_width :].reshape(KV_HEADS, HEAD_DIM)
-        q = _rms_norm(q, self.weights[f"{prefix}.qn.w"])
-        k = _rms_norm(k, self.weights[f"{prefix}.kn.w"])
+        q = self._norm(q, self.weights[f"{prefix}.qn.w"])
+        k = self._norm(k, self.weights[f"{prefix}.kn.w"])
         q, k = self._rope(q, self.position), self._rope(k, self.position)
         q = _power_of_two_quantize(q)
         k = _power_of_two_quantize(k)
@@ -324,7 +333,7 @@ class TileLangEngine:
             ).reshape(D)
         gate = torch.sigmoid(self.weights[f"{prefix}.g"]).to(attended.dtype)
         x = x + self._projection(f"{prefix}.o", attended * gate)
-        hidden = _rms_norm(x, self.weights[f"{prefix}.n2.w"])
+        hidden = self._norm(x, self.weights[f"{prefix}.n2.w"])
         up_gate = self._projection(f"{prefix}.up_gate", hidden)
         up, gate_projection = up_gate.split(FFN_DIM)
         gated = functional.silu(gate_projection) * up
@@ -336,15 +345,15 @@ class TileLangEngine:
 
         prefix = f"b.{layer}"
         tokens = x.shape[0]
-        z = _rms_norm(x, self.weights[f"{prefix}.n1.w"])
+        z = self._norm(x, self.weights[f"{prefix}.n1.w"])
         qkv = self._batch_projection(f"{prefix}.qkv", z)
         q_end = QUERY_HEADS * HEAD_DIM
         kv_width = KV_HEADS * HEAD_DIM
         q = qkv[:, :q_end].reshape(tokens, QUERY_HEADS, HEAD_DIM)
         k = qkv[:, q_end : q_end + kv_width].reshape(tokens, KV_HEADS, HEAD_DIM)
         v = qkv[:, q_end + kv_width :].reshape(tokens, KV_HEADS, HEAD_DIM)
-        q = _rms_norm(q, self.weights[f"{prefix}.qn.w"])
-        k = _rms_norm(k, self.weights[f"{prefix}.kn.w"])
+        q = self._norm(q, self.weights[f"{prefix}.qn.w"])
+        k = self._norm(k, self.weights[f"{prefix}.kn.w"])
         positions = torch.arange(
             start_position, start_position + tokens, device=self.device, dtype=torch.float32
         )
@@ -368,7 +377,7 @@ class TileLangEngine:
         )(q, k, v, alpha).reshape(tokens, D)
         gate = torch.sigmoid(self.weights[f"{prefix}.g"]).to(attended.dtype)
         x = x + self._batch_projection(f"{prefix}.o", attended * gate)
-        hidden = _rms_norm(x, self.weights[f"{prefix}.n2.w"])
+        hidden = self._norm(x, self.weights[f"{prefix}.n2.w"])
         up_gate = self._batch_projection(f"{prefix}.up_gate", hidden)
         up, gate_projection = up_gate.split(FFN_DIM, dim=-1)
         return x + self._batch_projection(
@@ -386,7 +395,7 @@ class TileLangEngine:
         joined = torch.cat((current, recall))
         hidden = functional.silu(self._projection("step.cin", joined))
         output = current + self._projection("step.cout", hidden)
-        return _rms_norm(output, self.weights["step.nf.w"])
+        return self._norm(output, self.weights["step.nf.w"])
 
     def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
@@ -403,7 +412,7 @@ class TileLangEngine:
         if not return_logits:
             return None
         hidden = self._structural_step(hidden)
-        hidden = _rms_norm(hidden, self.weights["nf.w"])
+        hidden = self._norm(hidden, self.weights["nf.w"])
         projected = self._projection("head.weight", hidden)
         return self._logits(projected)
 
@@ -436,7 +445,7 @@ class TileLangEngine:
             self.position = token_count
             self._position_cuda.fill_(self.position)
             final = self._structural_step(hidden[-1])
-            final = _rms_norm(final, self.weights["nf.w"])
+            final = self._norm(final, self.weights["nf.w"])
             projected = self._projection("head.weight", final)
             return self._logits(projected)
         for token_id in tokens[:-1]:

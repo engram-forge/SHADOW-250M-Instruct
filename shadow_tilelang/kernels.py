@@ -738,6 +738,51 @@ def compile_fingerprint_logits(vocabulary: int, features: int):
     return logits
 
 
+@lru_cache(maxsize=None)
+def compile_rms_norm(rows: int, width: int, epsilon: float = 1e-6):
+    """Compile FP32-accumulating BF16 RMSNorm for flattened rows."""
+
+    if rows < 1 or width < 1:
+        raise ValueError("RMSNorm dimensions must be positive")
+    tilelang, T = _imports()
+    threads = min(256, 1 << (width - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def rms_norm(
+        x: T.Tensor((rows, width), T.bfloat16),
+        weight: T.Tensor((width,), T.float32),
+    ):
+        output = T.empty((rows, width), T.bfloat16)
+        with T.Kernel(rows, threads=threads) as row:
+            lane = T.get_thread_binding(0)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            T.clear(partial)
+            for tile in T.serial(T.ceildiv(width, threads)):
+                column = tile * threads + lane
+                if column < width:
+                    value = x[row, column].astype(T.float32)
+                    partial[0] += value * value
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), partial[0], True, reduced[0], lane, dtype="handle"
+                ))
+            scale = T.rsqrt(reduced[0] / width + epsilon)
+            for tile in T.serial(T.ceildiv(width, threads)):
+                column = tile * threads + lane
+                if column < width:
+                    normalized = (
+                        x[row, column].astype(T.float32) * scale
+                    ).astype(T.bfloat16)
+                    output[row, column] = normalized * weight[column].astype(T.bfloat16)
+        return output
+
+    return rms_norm
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 
