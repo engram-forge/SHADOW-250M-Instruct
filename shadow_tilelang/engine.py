@@ -333,13 +333,10 @@ class TileLangEngine:
         v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
-            slot = self.position % self.max_context
-            self.k_cache[layer, :, slot] = k
-            self.v_cache[layer, :, slot] = v
             attended = compile_attention(
                 QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
             )(
-                q, self.k_cache[layer], self.v_cache[layer], alpha,
+                q, k, v, self.k_cache[layer], self.v_cache[layer], alpha,
                 self._position_cuda,
             ).reshape(D)
         else:

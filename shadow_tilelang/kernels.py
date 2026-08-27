@@ -455,6 +455,8 @@ def compile_attention(
     @tilelang.jit(target="cuda")
     def attention(
         query: T.Tensor((query_heads, head_dim), T.bfloat16),
+        current_key: T.Tensor((kv_heads, head_dim), T.bfloat16),
+        current_value: T.Tensor((kv_heads, head_dim), T.bfloat16),
         keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         alpha: T.Tensor((query_heads,), T.float32),
@@ -469,6 +471,10 @@ def compile_attention(
             total = T.if_then_else(position[0] + 1 < max_context, position[0] + 1, max_context)
             start = T.if_then_else(position[0] + 1 <= max_context, 0, (position[0] + 1) % max_context)
             kv_head = head // heads_per_kv
+            current_slot = position[0] % max_context
+            keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
+            values[kv_head, current_slot, lane] = current_value[kv_head, lane]
+            T.sync_threads()
             for token in T.serial(total):
                 slot = (start + token) % max_context
                 partial[0] = (

@@ -170,7 +170,9 @@ def test_tilelang_attention_matches_reference_with_circular_cache(position):
     values[:, slots] = chronological_values
     alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
     actual = compile_attention(query_heads, kv_heads, head_dim, max_context)(
-        query, keys, values, alpha,
+        query, chronological_keys[:, -1].contiguous(),
+        chronological_values[:, -1].contiguous(),
+        keys, values, alpha,
         torch.tensor([position], device="cuda", dtype=torch.int32),
     )
     repeated_keys = chronological_keys.repeat_interleave(query_heads // kv_heads, dim=0)
