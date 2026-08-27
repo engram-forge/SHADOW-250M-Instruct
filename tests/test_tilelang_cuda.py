@@ -654,6 +654,25 @@ def test_tilelang_residual_rms_norm_is_bit_exact():
     )
 
 
+def test_tilelang_residual_circular_store_is_bit_exact():
+    from shadow_tilelang.kernels import compile_residual_circular_store
+
+    max_context, width = 8, 1536
+    torch.manual_seed(902)
+    residual = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    projected = torch.randn_like(residual)
+    cache = torch.zeros(
+        max_context, width, device="cuda", dtype=torch.bfloat16
+    )
+    position = torch.tensor([11], device="cuda", dtype=torch.int32)
+    actual = compile_residual_circular_store(max_context, width)(
+        residual, projected, cache, position
+    )
+    expected = residual + projected
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cache[3], expected, rtol=0, atol=0)
+
+
 def test_tilelang_combined_qk_norm_is_bit_exact():
     from shadow_tilelang.kernels import compile_qk_rms_norm, compile_rms_norm
 

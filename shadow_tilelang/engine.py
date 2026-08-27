@@ -19,7 +19,8 @@ from .kernels import (
     compile_attention_value_reduce_gate,
     compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_embedding,
-    compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
+    compile_circular_gather, compile_fingerprint_gather,
+    compile_residual_circular_store,
     compile_fingerprint_unpack_batch,
     compile_double_rms_norm, compile_prefill_attention, compile_rms_norm,
     compile_residual_rms_norm,
@@ -427,7 +428,7 @@ class TileLangEngine:
 
     def _block(
         self, layer: int, x, cosine, sine, *, normalized=None,
-        next_norm_weight=None, attention_parallelism=0,
+        next_norm_weight=None, attention_parallelism=0, trunk_cache=None,
     ):
         import torch
         import torch.nn.functional as functional
@@ -527,6 +528,11 @@ class TileLangEngine:
                 projected = functional.linear(gated, self.weights[f"{prefix}.dn"])
                 return compile_residual_rms_norm(D)(
                     x, projected, next_norm_weight
+                )
+            if trunk_cache is not None:
+                projected = functional.linear(gated, self.weights[f"{prefix}.dn"])
+                return compile_residual_circular_store(self.max_context, D)(
+                    x, projected, trunk_cache, self._position_cuda
                 )
             return self.linear.residual(gated, x, self.weights[f"{prefix}.dn"])
         up_gate = self._projection(f"{prefix}.up_gate", hidden)
@@ -635,6 +641,9 @@ class TileLangEngine:
                     self.weights[f"b.{layer + 1}.n1.w"]
                     if layer + 1 < LAYERS else None
                 ),
+                trunk_cache=(
+                    self._trunk_cache_cuda if layer + 1 == LAYERS else None
+                ),
             )
             if layer + 1 < LAYERS:
                 hidden, normalized = result
@@ -645,9 +654,6 @@ class TileLangEngine:
     def _decode_cuda(self, *, attention_parallelism=0):
         hidden = self._decode_trunk_cuda(
             attention_parallelism=attention_parallelism
-        )
-        compile_circular_store(self.max_context, D)(
-            hidden, self._trunk_cache_cuda, self._position_cuda
         )
         hidden = self._structural_step_cuda(hidden, final_norm=True)
         projected = self._projection("head.weight", hidden)
@@ -776,10 +782,6 @@ class TileLangEngine:
         if self.backend != "tilelang":
             self.trunk_cache.append(hidden)
             self.trunk_cache = self.trunk_cache[-self.max_context :]
-        else:
-            compile_circular_store(self.max_context, D)(
-                hidden, self._trunk_cache_cuda, self._position_cuda
-            )
         self.position += 1
         if not return_logits:
             return None

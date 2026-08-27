@@ -1868,6 +1868,33 @@ def compile_circular_store(max_context: int, width: int):
 
 
 @lru_cache(maxsize=None)
+def compile_residual_circular_store(max_context: int, width: int):
+    """Add exact BF16 residuals and store the result in a circular cache."""
+
+    tilelang, T = _imports()
+    threads = min(width, 256)
+
+    @tilelang.jit(target="cuda")
+    def residual_store(
+        residual: T.Tensor((width,), T.bfloat16),
+        projected: T.Tensor((width,), T.bfloat16),
+        cache: T.Tensor((max_context, width), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((width,), T.bfloat16)
+        with T.Kernel(T.ceildiv(width, threads), threads=threads) as block:
+            lane = T.get_thread_binding(0)
+            column = block * threads + lane
+            if column < width:
+                value = residual[column] + projected[column]
+                output[column] = value
+                cache[position[0] % max_context, column] = value
+        return output
+
+    return residual_store
+
+
+@lru_cache(maxsize=None)
 def compile_token_store(max_context: int):
     """Record one dynamic token in a circular device-side history."""
 
