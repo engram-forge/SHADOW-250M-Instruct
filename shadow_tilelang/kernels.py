@@ -685,7 +685,7 @@ def compile_attention_scores(
         raise ValueError("query head count must be divisible by KV head count")
     tilelang, T = _imports()
     heads_per_kv = query_heads // kv_heads
-    tokens_per_block = 16
+    tokens_per_block = 4
 
     @tilelang.jit(target="cuda")
     def attention_scores(
