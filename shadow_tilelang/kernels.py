@@ -779,6 +779,34 @@ def compile_fingerprint_unpack(features: int):
 
 
 @lru_cache(maxsize=None)
+def compile_fingerprint_gather(vocabulary: int, features: int):
+    """Gather a CUDA-selected packed fingerprint and expand it to BF16 signs."""
+
+    if features % 8:
+        raise ValueError("fingerprint width must be divisible by eight")
+    tilelang, T = _imports()
+    packed_width = features // 8
+    threads = min(features, 256)
+
+    @tilelang.jit(target="cuda")
+    def gather(
+        packed: T.Tensor((vocabulary, packed_width), T.uint8),
+        index: T.Tensor((1,), T.int64),
+    ):
+        output = T.empty((features,), T.bfloat16)
+        with T.Kernel(T.ceildiv(features, threads), threads=threads) as block:
+            lane = T.get_thread_binding(0)
+            feature = block * threads + lane
+            if feature < features:
+                byte = packed[index[0], feature // 8].astype(T.int32)
+                bit = (byte >> (7 - feature % 8)) & 1
+                output[feature] = (bit * 2 - 1).astype(T.bfloat16)
+        return output
+
+    return gather
+
+
+@lru_cache(maxsize=None)
 def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features: int):
     """Gather and expand a batch of MSB-first packed fingerprints."""
 

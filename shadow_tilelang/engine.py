@@ -12,7 +12,8 @@ from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpa
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
-    compile_fingerprint_unpack_batch, compile_prefill_attention, compile_rms_norm,
+    compile_fingerprint_gather, compile_fingerprint_unpack_batch,
+    compile_prefill_attention, compile_rms_norm,
     compile_power_of_two_quantize, compile_rope,
 )
 
@@ -100,6 +101,15 @@ class TileLangEngine:
             self._position_cuda = torch.zeros(
                 1, device=self.device, dtype=torch.int32
             )
+            self._token_cuda = torch.zeros(
+                1, device=self.device, dtype=torch.int64
+            )
+            self._cosine_cuda = torch.empty(
+                HEAD_DIM // 2, device=self.device, dtype=self.dtype
+            )
+            self._sine_cuda = torch.empty_like(self._cosine_cuda)
+            self._decode_graph = None
+            self._decode_graph_hidden = None
         else:
             self.k_cache = [[] for _ in range(LAYERS)]
             self.v_cache = [[] for _ in range(LAYERS)]
@@ -248,6 +258,11 @@ class TileLangEngine:
                 self.fingerprints[token_id]
             )
         return self.fingerprints[token_id]
+
+    def _fingerprint_cuda(self):
+        return compile_fingerprint_gather(VOCAB_SIZE, FINGERPRINT_DIM)(
+            self.fingerprints, self._token_cuda
+        )
 
     def _fingerprint_batch(self, indices, batch_size: int):
         import torch
@@ -431,17 +446,53 @@ class TileLangEngine:
         output = current + self._projection("step.cout", hidden)
         return self._norm(output, self.weights["step.nf.w"])
 
+    def _decode_trunk_cuda(self):
+        hidden = self._projection("emb.weight", self._fingerprint_cuda())
+        for layer in range(LAYERS):
+            hidden = self._block(
+                layer, hidden, self._cosine_cuda, self._sine_cuda
+            )
+        return hidden
+
+    def _decode_trunk_graph(self):
+        """Replay the launch-heavy transformer trunk as one CUDA graph."""
+
+        import torch
+
+        if self._decode_graph is None:
+            # Compile every lazy TileLang specialization before capture. The
+            # warm execution writes the same dynamic cache slot that capture
+            # immediately overwrites, so it does not advance model state.
+            self._decode_trunk_cuda()
+            torch.cuda.synchronize(self.device)
+            self._decode_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._decode_graph):
+                self._decode_graph_hidden = self._decode_trunk_cuda()
+            # Capture records work but does not execute it. Replay immediately
+            # so the first graphed token observes populated output storage.
+        self._decode_graph.replay()
+        # Graph outputs have stable storage and are overwritten by the next
+        # replay. Preserve this token for the structural-memory cache.
+        return self._decode_graph_hidden.clone()
+
     def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
             raise ValueError(f"token id {token_id} is outside [0, {VOCAB_SIZE})")
-        fingerprint = self._fingerprint(int(token_id))
         if self.backend == "tilelang":
+            self._token_cuda.fill_(int(token_id))
             self._position_cuda.fill_(self.position)
         angle = float(self.position) * self._inv_frequency
         cosine, sine = angle.cos().to(self.dtype), angle.sin().to(self.dtype)
-        hidden = self._projection("emb.weight", fingerprint)
-        for layer in range(LAYERS):
-            hidden = self._block(layer, hidden, cosine, sine)
+        if self.backend == "tilelang":
+            self._cosine_cuda.copy_(cosine)
+            self._sine_cuda.copy_(sine)
+            hidden = self._decode_trunk_graph()
+        else:
+            hidden = self._projection(
+                "emb.weight", self._fingerprint(int(token_id))
+            )
+            for layer in range(LAYERS):
+                hidden = self._block(layer, hidden, cosine, sine)
         self.trunk_cache.append(hidden)
         self.trunk_cache = self.trunk_cache[-self.max_context :]
         self.position += 1

@@ -236,7 +236,8 @@ def test_tilelang_batched_prefill_matches_reference_and_decode(length):
 def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     import numpy as np
     from shadow_tilelang.kernels import (
-        compile_fingerprint_logits, compile_fingerprint_unpack,
+        compile_fingerprint_gather, compile_fingerprint_logits,
+        compile_fingerprint_unpack,
         compile_fingerprint_unpack_batch,
     )
 
@@ -250,6 +251,12 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     indices = torch.tensor([0, 37, vocabulary - 1], device="cuda")
     torch.testing.assert_close(
         compile_fingerprint_unpack(features)(packed_cuda[37]), dense[37], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compile_fingerprint_gather(vocabulary, features)(
+            packed_cuda, torch.tensor([37], device="cuda")
+        ),
+        dense[37], rtol=0, atol=0,
     )
     torch.testing.assert_close(
         compile_fingerprint_unpack_batch(3, vocabulary, features)(packed_cuda, indices),
