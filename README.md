@@ -218,6 +218,11 @@ and the before and after results is in [finetune/FINETUNING.md](finetune/FINETUN
 
 ## Usage
 
+Experimental NVIDIA CUDA inference through TileLang is developed in the
+`feat/tilelang-cuda-engine` worktree. See
+[`doc/tilelang-engine.md`](doc/tilelang-engine.md) for setup, architecture,
+generated-CUDA inspection, tests, and the optimization roadmap.
+
 Easiest start, any system:
 
     python shadow_chat.py

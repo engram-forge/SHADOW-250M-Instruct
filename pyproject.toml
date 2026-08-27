@@ -12,5 +12,17 @@ dependencies = [
     "torch>=2.2,<3",
 ]
 
+[project.optional-dependencies]
+tilelang = [
+    "tilelang==0.1.13",
+    "nvidia-cuda-cccl==13.0.85; sys_platform == 'linux'",
+    "nvidia-cuda-crt==13.0.88; sys_platform == 'linux'",
+    "nvidia-cuda-nvcc==13.0.88; sys_platform == 'linux'",
+    "nvidia-nvvm==13.0.88; sys_platform == 'linux'",
+]
+
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
