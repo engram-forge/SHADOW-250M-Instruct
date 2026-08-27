@@ -614,18 +614,22 @@ class TileLangEngine:
         output = current + self._projection("step.cout", hidden)
         return self._norm(output, self.weights["step.nf.w"])
 
-    def _structural_step_cuda(self, current, *, final_norm=False):
+    def _structural_step_cuda(
+        self, current, *, final_norm=False, context_capacity=None
+    ):
         import torch
         import torch.nn.functional as functional
 
         query = self._projection("step.Wq", current)
-        scores = self._trunk_cache_cuda @ query
+        capacity = self.max_context if context_capacity is None else context_capacity
+        context = self._trunk_cache_cuda[:capacity]
+        scores = context @ query
         probability = compile_structural_softmax(
-            self.max_context, 1.0 / math.sqrt(D)
+            capacity, 1.0 / math.sqrt(D)
         )(
             scores, self._position_cuda
         )
-        recall = probability @ self._trunk_cache_cuda
+        recall = probability @ context
         hidden = self.linear.split_silu(
             current, recall, self.weights["step.cin"]
         )
@@ -673,7 +677,10 @@ class TileLangEngine:
         hidden = self._decode_trunk_cuda(
             attention_parallelism=attention_parallelism
         )
-        hidden = self._structural_step_cuda(hidden, final_norm=True)
+        hidden = self._structural_step_cuda(
+            hidden, final_norm=True,
+            context_capacity=self._structural_capacity(attention_parallelism),
+        )
         projected = self._projection("head.weight", hidden)
         return self._logits(
             projected, select_token=select_token, output_logits=output_logits
@@ -705,6 +712,21 @@ class TileLangEngine:
                 break
             parallelism = candidate
         return parallelism
+
+    def _structural_capacity(self, attention_parallelism: int) -> int:
+        """Return the static valid-row ceiling for one decode graph."""
+
+        if self.max_context < 512:
+            return self.max_context
+        early_capacities = {-2: 3, -4: 4, -8: 16, 0: 128}
+        if attention_parallelism in early_capacities:
+            return min(self.max_context, early_capacities[attention_parallelism])
+        split_capacities = {64: 328, 128: 976}
+        return min(
+            self.max_context, split_capacities.get(
+                attention_parallelism, self.max_context
+            )
+        )
 
     def _ensure_decode_graph(self, attention_parallelism=0):
         """Capture the dynamic decode graph without changing logical position."""

@@ -130,6 +130,34 @@ def test_tilelang_greedy_generation_crosses_early_attention_boundary(boundary_in
             engine.close()
 
 
+@pytest.mark.parametrize(
+    "position,expected",
+    [(0, 3), (2, 3), (3, 4), (4, 16), (15, 16), (16, 128),
+     (127, 128), (128, 328), (327, 328), (328, 976), (975, 976),
+     (976, 2048), (2048, 2048)],
+)
+def test_tilelang_structural_capacity_covers_decode_graph_range(
+    position, expected
+):
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (
+        root / "deployment/shadow250m_instruct.shdw",
+        root / "deployment/fp131072.npy",
+    )
+    with torch.inference_mode():
+        engine = TileLangEngine(*paths, backend="tilelang", max_context=2048)
+        try:
+            parallelism = engine._attention_parallelism(position)
+            capacity = engine._structural_capacity(parallelism)
+            assert capacity == expected
+            assert capacity >= min(position + 1, engine.max_context)
+        finally:
+            engine.close()
+
+
 def test_tilelang_ternary_unpack_matches_cpu():
     import numpy as np
     from shadow_tilelang.format import TernaryRecord, unpack_ternary
