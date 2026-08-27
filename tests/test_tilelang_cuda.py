@@ -209,6 +209,33 @@ def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
             native.close()
 
 
+def test_tilelang_structural_cache_preserves_chronological_order():
+    from shadow_tilelang.kernels import compile_circular_gather, compile_circular_store
+
+    max_context, width = 4, 64
+    cache = torch.zeros(
+        max_context, width, device="cuda", dtype=torch.bfloat16
+    )
+    chronological = []
+    for position in range(7):
+        value = torch.full(
+            (width,), position + 0.5, device="cuda", dtype=torch.bfloat16
+        )
+        position_cuda = torch.tensor(
+            [position], device="cuda", dtype=torch.int32
+        )
+        compile_circular_store(max_context, width)(
+            value, cache, position_cuda
+        )
+        chronological.append(value)
+        chronological = chronological[-max_context:]
+        actual = compile_circular_gather(max_context, width)(
+            cache, position_cuda
+        )[:len(chronological)]
+        expected = torch.stack(chronological)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("length", [2, 4, 7])
 def test_tilelang_batched_prefill_matches_reference_and_decode(length):
     from pathlib import Path

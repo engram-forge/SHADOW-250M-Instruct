@@ -12,7 +12,8 @@ from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpa
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
-    compile_fingerprint_gather, compile_fingerprint_unpack_batch,
+    compile_circular_gather, compile_circular_store, compile_fingerprint_gather,
+    compile_fingerprint_unpack_batch,
     compile_prefill_attention, compile_rms_norm,
     compile_power_of_two_quantize, compile_rope,
 )
@@ -104,12 +105,15 @@ class TileLangEngine:
             self._token_cuda = torch.zeros(
                 1, device=self.device, dtype=torch.int64
             )
-            self._cosine_cuda = torch.empty(
-                HEAD_DIM // 2, device=self.device, dtype=self.dtype
+            self._trunk_cache_cuda = torch.empty(
+                self.max_context, D, device=self.device, dtype=self.dtype
             )
-            self._sine_cuda = torch.empty_like(self._cosine_cuda)
+            self._trunk_cache_cuda.zero_()
+            self._trunk_slots_cuda = torch.arange(
+                self.max_context, device=self.device, dtype=torch.int32
+            )
             self._decode_graph = None
-            self._decode_graph_hidden = None
+            self._decode_graph_logits = None
         else:
             self.k_cache = [[] for _ in range(LAYERS)]
             self.v_cache = [[] for _ in range(LAYERS)]
@@ -446,16 +450,45 @@ class TileLangEngine:
         output = current + self._projection("step.cout", hidden)
         return self._norm(output, self.weights["step.nf.w"])
 
+    def _structural_step_cuda(self, current):
+        import torch
+        import torch.nn.functional as functional
+
+        query = self._projection("step.Wq", current)
+        context = compile_circular_gather(self.max_context, D)(
+            self._trunk_cache_cuda, self._position_cuda
+        )
+        scores = context @ query / math.sqrt(D)
+        valid = self._trunk_slots_cuda <= self._position_cuda[0]
+        scores = scores.masked_fill(~valid, float("-inf"))
+        probability = torch.softmax(scores.float(), dim=-1).to(self.dtype)
+        recall = probability @ context
+        joined = torch.cat((current, recall))
+        hidden = functional.silu(self._projection("step.cin", joined))
+        output = current + self._projection("step.cout", hidden)
+        return self._norm(output, self.weights["step.nf.w"])
+
     def _decode_trunk_cuda(self):
+        angle = self._position_cuda.float() * self._inv_frequency
+        cosine = angle.cos().to(self.dtype)
+        sine = angle.sin().to(self.dtype)
         hidden = self._projection("emb.weight", self._fingerprint_cuda())
         for layer in range(LAYERS):
-            hidden = self._block(
-                layer, hidden, self._cosine_cuda, self._sine_cuda
-            )
+            hidden = self._block(layer, hidden, cosine, sine)
         return hidden
 
-    def _decode_trunk_graph(self):
-        """Replay the launch-heavy transformer trunk as one CUDA graph."""
+    def _decode_cuda(self):
+        hidden = self._decode_trunk_cuda()
+        compile_circular_store(self.max_context, D)(
+            hidden, self._trunk_cache_cuda, self._position_cuda
+        )
+        hidden = self._structural_step_cuda(hidden)
+        hidden = self._norm(hidden, self.weights["nf.w"])
+        projected = self._projection("head.weight", hidden)
+        return self._logits(projected)
+
+    def _decode_graph_step(self):
+        """Replay a complete dynamic-token model step as one CUDA graph."""
 
         import torch
 
@@ -463,17 +496,18 @@ class TileLangEngine:
             # Compile every lazy TileLang specialization before capture. The
             # warm execution writes the same dynamic cache slot that capture
             # immediately overwrites, so it does not advance model state.
-            self._decode_trunk_cuda()
+            self._decode_cuda()
             torch.cuda.synchronize(self.device)
             self._decode_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._decode_graph):
-                self._decode_graph_hidden = self._decode_trunk_cuda()
+                self._decode_graph_logits = self._decode_cuda()
             # Capture records work but does not execute it. Replay immediately
             # so the first graphed token observes populated output storage.
         self._decode_graph.replay()
         # Graph outputs have stable storage and are overwritten by the next
-        # replay. Preserve this token for the structural-memory cache.
-        return self._decode_graph_hidden.clone()
+        # replay. Preserve normal step() value semantics for callers retaining
+        # logits from more than one token.
+        return self._decode_graph_logits.clone()
 
     def _consume(self, token_id: int, *, return_logits: bool):
         if not 0 <= int(token_id) < VOCAB_SIZE:
@@ -484,21 +518,31 @@ class TileLangEngine:
         angle = float(self.position) * self._inv_frequency
         cosine, sine = angle.cos().to(self.dtype), angle.sin().to(self.dtype)
         if self.backend == "tilelang":
-            self._cosine_cuda.copy_(cosine)
-            self._sine_cuda.copy_(sine)
-            hidden = self._decode_trunk_graph()
+            if return_logits:
+                logits = self._decode_graph_step()
+                self.position += 1
+                return logits
+            hidden = self._decode_trunk_cuda()
         else:
             hidden = self._projection(
                 "emb.weight", self._fingerprint(int(token_id))
             )
             for layer in range(LAYERS):
                 hidden = self._block(layer, hidden, cosine, sine)
-        self.trunk_cache.append(hidden)
-        self.trunk_cache = self.trunk_cache[-self.max_context :]
+        if self.backend != "tilelang":
+            self.trunk_cache.append(hidden)
+            self.trunk_cache = self.trunk_cache[-self.max_context :]
+        else:
+            compile_circular_store(self.max_context, D)(
+                hidden, self._trunk_cache_cuda, self._position_cuda
+            )
         self.position += 1
         if not return_logits:
             return None
-        hidden = self._structural_step(hidden)
+        hidden = (
+            self._structural_step_cuda(hidden)
+            if self.backend == "tilelang" else self._structural_step(hidden)
+        )
         hidden = self._norm(hidden, self.weights["nf.w"])
         projected = self._projection("head.weight", hidden)
         return self._logits(projected)
@@ -529,6 +573,7 @@ class TileLangEngine:
                 hidden = self._prefill_block(layer, hidden, 0)
             hidden = hidden[:token_count]
             self.trunk_cache = list(hidden.unbind(0))
+            self._trunk_cache_cuda[:token_count].copy_(hidden)
             self.position = token_count
             self._position_cuda.fill_(self.position)
             final = self._structural_step(hidden[-1])

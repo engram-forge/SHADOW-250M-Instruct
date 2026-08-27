@@ -807,6 +807,62 @@ def compile_fingerprint_gather(vocabulary: int, features: int):
 
 
 @lru_cache(maxsize=None)
+def compile_circular_store(max_context: int, width: int):
+    """Store one vector at a CUDA-selected circular-cache position."""
+
+    tilelang, T = _imports()
+    threads = min(width, 256)
+
+    @tilelang.jit(target="cuda")
+    def store(
+        value: T.Tensor((width,), T.bfloat16),
+        cache: T.Tensor((max_context, width), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((1,), T.int32)
+        with T.Kernel(T.ceildiv(width, threads), threads=threads) as block:
+            lane = T.get_thread_binding(0)
+            column = block * threads + lane
+            if column < width:
+                cache[position[0] % max_context, column] = value[column]
+            if block == 0 and lane == 0:
+                output[0] = position[0]
+        return output
+
+    return store
+
+
+@lru_cache(maxsize=None)
+def compile_circular_gather(max_context: int, width: int):
+    """Read a circular cache in chronological order on CUDA."""
+
+    tilelang, T = _imports()
+    threads = 256
+    total = max_context * width
+
+    @tilelang.jit(target="cuda")
+    def gather(
+        cache: T.Tensor((max_context, width), T.bfloat16),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((max_context, width), T.bfloat16)
+        with T.Kernel(T.ceildiv(total, threads), threads=threads) as block:
+            lane = T.get_thread_binding(0)
+            linear = block * threads + lane
+            if linear < total:
+                row = linear // width
+                column = linear % width
+                start = T.if_then_else(
+                    position[0] + 1 <= max_context,
+                    0, (position[0] + 1) % max_context,
+                )
+                output[row, column] = cache[(start + row) % max_context, column]
+        return output
+
+    return gather
+
+
+@lru_cache(maxsize=None)
 def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features: int):
     """Gather and expand a batch of MSB-first packed fingerprints."""
 
