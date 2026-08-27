@@ -324,6 +324,88 @@ def compile_ternary_gemv(out_features: int, in_features: int):
     return gemv
 
 
+@lru_cache(maxsize=None)
+def compile_attention(
+    query_heads: int, kv_heads: int, head_dim: int, max_context: int
+):
+    """Compile exact shiftmax decode attention over a circular KV cache."""
+
+    if query_heads % kv_heads:
+        raise ValueError("query head count must be divisible by KV head count")
+    if head_dim > 1024:
+        raise ValueError("attention head width exceeds a CUDA thread block")
+    tilelang, T = _imports()
+    heads_per_kv = query_heads // kv_heads
+
+    @tilelang.jit(target="cuda")
+    def attention(
+        query: T.Tensor((query_heads, head_dim), T.bfloat16),
+        keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
+        alpha: T.Tensor((query_heads,), T.float32),
+        position: T.Tensor((1,), T.int32),
+    ):
+        output = T.empty((query_heads, head_dim), T.bfloat16)
+        with T.Kernel(query_heads, threads=head_dim) as head:
+            lane = T.get_thread_binding(0)
+            scores = T.alloc_shared((max_context + 1,), T.float32)
+            partial = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            total = T.if_then_else(position[0] + 1 < max_context, position[0] + 1, max_context)
+            start = T.if_then_else(position[0] + 1 <= max_context, 0, (position[0] + 1) % max_context)
+            kv_head = head // heads_per_kv
+            for token in T.serial(total):
+                slot = (start + token) % max_context
+                partial[0] = (
+                    query[head, lane].astype(T.float32)
+                    * keys[kv_head, slot, lane].astype(T.float32)
+                )
+                with T.attr(
+                    T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1), partial[0], True, reduced[0], lane,
+                            dtype="handle",
+                        )
+                    )
+                if lane == 0:
+                    dot = reduced[0].astype(T.bfloat16).astype(T.float32)
+                    scores[token] = T.floor(dot * alpha[head])
+            T.sync_threads()
+            maximum = T.alloc_local((1,), T.float32)
+            denominator = T.alloc_local((1,), T.float32)
+            if lane == 0:
+                maximum[0] = scores[0]
+                for token in T.serial(1, total):
+                    maximum[0] = T.max(maximum[0], scores[token])
+                denominator[0] = 0.0
+                for token in T.serial(total):
+                    scores[token] = T.exp2(
+                        T.max(scores[token] - maximum[0], T.float32(-15.0))
+                    )
+                    denominator[0] += scores[token]
+                scores[max_context] = denominator[0]
+            T.sync_threads()
+            attended = T.alloc_local((1,), T.float32)
+            T.clear(attended)
+            for token in T.serial(total):
+                slot = (start + token) % max_context
+                probability = (
+                    scores[token] / scores[max_context]
+                ).astype(T.bfloat16)
+                attended[0] += (
+                    probability.astype(T.float32)
+                    * values[kv_head, slot, lane].astype(T.float32)
+                )
+            output[head, lane] = attended[0]
+        return output
+
+    return attention
+
+
 class TileLangLinear:
     """Shape-cached callable used for every decode-time projection."""
 

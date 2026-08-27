@@ -11,6 +11,7 @@ import numpy as np
 from .format import DenseRecord, RVQRecord, ShadowModelFile, TernaryRecord, unpack_rvq, unpack_ternary
 from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
+    compile_attention,
 )
 
 
@@ -83,9 +84,23 @@ class TileLangEngine:
         self.model_file.close()
 
     def reset(self) -> None:
+        import torch
+
         self.position = 0
-        self.k_cache = [[] for _ in range(LAYERS)]
-        self.v_cache = [[] for _ in range(LAYERS)]
+        if self.backend == "tilelang":
+            cache_shape = (LAYERS, KV_HEADS, self.max_context, HEAD_DIM)
+            self.k_cache = torch.empty(
+                cache_shape, device=self.device, dtype=self.dtype
+            )
+            self.v_cache = torch.empty(
+                cache_shape, device=self.device, dtype=self.dtype
+            )
+            self._position_cuda = torch.zeros(
+                1, device=self.device, dtype=torch.int32
+            )
+        else:
+            self.k_cache = [[] for _ in range(LAYERS)]
+            self.v_cache = [[] for _ in range(LAYERS)]
         self.trunk_cache = []
 
     def _load_weights(self):
@@ -230,27 +245,40 @@ class TileLangEngine:
         q = _rms_norm(q, self.weights[f"{prefix}.qn.w"])
         k = _rms_norm(k, self.weights[f"{prefix}.kn.w"])
         q, k = self._rope(q, self.position), self._rope(k, self.position)
-        self.k_cache[layer].append(k)
-        self.v_cache[layer].append(v)
-        self.k_cache[layer] = self.k_cache[layer][-self.max_context :]
-        self.v_cache[layer] = self.v_cache[layer][-self.max_context :]
-        keys = torch.stack(self.k_cache[layer], dim=1)
-        values = torch.stack(self.v_cache[layer], dim=1)
-        repeat = QUERY_HEADS // KV_HEADS
-        keys = keys.repeat_interleave(repeat, dim=0)
-        values = values.repeat_interleave(repeat, dim=0)
         q = _power_of_two_quantize(q)
-        keys = _power_of_two_quantize(keys)
-        values = _power_of_two_quantize(values)
-        scores = torch.einsum("hd,htd->ht", q, keys)
-        alpha = self.weights[f"{prefix}.alpha"].reshape(QUERY_HEADS, 1)
+        k = _power_of_two_quantize(k)
+        v = _power_of_two_quantize(v)
+        alpha = self.weights[f"{prefix}.alpha"].reshape(QUERY_HEADS)
         alpha = (alpha * 4096.0).round() / 4096.0
-        scores = torch.floor(scores * alpha)
-        probability = torch.exp2((scores - scores.amax(-1, keepdim=True)).clamp_min(-15))
-        probability /= probability.sum(-1, keepdim=True)
-        attended = torch.einsum(
-            "ht,htd->hd", probability.to(values.dtype), values
-        ).reshape(D)
+        if self.backend == "tilelang":
+            slot = self.position % self.max_context
+            self.k_cache[layer, :, slot] = k
+            self.v_cache[layer, :, slot] = v
+            attended = compile_attention(
+                QUERY_HEADS, KV_HEADS, HEAD_DIM, self.max_context
+            )(
+                q, self.k_cache[layer], self.v_cache[layer], alpha,
+                self._position_cuda,
+            ).reshape(D)
+        else:
+            self.k_cache[layer].append(k)
+            self.v_cache[layer].append(v)
+            self.k_cache[layer] = self.k_cache[layer][-self.max_context :]
+            self.v_cache[layer] = self.v_cache[layer][-self.max_context :]
+            keys = torch.stack(self.k_cache[layer], dim=1)
+            values = torch.stack(self.v_cache[layer], dim=1)
+            repeat = QUERY_HEADS // KV_HEADS
+            keys = keys.repeat_interleave(repeat, dim=0)
+            values = values.repeat_interleave(repeat, dim=0)
+            scores = torch.einsum("hd,htd->ht", q, keys)
+            scores = torch.floor(scores * alpha[:, None])
+            probability = torch.exp2(
+                (scores - scores.amax(-1, keepdim=True)).clamp_min(-15)
+            )
+            probability /= probability.sum(-1, keepdim=True)
+            attended = torch.einsum(
+                "ht,htd->hd", probability.to(values.dtype), values
+            ).reshape(D)
         gate = torch.sigmoid(self.weights[f"{prefix}.g"]).to(attended.dtype)
         x = x + self._projection(f"{prefix}.o", attended * gate)
         hidden = _rms_norm(x, self.weights[f"{prefix}.n2.w"])
@@ -278,6 +306,8 @@ class TileLangEngine:
         if not 0 <= int(token_id) < VOCAB_SIZE:
             raise ValueError(f"token id {token_id} is outside [0, {VOCAB_SIZE})")
         fingerprint = self.fingerprints[int(token_id)]
+        if self.backend == "tilelang":
+            self._position_cuda.fill_(self.position)
         hidden = self._projection("emb.weight", fingerprint)
         for layer in range(LAYERS):
             hidden = self._block(layer, hidden)

@@ -135,3 +135,64 @@ def test_tilelang_engine_keeps_quantized_weights_packed():
         assert isinstance(engine.weights["step.Wq"], PackedRVQWeight)
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize("position", [11, 19])
+def test_tilelang_attention_matches_reference_with_circular_cache(position):
+    from shadow_tilelang.engine import _power_of_two_quantize
+    from shadow_tilelang.kernels import compile_attention
+
+    query_heads, kv_heads, head_dim, max_context = 4, 2, 64, 12
+    torch.manual_seed(31 + position)
+    query = _power_of_two_quantize(
+        torch.randn(query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    chronological_keys = _power_of_two_quantize(
+        torch.randn(kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    chronological_values = _power_of_two_quantize(
+        torch.randn(kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    start = 0 if position + 1 <= max_context else (position + 1) % max_context
+    slots = (torch.arange(max_context, device="cuda") + start) % max_context
+    keys = torch.empty_like(chronological_keys)
+    values = torch.empty_like(chronological_values)
+    keys[:, slots] = chronological_keys
+    values[:, slots] = chronological_values
+    alpha = (torch.randn(query_heads, device="cuda") * 4096).round() / 4096
+    actual = compile_attention(query_heads, kv_heads, head_dim, max_context)(
+        query, keys, values, alpha,
+        torch.tensor([position], device="cuda", dtype=torch.int32),
+    )
+    repeated_keys = chronological_keys.repeat_interleave(query_heads // kv_heads, dim=0)
+    repeated_values = chronological_values.repeat_interleave(query_heads // kv_heads, dim=0)
+    scores = torch.einsum("hd,htd->ht", query, repeated_keys)
+    scores = torch.floor(scores * alpha[:, None])
+    probability = torch.exp2(
+        (scores - scores.amax(-1, keepdim=True)).clamp_min(-15)
+    )
+    probability /= probability.sum(-1, keepdim=True)
+    expected = torch.einsum(
+        "ht,htd->hd", probability.to(repeated_values.dtype), repeated_values
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
+    from pathlib import Path
+    from shadow_tilelang.engine import TileLangEngine
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (root / "deployment/shadow250m_instruct.shdw", root / "deployment/fp131072.npy")
+    prompt = [2, 8, 925, 1234, 356, 296, 306]
+    with torch.inference_mode():
+        reference = TileLangEngine(*paths, backend="torch", max_context=4)
+        native = TileLangEngine(*paths, backend="tilelang", max_context=4)
+        try:
+            for token in prompt:
+                expected = reference.step(token)
+                actual = native.step(token)
+                assert int(actual.argmax()) == int(expected.argmax())
+        finally:
+            reference.close()
+            native.close()

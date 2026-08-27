@@ -53,17 +53,19 @@ backends run on CUDA and use the same quantized weight values and caches.
   lookup, BF16 dequantization, and GEMV in one kernel.
 - Q/K/V and SwiGLU up/gate rows are concatenated at load time, reducing each
   transformer block from seven projection launches to four.
-- The exact power-of-two Q/K/V quantizer and floor/exp2 shiftmax attention are
-  represented in the runtime graph.
+- A TileLang kernel evaluates exact floor/exp2 shiftmax attention directly over
+  a fixed circular BF16 K/V cache. Q/K/V are power-of-two quantized once before
+  cache insertion instead of re-quantizing the complete history during decode.
 
-The current implementation processes prefill one token at a time. The next
-measured optimizations are a tiled exact-shiftmax attention kernel and a batched
-prefill path.
+The current implementation processes prefill one token at a time. A batched
+prefill path is the next measured optimization.
 
-On the development H100 NVL, the warm stateful decode fixture currently runs
-at about 72 tokens/s. Packed-weight GEMV reduced load-time CUDA allocation from
-644.7 MiB to 178.8 MiB and peak allocation from 1,189.0 MiB to 725.6 MiB. These
-are bring-up numbers, not release claims: the GPU was shared during measurement.
+On the development H100 NVL, native packed-weight GEMV and exact attention run
+the warm stateful decode fixture at about 89 tokens/s. Packed-weight GEMV
+reduced load-time CUDA allocation from 644.7 MiB to 178.8 MiB; the fixed K/V
+cache brings the final load allocation to 188.8 MiB and peak allocation to
+734.4 MiB. These are bring-up numbers, not release claims: the GPU was shared
+during measurement.
 
 ## Inspect generated CUDA
 
