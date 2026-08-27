@@ -2083,12 +2083,15 @@ def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features:
 
 @lru_cache(maxsize=None)
 def compile_fingerprint_logits(
-    vocabulary: int, features: int, select_token: bool = False
+    vocabulary: int, features: int, select_token: bool = False,
+    output_logits: bool = True,
 ):
     """Project BF16 features directly against lane-paired signs."""
 
     if features % 512:
         raise ValueError("paired fingerprint width must be divisible by 512")
+    if not output_logits and not select_token:
+        raise ValueError("candidate-only logits require token selection")
     tilelang, T = _imports()
     packed_width = features // 16
     lanes = 32
@@ -2102,7 +2105,8 @@ def compile_fingerprint_logits(
         packed: T.Tensor((vocabulary, packed_width), T.uint16),
         bias: T.Tensor((vocabulary,), T.float32),
     ):
-        output = T.empty((vocabulary,), T.float32)
+        if output_logits:
+            output = T.empty((vocabulary,), T.float32)
         if select_token:
             block_values = T.empty((blocks,), T.float32)
             block_indices = T.empty((blocks,), T.int32)
@@ -2157,7 +2161,7 @@ def compile_fingerprint_logits(
                         reduced[0] * normalization + bias[token],
                         T.float32(float("-inf")),
                     )
-                    if token < vocabulary:
+                    if output_logits and token < vocabulary:
                         output[token] = value
                     row_values[row_lane] = value
                     row_indices[row_lane] = token
@@ -2178,9 +2182,11 @@ def compile_fingerprint_logits(
                     block_values[block] = best_value[0]
                     block_indices[block] = best_index[0]
             else:
-                if lane == 0 and token < vocabulary:
+                if output_logits and lane == 0 and token < vocabulary:
                     output[token] = reduced[0] * normalization + bias[token]
         if select_token:
+            if not output_logits:
+                return block_values, block_indices
             return output, block_values, block_indices
         return output
 

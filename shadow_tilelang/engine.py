@@ -384,10 +384,10 @@ class TileLangEngine:
             )(self.fingerprints, padded)
         return self.fingerprints[indices]
 
-    def _logits(self, projected, *, select_token=False):
+    def _logits(self, projected, *, select_token=False, output_logits=True):
         if self.backend == "tilelang":
             return compile_fingerprint_logits(
-                VOCAB_SIZE, FINGERPRINT_DIM, select_token
+                VOCAB_SIZE, FINGERPRINT_DIM, select_token, output_logits
             )(
                 projected, self.fingerprints, self.weights["tb"].float()
             )
@@ -663,13 +663,17 @@ class TileLangEngine:
                 hidden = result
         return hidden
 
-    def _decode_cuda(self, *, attention_parallelism=0, select_token=False):
+    def _decode_cuda(
+        self, *, attention_parallelism=0, select_token=False, output_logits=True
+    ):
         hidden = self._decode_trunk_cuda(
             attention_parallelism=attention_parallelism
         )
         hidden = self._structural_step_cuda(hidden, final_norm=True)
         projected = self._projection("head.weight", hidden)
-        return self._logits(projected, select_token=select_token)
+        return self._logits(
+            projected, select_token=select_token, output_logits=output_logits
+        )
 
     def _decode_graph_step(self):
         """Replay a complete dynamic-token model step as one CUDA graph."""
@@ -728,8 +732,9 @@ class TileLangEngine:
         graph = self._greedy_graphs.get(attention_parallelism)
         if graph is None:
             self._ensure_decode_graph(attention_parallelism)
-            logits, block_values, block_indices = self._decode_cuda(
-                attention_parallelism=attention_parallelism, select_token=True
+            block_values, block_indices = self._decode_cuda(
+                attention_parallelism=attention_parallelism, select_token=True,
+                output_logits=False,
             )
             compile_candidate_argmax(
                 block_values.numel(), VOCAB_SIZE
@@ -741,8 +746,9 @@ class TileLangEngine:
                     self._token_cuda, self._greedy_tokens_cuda,
                     self._position_cuda,
                 )
-                logits, block_values, block_indices = self._decode_cuda(
-                    attention_parallelism=attention_parallelism, select_token=True
+                block_values, block_indices = self._decode_cuda(
+                    attention_parallelism=attention_parallelism, select_token=True,
+                    output_logits=False,
                 )
                 self._token_cuda.copy_(compile_candidate_argmax(
                     block_values.numel(), VOCAB_SIZE
