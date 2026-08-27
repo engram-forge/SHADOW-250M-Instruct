@@ -24,6 +24,7 @@ from .kernels import (
     compile_prefill_attention, compile_rms_norm,
     compile_residual_rms_norm,
     compile_power_of_two_quantize, compile_rope, compile_rope_quantize,
+    compile_rope_angles,
     compile_rope_quantize_cache,
     compile_qk_rms_norm,
     compile_structural_softmax,
@@ -608,9 +609,9 @@ class TileLangEngine:
         return self._norm(output, self.weights["step.nf.w"])
 
     def _decode_trunk_cuda(self, *, attention_parallelism=0):
-        angle = self._position_cuda.float() * self._inv_frequency
-        cosine = angle.cos().to(self.dtype)
-        sine = angle.sin().to(self.dtype)
+        cosine, sine = compile_rope_angles(HEAD_DIM // 2)(
+            self._position_cuda, self._inv_frequency
+        )
         hidden = compile_fingerprint_embedding(
             VOCAB_SIZE, FINGERPRINT_DIM, D
         )(

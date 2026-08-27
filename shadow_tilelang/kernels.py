@@ -2272,6 +2272,29 @@ def compile_power_of_two_quantize(rows: int, width: int):
 
 
 @lru_cache(maxsize=None)
+def compile_rope_angles(half_dim: int):
+    """Generate decode RoPE cosine and sine from a device position."""
+
+    tilelang, T = _imports()
+
+    @tilelang.jit(target="cuda")
+    def angles(
+        position: T.Tensor((1,), T.int32),
+        inv_frequency: T.Tensor((half_dim,), T.float32),
+    ):
+        cosine = T.empty((half_dim,), T.bfloat16)
+        sine = T.empty((half_dim,), T.bfloat16)
+        with T.Kernel(1, threads=half_dim):
+            lane = T.get_thread_binding(0)
+            angle = position[0].astype(T.float32) * inv_frequency[lane]
+            cosine[lane] = T.cos(angle)
+            sine[lane] = T.sin(angle)
+        return cosine, sine
+
+    return angles
+
+
+@lru_cache(maxsize=None)
 def compile_rope(heads: int, head_dim: int):
     """Compile BF16 RoPE while preserving the reference operation order."""
 
