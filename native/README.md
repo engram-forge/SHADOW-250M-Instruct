@@ -63,6 +63,26 @@ readings, CPU information, and runtime capabilities. It refuses an FP16 candidat
 unless both required features are exposed. Quality/parity qualification remains a
 separate mandatory gate.
 
+For the complete first-board qualification, use the unified driver:
+
+    python3 benchmarks/qualify_rk3566.py
+
+It builds separate Cortex-A55 compatibility and DotProd artifacts, refuses the
+DotProd matrix unless Linux reports asimddp, and evaluates exact, Compact64,
+FP16 QKV, and combined Compact64 plus FP16 QKV modes. Decode contexts are
+32/128/512/1024/2048; prefill lengths are 4/16/64/256; both use 1/2/4 threads.
+The final gate compares all three approximate modes with exact generation on the
+472-case fixture. Timestamped qualification JSON, Markdown, and per-mode quality
+files are written below benchmarks/board-results. The main JSON is checkpointed
+after every matrix cell so interrupted long runs retain completed evidence.
+
+Inspect the planned scope and detected hardware without running builds:
+
+    python3 benchmarks/qualify_rk3566.py --dry-run
+
+The full default run is intentionally long. Reduced CLI settings are useful for
+a board smoke test, but are not release evidence.
+
 Linux supports `--archive-backend auto` and `cpu`; both select the exact CPU
 scanner. Requesting `metal` fails explicitly. A QEMU user-mode smoke test must
 use a sysroot matching the binary's build userspace, for example Ubuntu 24.04:
