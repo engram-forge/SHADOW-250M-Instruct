@@ -547,5 +547,15 @@ def test_tilelang_projection_epilogues_are_bit_exact():
             )
             expected = residual + engine.linear(hidden, engine.weights["b.0.dn"])
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            ffn_input = torch.randn(
+                1536, device="cuda", dtype=torch.bfloat16
+            )
+            up_gate = engine.linear(ffn_input, engine.weights["b.0.up_gate"])
+            up, gate_projection = up_gate.split(4224)
+            expected = torch.nn.functional.silu(gate_projection) * up
+            actual = engine.linear.swiglu(
+                ffn_input, engine.weights["b.0.up_gate"]
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             engine.close()

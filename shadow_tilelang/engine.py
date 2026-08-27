@@ -422,11 +422,14 @@ class TileLangEngine:
         else:
             x = x + self._projection(f"{prefix}.o", attended * gate)
         hidden = self._norm(x, self.weights[f"{prefix}.n2.w"])
+        if self.backend == "tilelang":
+            gated = self.linear.swiglu(
+                hidden, self.weights[f"{prefix}.up_gate"]
+            )
+            return self.linear.residual(gated, x, self.weights[f"{prefix}.dn"])
         up_gate = self._projection(f"{prefix}.up_gate", hidden)
         up, gate_projection = up_gate.split(FFN_DIM)
         gated = functional.silu(gate_projection) * up
-        if self.backend == "tilelang":
-            return self.linear.residual(gated, x, self.weights[f"{prefix}.dn"])
         return x + self._projection(f"{prefix}.dn", gated)
 
     def _prefill_block(self, layer: int, x, start_position: int):
