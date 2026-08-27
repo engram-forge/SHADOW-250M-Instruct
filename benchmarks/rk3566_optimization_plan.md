@@ -382,3 +382,28 @@ residual accumulation, structural recurrence, and logits FP32 initially. FFN and
 residual FP16 storage remain approximate candidates requiring full 472-case
 generation validation. Range safety does not override the rejected WSL speed
 results; persistent FP16 storage should next be measured on physical RK3566.
+
+### Coherent opt-in FP16 QKV island
+
+`SHADOW_FP16_QKV=1` converts Q once, K/V once at insertion, and directly consumes
+stored FP16 operands with FP16FML and FP32 accumulation. Softmax stays FP32 and
+probabilities convert once for P/V FML. Sequential decode and batch-4 prefill
+share the representation; Compact64 is compatible. Cold archives retain FP32.
+
+| Context | Exact FP32 | Exact FP16 | Gain |
+| ---: | ---: | ---: | ---: |
+| 32 | 127.87 tok/s | 131.25 tok/s | +2.6% |
+| 128 | 119.61 tok/s | 122.50 tok/s | +2.4% |
+| 512 | 100.42 tok/s | 108.54 tok/s | +8.1% |
+| 1024 | 68.29 tok/s | 84.65 tok/s | +24.0% |
+| 2048 | 52.18 tok/s | 59.00 tok/s | +13.1% |
+
+At context 1024, exact prefill improved 25.6% and median RSS fell about 9.2 MiB.
+Compact64 improved 16.3% decode and 10.1% prefill at context 1024; at context 512
+decode improved 14.7%. These are three-run WSL development results.
+
+The 16-case/17-token screen produced 15/16 complete-sequence equality, 16/16
+first-token agreement, 98.53% stepwise argmax agreement, and median logit RMSE
+5.30e-6. One divergent trajectory reached RMSE 2.33, so the mode is approximate
+and remains opt-in. Full 472-case quality and physical-board matrices remain
+required before considering it as a default.

@@ -41,8 +41,14 @@ directly by FP16FML with FP32 accumulators. RMSNorm reductions, attention softma
 residuals, structural recurrence, and logits remain FP32. Do not enable a path
 that converts cached K/V back to FP32 inside the attention loop.
 
-Run the matched board matrix after an FP16-island switch exists, substituting its
-actual environment variable for `SHADOW_FP16_QKV=1`:
+`SHADOW_FP16_QKV=1` enables the implemented opt-in approximate island. It
+converts Q once and K/V once at cache insertion, consumes stored FP16 operands
+directly with widening FP32 accumulation, keeps softmax in FP32, and converts
+normalized probabilities once for FP16 probability/value FML. It falls back to
+FP32 when FP16FML is unavailable or cold-archive attention is active. It is
+compatible with `SHADOW_DOTPROD_FFN=compact64` and is not the exact default.
+
+Run the matched board matrix with:
 
     python3 benchmarks/rk3566_board_qualification.py \
       --kernel build/linux-arm64/shadow \

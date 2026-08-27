@@ -21,6 +21,10 @@
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
 #endif
+#if defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #if defined(__APPLE__)
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -275,6 +279,51 @@ void bfloat16_round_inplace(std::span<float> values) {
     value = bfloat16_round(value);
 }
 
+bool fp16_qkv_enabled() {
+  const char *value = std::getenv("SHADOW_FP16_QKV");
+  return value && std::string_view(value) != "0" &&
+         cpu_has_fp16_arithmetic() && cpu_has_fp16_fml();
+}
+
+#if defined(__aarch64__)
+void to_fp16(std::span<const float> input, std::uint16_t *output) {
+  std::size_t i = 0;
+  for (; i + 8 <= input.size(); i += 8) {
+    const auto low = vcvt_f16_f32(vld1q_f32(input.data() + i));
+    const auto high = vcvt_f16_f32(vld1q_f32(input.data() + i + 4));
+    vst1q_u16(output + i, vreinterpretq_u16_f16(vcombine_f16(low, high)));
+  }
+  for (; i < input.size(); ++i) {
+    const auto half = vcvt_f16_f32(vdupq_n_f32(input[i]));
+    vst1_lane_u16(output + i, vreinterpret_u16_f16(half), 0);
+  }
+}
+
+__attribute__((target("fp16fml")))
+float dot_fp16(const std::uint16_t *a, const std::uint16_t *b) {
+  float32x4_t low = vdupq_n_f32(0), high = vdupq_n_f32(0);
+  for (std::size_t i = 0; i < HD; i += 8) {
+    const auto av = vreinterpretq_f16_u16(vld1q_u16(a + i));
+    const auto bv = vreinterpretq_f16_u16(vld1q_u16(b + i));
+    low = vfmlalq_low_f16(low, av, bv);
+    high = vfmlalq_high_f16(high, av, bv);
+  }
+  return vaddvq_f32(vaddq_f32(low, high));
+}
+
+__attribute__((target("fp16fml")))
+void accumulate_value_fp16(float weight, const std::uint16_t *value, float *out) {
+  const auto wh = vdupq_n_f16(static_cast<__fp16>(weight));
+  for (std::size_t i = 0; i < HD; i += 8) {
+    const auto vv = vreinterpretq_f16_u16(vld1q_u16(value + i));
+    auto low = vld1q_f32(out + i), high = vld1q_f32(out + i + 4);
+    low = vfmlalq_low_f16(low, vv, wh);
+    high = vfmlalq_high_f16(high, vv, wh);
+    vst1q_f32(out + i, low); vst1q_f32(out + i + 4, high);
+  }
+}
+#endif
+
 const auto &ternary3_table() {
   static const auto table = [] {
     std::array<std::array<std::int8_t, 5>, 256> result{};
@@ -506,6 +555,7 @@ std::array<float, HD> codec_unpack(std::span<const std::uint8_t> packed,
 
 struct LayerCache {
   std::array<std::vector<std::array<float, HD>>, NKV> keys, values;
+  std::array<std::vector<std::array<std::uint16_t, HD>>, NKV> keys_f16, values_f16;
 };
 
 struct LayerWeights {
@@ -1962,9 +2012,34 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
   for (auto &cache : impl_->cache) {
     for (auto &keys : cache.keys) keys.clear();
     for (auto &values : cache.values) values.clear();
+    for (auto &keys : cache.keys_f16) keys.clear();
+    for (auto &values : cache.values_f16) values.clear();
   }
   impl_->trunk.clear();
   impl_->position = 0;
+  const bool use_fp16_qkv = fp16_qkv_enabled() && options.archive.empty();
+  auto insert_kv = [&](LayerCache &cache, std::size_t kvh,
+                       std::span<const float, HD> key,
+                       std::span<const float, HD> value) {
+    if (use_fp16_qkv) {
+      std::array<std::uint16_t, HD> kh{}, vh{};
+      to_fp16(key, kh.data()); to_fp16(value, vh.data());
+      cache.keys_f16[kvh].push_back(kh); cache.values_f16[kvh].push_back(vh);
+      if (cache.keys_f16[kvh].size() > 2048) {
+        cache.keys_f16[kvh].erase(cache.keys_f16[kvh].begin());
+        cache.values_f16[kvh].erase(cache.values_f16[kvh].begin());
+      }
+    } else {
+      std::array<float, HD> kh{}, vh{};
+      std::copy(key.begin(), key.end(), kh.begin());
+      std::copy(value.begin(), value.end(), vh.begin());
+      cache.keys[kvh].push_back(kh); cache.values[kvh].push_back(vh);
+      if (cache.keys[kvh].size() > 2048) {
+        cache.keys[kvh].erase(cache.keys[kvh].begin());
+        cache.values[kvh].erase(cache.values[kvh].begin());
+      }
+    }
+  };
   GenerationStats stats;
   stats.load_seconds = load_seconds_;
   std::vector<std::uint32_t> history(prompt.begin(), prompt.end());
@@ -2034,15 +2109,9 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       }
       auto &cache = impl_->cache[layer];
       for (std::size_t kvh = 0; kvh < NKV; ++kvh) {
-        std::array<float, HD> key{}, value{};
-        std::copy_n(ka.data() + kvh * HD, HD, key.data());
-        std::copy_n(va.data() + kvh * HD, HD, value.data());
-        cache.keys[kvh].push_back(key);
-        cache.values[kvh].push_back(value);
-        if (cache.keys[kvh].size() > 2048) {
-          cache.keys[kvh].erase(cache.keys[kvh].begin());
-          cache.values[kvh].erase(cache.values[kvh].begin());
-        }
+        insert_kv(cache, kvh,
+                  std::span<const float, HD>(ka.data() + kvh * HD, HD),
+                  std::span<const float, HD>(va.data() + kvh * HD, HD));
       }
       std::array<std::vector<std::array<float, HD>>, NKV> cold_keys,
           cold_values;
@@ -2085,9 +2154,10 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       std::fill(s.attended.begin(), s.attended.end(), 0.0f);
       auto &attended = s.attended;
       const auto alpha = w.alpha->dense_f32();
-      const std::size_t cache_tokens = cache.keys[0].size();
+      const std::size_t cache_tokens = use_fp16_qkv ? cache.keys_f16[0].size()
+                                                    : cache.keys[0].size();
       std::vector<float> shared_scores;
-      if (cache_tokens >= 1024 && options.archive.empty()) {
+      if (!use_fp16_qkv && cache_tokens >= 1024 && options.archive.empty()) {
         shared_scores.resize(NH * cache_tokens);
         for (std::size_t kvh = 0; kvh < NKV; ++kvh)
           for (std::size_t t = 0; t < cache_tokens; ++t) {
@@ -2123,6 +2193,8 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
       for (std::size_t head = 0; head < NH; ++head) {
         const std::size_t kvh = head / (NH / NKV);
         auto qh = std::span<const float>(q).subspan(head * HD, HD);
+        std::array<std::uint16_t, HD> qh_f16{};
+        if (use_fp16_qkv) to_fp16(qh, qh_f16.data());
         const std::size_t cold_count = cold_keys[kvh].size();
         s.score.assign(cold_count + cache_tokens, 0.0f);
         auto &score = s.score;
@@ -2136,7 +2208,9 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
         for (std::size_t t = 0; t < cache_tokens; ++t) {
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
           const float raw = shared_scores.empty()
-              ? aq * bfloat16_round(dot(qh, cache.keys[kvh][t]))
+              ? aq * bfloat16_round(use_fp16_qkv
+                    ? dot_fp16(qh_f16.data(), cache.keys_f16[kvh][t].data())
+                    : dot(qh, cache.keys[kvh][t]))
               : shared_scores[head * cache_tokens + t];
           score[cold_count + t] = shared_scores.empty() ? std::floor(raw) : raw;
           peak = std::max(peak, score[cold_count + t]);
@@ -2156,9 +2230,15 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
           for (std::size_t j = 0; j < HD; ++j)
             attended[head * HD + j] += score[t] * cold_values[kvh][t][j];
         for (std::size_t t = 0; t < cache_tokens; ++t) {
-          auto vv = std::span<const float>(cache.values[kvh][t]);
-          for (std::size_t j = 0; j < HD; ++j)
-            attended[head * HD + j] += score[cold_count + t] * vv[j];
+          if (use_fp16_qkv)
+            accumulate_value_fp16(score[cold_count + t],
+                                  cache.values_f16[kvh][t].data(),
+                                  attended.data() + head * HD);
+          else {
+            auto vv = std::span<const float>(cache.values[kvh][t]);
+            for (std::size_t j = 0; j < HD; ++j)
+              attended[head * HD + j] += score[cold_count + t] * vv[j];
+          }
         }
         for (std::size_t j = 0; j < HD; ++j)
           attended[head * HD + j] = bfloat16_round(attended[head * HD + j]);
@@ -2320,26 +2400,25 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
           std::copy(vh.begin(), vh.end(), va.begin() + head * HD);
         }
         for (std::size_t kvh = 0; kvh < NKV; ++kvh) {
-          std::array<float, HD> key{}, value{};
-          std::copy_n(ka.data() + kvh * HD, HD, key.data());
-          std::copy_n(va.data() + kvh * HD, HD, value.data());
-          cache.keys[kvh].push_back(key); cache.values[kvh].push_back(value);
-          if (cache.keys[kvh].size() > 2048) {
-            cache.keys[kvh].erase(cache.keys[kvh].begin());
-            cache.values[kvh].erase(cache.values[kvh].begin());
-          }
+          insert_kv(cache, kvh,
+                    std::span<const float, HD>(ka.data() + kvh * HD, HD),
+                    std::span<const float, HD>(va.data() + kvh * HD, HD));
         }
         auto token_attended = std::span<float>(attended).subspan(token * NH * HD, NH * HD);
         for (std::size_t head = 0; head < NH; ++head) {
           const std::size_t kvh = head / (NH / NKV);
           auto qh = qs.subspan(head * HD, HD);
-          const std::size_t cache_tokens = cache.keys[kvh].size();
+          const std::size_t cache_tokens = use_fp16_qkv
+              ? cache.keys_f16[kvh].size() : cache.keys[kvh].size();
+          std::array<std::uint16_t, HD> qh_f16{};
+          if (use_fp16_qkv) to_fp16(qh, qh_f16.data());
           std::vector<float> scores(cache_tokens);
           float peak = -std::numeric_limits<float>::infinity();
           const float aq = std::nearbyint(alpha[head] * 4096.0f) / 4096.0f;
           for (std::size_t t = 0; t < scores.size(); ++t) {
-            scores[t] = std::floor(
-                aq * bfloat16_round(dot(qh, cache.keys[kvh][t])));
+            scores[t] = std::floor(aq * bfloat16_round(use_fp16_qkv
+                ? dot_fp16(qh_f16.data(), cache.keys_f16[kvh][t].data())
+                : dot(qh, cache.keys[kvh][t])));
             peak = std::max(peak, scores[t]);
           }
           float denom = 0;
@@ -2350,9 +2429,14 @@ GenerationStats Runtime::generate(std::span<const std::uint32_t> prompt,
           for (float &score : scores)
             score = bfloat16_round(score / denom);
           for (std::size_t t = 0; t < scores.size(); ++t) {
-            auto vv = std::span<const float>(cache.values[kvh][t]);
-            for (std::size_t j = 0; j < HD; ++j)
-              token_attended[head * HD + j] += scores[t] * vv[j];
+            if (use_fp16_qkv)
+              accumulate_value_fp16(scores[t], cache.values_f16[kvh][t].data(),
+                                    token_attended.data() + head * HD);
+            else {
+              auto vv = std::span<const float>(cache.values[kvh][t]);
+              for (std::size_t j = 0; j < HD; ++j)
+                token_attended[head * HD + j] += scores[t] * vv[j];
+            }
           }
           for (std::size_t j = 0; j < HD; ++j)
             token_attended[head * HD + j] =
