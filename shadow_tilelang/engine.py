@@ -167,6 +167,16 @@ class TileLangEngine:
                     tensor = torch.from_numpy(unpack_rvq(record)).to(self.device, self.dtype)
             elif isinstance(record, TernaryRecord):
                 if self.backend == "tilelang":
+                    # cuBLAS streams the wide FFN down projections materially
+                    # faster than unpacking their ternary payload during every
+                    # token. Keep QKV and up/gate compressed, but spend about
+                    # 99 MiB to materialize these ten hot matrices as BF16.
+                    if record.name.endswith(".dn"):
+                        tensor = torch.from_numpy(
+                            unpack_ternary(record).copy()
+                        ).to(self.device, self.dtype)
+                        weights[record.name] = tensor.contiguous()
+                        continue
                     source = np.array(record.packed, copy=True)
                     trits = np.empty(
                         (record.out_features, record.in_features), dtype=np.uint8

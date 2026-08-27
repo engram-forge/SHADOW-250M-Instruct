@@ -166,7 +166,7 @@ def test_tilelang_rvq_gemv_matches_materialized_sections():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_tilelang_engine_keeps_quantized_weights_packed():
+def test_tilelang_engine_uses_decode_optimized_weight_storage():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine
     from shadow_tilelang.kernels import PackedRVQWeight, PackedTernaryWeight
@@ -177,7 +177,8 @@ def test_tilelang_engine_keeps_quantized_weights_packed():
     try:
         assert isinstance(engine.weights["b.0.qkv"], PackedRVQWeight)
         assert isinstance(engine.weights["b.0.up_gate"], PackedTernaryWeight)
-        assert isinstance(engine.weights["b.0.dn"], PackedTernaryWeight)
+        assert isinstance(engine.weights["b.0.dn"], torch.Tensor)
+        assert engine.weights["b.0.dn"].dtype == torch.bfloat16
         assert isinstance(engine.weights["step.Wq"], PackedRVQWeight)
     finally:
         engine.close()

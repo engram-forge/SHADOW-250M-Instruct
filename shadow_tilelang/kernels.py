@@ -1646,7 +1646,10 @@ class TileLangLinear:
 
     def residual(self, x, residual, weight):
         if not isinstance(weight, PackedTernaryWeight):
-            raise TypeError("residual projection requires packed ternary weights")
+            import torch.nn.functional as functional
+
+            projected = functional.linear(x, weight)
+            return residual + projected
         return compile_ternary_gemv_residual(
             weight.out_features, weight.in_features
         )(x.contiguous(), residual, weight.packed, weight.scales)
