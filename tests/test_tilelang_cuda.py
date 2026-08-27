@@ -198,6 +198,35 @@ def test_tilelang_attention_matches_reference_with_circular_cache(position):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_tilelang_attention_quantizes_value_before_cache_write():
+    from shadow_tilelang.engine import _power_of_two_quantize
+    from shadow_tilelang.kernels import compile_attention
+
+    query_heads, kv_heads, head_dim, max_context = 24, 2, 64, 32
+    torch.manual_seed(91)
+    query = _power_of_two_quantize(
+        torch.randn(query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    key = _power_of_two_quantize(
+        torch.randn(kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    value = torch.randn(
+        kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    keys = torch.zeros(
+        kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = torch.zeros_like(keys)
+    position = torch.tensor([7], device="cuda", dtype=torch.int32)
+    compile_attention(query_heads, kv_heads, head_dim, max_context)(
+        query, key, value, keys, values,
+        torch.ones(query_heads, device="cuda"), position,
+    )
+    torch.testing.assert_close(
+        values[:, 7], _power_of_two_quantize(value), rtol=0, atol=0
+    )
+
+
 def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine

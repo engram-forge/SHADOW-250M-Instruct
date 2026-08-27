@@ -373,7 +373,8 @@ class TileLangEngine:
         else:
             q = self._quantize(self._rope(q, self.position, cosine, sine))
             k = self._quantize(self._rope(k, self.position, cosine, sine))
-        v = self._quantize(v)
+        if self.backend != "tilelang":
+            v = self._quantize(v)
         alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
             attended = compile_attention(

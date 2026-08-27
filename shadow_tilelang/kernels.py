@@ -444,7 +444,7 @@ def compile_attention(
     def attention(
         query: T.Tensor((query_heads, head_dim), T.bfloat16),
         current_key: T.Tensor((kv_heads, head_dim), T.bfloat16),
-        current_value: T.Tensor((kv_heads, head_dim), T.bfloat16),
+        current_value_unquantized: T.Tensor((kv_heads, head_dim), T.bfloat16),
         keys: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         values: T.Tensor((kv_heads, max_context, head_dim), T.bfloat16),
         alpha: T.Tensor((query_heads,), T.float32),
@@ -460,8 +460,35 @@ def compile_attention(
             start = T.if_then_else(position[0] + 1 <= max_context, 0, (position[0] + 1) % max_context)
             kv_head = head // heads_per_kv
             current_slot = position[0] % max_context
+            value_maximum = T.alloc_local((1,), T.float32)
+            value_reduced = T.alloc_local((1,), T.float32)
+            value_maximum[0] = T.abs(
+                current_value_unquantized[kv_head, lane]
+            ).astype(T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: T.max(a, b), [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), value_maximum[0], True, value_reduced[0], lane,
+                    dtype="handle",
+                ))
+            maximum = T.max(
+                value_reduced[0], T.float32(1e-6)
+            ).astype(T.bfloat16)
+            ratio = (maximum / T.bfloat16(127.0)).astype(T.float32)
+            logarithm = T.log2(ratio).astype(T.bfloat16).astype(T.float32)
+            exponent = T.ceil(logarithm).astype(T.bfloat16).astype(T.float32)
+            value_scale = T.exp2(exponent).astype(T.bfloat16)
+            rounded = T.round((
+                current_value_unquantized[kv_head, lane] / value_scale
+            ).astype(T.float32))
+            clipped = T.min(
+                T.max(rounded, T.float32(-127.0)), T.float32(127.0)
+            ).astype(T.bfloat16)
+            current_value = clipped * value_scale
             keys[kv_head, current_slot, lane] = current_key[kv_head, lane]
-            values[kv_head, current_slot, lane] = current_value[kv_head, lane]
+            values[kv_head, current_slot, lane] = current_value
             T.sync_threads()
             for token in T.serial(total):
                 slot = (start + token) % max_context
