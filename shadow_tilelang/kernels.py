@@ -491,7 +491,8 @@ def compile_rvq_gemv_split_silu(
 
 @lru_cache(maxsize=None)
 def compile_rvq_gemv_residual(
-    out_features: int, in_features: int, group_size: int, stages: int
+    out_features: int, in_features: int, group_size: int, stages: int,
+    rows_per_block: int = 8,
 ):
     """Compile RVQ GEMV with an exact BF16 residual epilogue."""
 
@@ -499,7 +500,7 @@ def compile_rvq_gemv_residual(
         raise ValueError("RVQ GEMV output width must be positive and 64-row aligned")
     tilelang, T = _imports()
     groups, chunks = in_features // group_size, out_features // 64
-    n_partition, reduce_threads = 8, 16
+    n_partition, reduce_threads = rows_per_block, 16
 
     @tilelang.jit(target="cuda")
     def gemv(
@@ -2904,7 +2905,7 @@ class TileLangLinear:
             )
         return compile_rvq_gemv_residual(
             weight.out_features, weight.in_features, weight.group_size,
-            weight.stages,
+            weight.stages, 4,
         )(
             x.contiguous(), residual, weight.codebooks, weight.indices,
             weight.scales,

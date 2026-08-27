@@ -220,6 +220,23 @@ def test_tilelang_rvq_gemv_matches_materialized_sections():
         sections.append(torch.from_numpy(unpack_rvq(record)).cuda().bfloat16())
     expected = torch.nn.functional.linear(x, torch.cat(sections))
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    residual = torch.randn(
+        128, device="cuda", dtype=torch.bfloat16
+    )
+    from shadow_tilelang.kernels import compile_rvq_gemv_residual
+    expected = compile_rvq_gemv_residual(
+        128, 192, 8, 2, 8
+    )(
+        x, residual, torch.from_numpy(pair_codebooks).cuda(),
+        torch.from_numpy(pair_indices.copy()).cuda(),
+        torch.from_numpy(scales).cuda(),
+    )
+    actual = compile_rvq_gemv_residual(128, 192, 8, 2, 4)(
+        x, residual, torch.from_numpy(pair_codebooks).cuda(),
+        torch.from_numpy(pair_indices.copy()).cuda(),
+        torch.from_numpy(scales).cuda(),
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_tilelang_dense_rvq_reduction_geometry_is_bit_exact():
