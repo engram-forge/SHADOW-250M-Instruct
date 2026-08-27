@@ -266,6 +266,29 @@ def test_tilelang_attention_quantizes_value_before_cache_write():
     )
 
 
+def test_tilelang_attention_full_context_equal_scores_are_bit_exact():
+    from shadow_tilelang.kernels import compile_attention
+
+    query_heads, kv_heads, head_dim, max_context = 24, 2, 64, 2048
+    query = torch.zeros(
+        query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    keys = torch.zeros(
+        kv_heads, max_context, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    torch.manual_seed(771)
+    values = torch.randn_like(keys)
+    alpha = torch.ones(query_heads, device="cuda")
+    position = torch.tensor([max_context - 1], device="cuda", dtype=torch.int32)
+    actual = compile_attention(
+        query_heads, kv_heads, head_dim, max_context
+    )(query, keys, values, alpha, position)
+    expected = values.float().mean(dim=1).bfloat16().repeat_interleave(
+        query_heads // kv_heads, dim=0
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_tilelang_engine_circular_cache_matches_reference_after_wrap():
     from pathlib import Path
     from shadow_tilelang.engine import TileLangEngine

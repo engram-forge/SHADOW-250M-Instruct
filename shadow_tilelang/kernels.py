@@ -756,10 +756,26 @@ def compile_attention(
                     )
             T.sync_threads()
             if lane == 0 and token_lane == 0:
-                denominator[0] = 0.0
-                for token in T.serial(total):
+                denominator[0] = T.float32(0)
+            else:
+                denominator[0] = T.float32(0)
+            for token_tile in T.serial(T.ceildiv(total, score_threads)):
+                token = (
+                    token_tile * score_threads + token_lane * head_dim + lane
+                )
+                if token < total:
                     denominator[0] += scores[token]
-                scores[max_context] = denominator[0]
+            denominator_reduced = T.alloc_local((1,), T.float32)
+            with T.attr(
+                T.comm_reducer(lambda a, b: a + b, [T.float32(0)]),
+                "reduce_scope", T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(T.tvm_thread_allreduce(
+                    T.uint32(1), denominator[0], True, denominator_reduced[0],
+                    lane, token_lane, dtype="handle",
+                ))
+            if lane == 0 and token_lane == 0:
+                scores[max_context] = denominator_reduced[0]
             T.sync_threads()
             attended_partials = T.alloc_shared(
                 (token_parallel, head_dim), T.float32
