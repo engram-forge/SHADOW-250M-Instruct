@@ -489,3 +489,8 @@ Seven-run, four-thread WSL medians improved context-128 decode from 173.04 to
 176.62 tok/s (+2.1%). Length-256 batch-4 prefill time fell from 1.1358 to 1.1131
 seconds (+2.0% throughput). This is a small numerical-equivalent gain layered on
 the fused Compact64 kernels; confirm it on physical RK3566.
+
+Persistent thread-local quantization scratch was also tested and removed. Seven
+interleaved context-128 runs measured 180.44 tok/s with per-call vectors and
+180.74 tok/s with persistent buffers (+0.17%), with worse candidate variance.
+Allocation is not a meaningful Compact64 bottleneck on the development host.
