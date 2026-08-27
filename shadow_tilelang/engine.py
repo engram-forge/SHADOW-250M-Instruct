@@ -13,7 +13,7 @@ from .kernels import (
     PackedRVQWeight, PackedTernaryWeight, TileLangLinear, TorchLinear,
     compile_attention, compile_fingerprint_logits, compile_fingerprint_unpack,
     compile_fingerprint_unpack_batch, compile_prefill_attention, compile_rms_norm,
-    compile_power_of_two_quantize,
+    compile_power_of_two_quantize, compile_rope,
 )
 
 
@@ -154,6 +154,13 @@ class TileLangEngine:
         # same operation as three Q/K/V and two up/gate calls.
         for layer in range(LAYERS):
             prefix = f"b.{layer}"
+            weights[f"{prefix}.gate"] = torch.sigmoid(
+                weights[f"{prefix}.g"]
+            ).to(self.dtype).contiguous()
+            weights[f"{prefix}.alpha_q"] = (
+                (weights[f"{prefix}.alpha"].reshape(QUERY_HEADS) * 4096.0).round()
+                / 4096.0
+            ).contiguous()
             if self.backend == "tilelang":
                 weights[f"{prefix}.qkv"] = self._join_rvq(
                     weights[f"{prefix}.q"], weights[f"{prefix}.k"],
@@ -284,17 +291,20 @@ class TileLangEngine:
             return self.linear.batch(x, self.weights[name])
         return self.linear(x, self.weights[name])
 
-    def _rope(self, x, position: int):
+    def _rope(self, x, position: int, cosine=None, sine=None):
         import torch
 
-        angle = float(position) * self._inv_frequency
-        cosine, sine = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
+        if cosine is None or sine is None:
+            angle = float(position) * self._inv_frequency
+            cosine, sine = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
+        if self.backend == "tilelang":
+            return compile_rope(x.shape[0], x.shape[1])(x, cosine, sine)
         even, odd = x[..., 0::2], x[..., 1::2]
         return torch.stack(
             (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
         ).flatten(-2)
 
-    def _block(self, layer: int, x):
+    def _block(self, layer: int, x, cosine, sine):
         import torch
         import torch.nn.functional as functional
 
@@ -308,12 +318,12 @@ class TileLangEngine:
         v = qkv[q_end + kv_width :].reshape(KV_HEADS, HEAD_DIM)
         q = self._norm(q, self.weights[f"{prefix}.qn.w"])
         k = self._norm(k, self.weights[f"{prefix}.kn.w"])
-        q, k = self._rope(q, self.position), self._rope(k, self.position)
+        q = self._rope(q, self.position, cosine, sine)
+        k = self._rope(k, self.position, cosine, sine)
         q = self._quantize(q)
         k = self._quantize(k)
         v = self._quantize(v)
-        alpha = self.weights[f"{prefix}.alpha"].reshape(QUERY_HEADS)
-        alpha = (alpha * 4096.0).round() / 4096.0
+        alpha = self.weights[f"{prefix}.alpha_q"]
         if self.backend == "tilelang":
             slot = self.position % self.max_context
             self.k_cache[layer, :, slot] = k
@@ -343,7 +353,7 @@ class TileLangEngine:
             attended = torch.einsum(
                 "ht,htd->hd", probability.to(values.dtype), values
             ).reshape(D)
-        gate = torch.sigmoid(self.weights[f"{prefix}.g"]).to(attended.dtype)
+        gate = self.weights[f"{prefix}.gate"]
         x = x + self._projection(f"{prefix}.o", attended * gate)
         hidden = self._norm(x, self.weights[f"{prefix}.n2.w"])
         up_gate = self._projection(f"{prefix}.up_gate", hidden)
@@ -415,9 +425,11 @@ class TileLangEngine:
         fingerprint = self._fingerprint(int(token_id))
         if self.backend == "tilelang":
             self._position_cuda.fill_(self.position)
+        angle = float(self.position) * self._inv_frequency
+        cosine, sine = angle.cos().to(self.dtype), angle.sin().to(self.dtype)
         hidden = self._projection("emb.weight", fingerprint)
         for layer in range(LAYERS):
-            hidden = self._block(layer, hidden)
+            hidden = self._block(layer, hidden, cosine, sine)
         self.trunk_cache.append(hidden)
         self.trunk_cache = self.trunk_cache[-self.max_context :]
         self.position += 1

@@ -824,6 +824,40 @@ def compile_power_of_two_quantize(rows: int, width: int):
     return quantize
 
 
+@lru_cache(maxsize=None)
+def compile_rope(heads: int, head_dim: int):
+    """Compile BF16 RoPE while preserving the reference operation order."""
+
+    tilelang, T = _imports()
+    threads = min(256, 1 << (head_dim - 1).bit_length())
+
+    @tilelang.jit(target="cuda")
+    def rope(
+        x: T.Tensor((heads, head_dim), T.bfloat16),
+        cosine: T.Tensor((head_dim // 2,), T.bfloat16),
+        sine: T.Tensor((head_dim // 2,), T.bfloat16),
+    ):
+        output = T.empty((heads, head_dim), T.bfloat16)
+        with T.Kernel(heads, threads=threads) as head:
+            lane = T.get_thread_binding(0)
+            if lane < head_dim:
+                pair = lane // 2
+                even = x[head, pair * 2]
+                odd = x[head, pair * 2 + 1]
+                even_cosine = even * cosine[pair]
+                odd_sine = odd * sine[pair]
+                even_sine = even * sine[pair]
+                odd_cosine = odd * cosine[pair]
+                output[head, lane] = T.if_then_else(
+                    lane % 2 == 0,
+                    even_cosine - odd_sine,
+                    even_sine + odd_cosine,
+                )
+        return output
+
+    return rope
+
+
 
 
 class TileLangLinear:

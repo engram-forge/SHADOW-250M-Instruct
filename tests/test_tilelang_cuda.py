@@ -304,3 +304,19 @@ def test_tilelang_power_of_two_quantizer_is_bit_exact(shape):
     actual = compile_power_of_two_quantize(*shape)(x)
     expected = _power_of_two_quantize(x)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads", [2, 24])
+def test_tilelang_rope_is_bit_exact(heads):
+    from shadow_tilelang.kernels import compile_rope
+
+    torch.manual_seed(heads)
+    x = torch.randn(heads, 64, device="cuda", dtype=torch.bfloat16)
+    angle = torch.randn(32, device="cuda")
+    cosine, sine = angle.cos().bfloat16(), angle.sin().bfloat16()
+    actual = compile_rope(heads, 64)(x, cosine, sine)
+    even, odd = x[..., 0::2], x[..., 1::2]
+    expected = torch.stack(
+        (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
+    ).flatten(-2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

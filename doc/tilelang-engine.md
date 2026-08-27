@@ -68,6 +68,9 @@ backends run on CUDA and use the same quantized weight values and caches.
 - The exact per-head power-of-two Q/K/V quantizer is also a single, bit-exact
   TileLang kernel rather than a sequence of PyTorch reductions and pointwise
   launches.
+- Decode RoPE is a bit-exact TileLang kernel; its cosine and sine vectors are
+  computed once per token and reused across all transformer layers. Static
+  sigmoid gates and quantized attention scales are materialized once at load.
 
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.
