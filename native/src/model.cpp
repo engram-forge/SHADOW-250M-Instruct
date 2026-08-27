@@ -1201,6 +1201,103 @@ void Tensor::matvec_batch4_into(std::span<const float> x,
                                 std::span<float> y) const {
   if (x.size() != 4 * in || y.size() != 4 * out)
     throw std::runtime_error(name + " batch4 matvec shape mismatch");
+#if defined(SHADOW_ARM_DOTPROD) && defined(__aarch64__)
+  if (kind == WeightKind::ternary3 && compact_dotprod_ffn() &&
+      !ternary_dotprod_compact.empty()) {
+    constexpr std::size_t token_count = 4;
+    const std::size_t quant_group = dotprod_ffn_group();
+    const std::size_t group_count = (in + quant_group - 1) / quant_group;
+    std::vector<std::int8_t> quantized(token_count * in);
+    std::vector<float> quant_scales(token_count * group_count);
+    for (std::size_t token = 0; token < token_count; ++token)
+      for (std::size_t begin = 0; begin < in; begin += quant_group) {
+        const std::size_t end = std::min(begin + quant_group, std::size_t(in));
+        float peak = 0;
+        for (std::size_t column = begin; column < end; ++column)
+          peak = std::max(peak, std::abs(x[token * in + column]));
+        const float scale = peak / 127.0f;
+        const float inverse = scale == 0 ? 0 : 1 / scale;
+        quant_scales[token * group_count + begin / quant_group] = scale;
+        for (std::size_t column = begin; column < end; ++column)
+          quantized[token * in + column] = static_cast<std::int8_t>(std::clamp(
+              std::nearbyint(x[token * in + column] * inverse), -127.0f,
+              127.0f));
+      }
+    parallel_rows(out, [&](std::size_t row_begin, std::size_t row_end) {
+      const uint8x16_t mask = vdupq_n_u8(3), one = vdupq_n_u8(1);
+      for (std::size_t row = row_begin; row < row_end; row += 16) {
+        float32x4_t output[token_count][4];
+        for (auto &token_output : output)
+          for (auto &part : token_output) part = vdupq_n_f32(0);
+        for (std::size_t begin = 0; begin < in; begin += quant_group) {
+          int32x4_t sums[token_count][4];
+          for (auto &token_sums : sums)
+            for (auto &sum : token_sums) sum = vdupq_n_s32(0);
+          const std::size_t end = std::min(begin + quant_group, std::size_t(in));
+          for (std::size_t column = begin; column < end; column += 4) {
+            int8x16_t activation[token_count];
+            for (std::size_t token = 0; token < token_count; ++token) {
+              std::int32_t word;
+              std::memcpy(&word, quantized.data() + token * in + column,
+                          sizeof(word));
+              activation[token] = vreinterpretq_s8_s32(vdupq_n_s32(word));
+            }
+            const uint8x16_t packed = vld1q_u8(
+                ternary_dotprod_compact.data() +
+                ternary_dotprod_compact_offset(row, column, in));
+            const int8x16_t q0 = vreinterpretq_s8_u8(
+                vsubq_u8(vandq_u8(packed, mask), one));
+            const int8x16_t q1 = vreinterpretq_s8_u8(vsubq_u8(
+                vandq_u8(vshrq_n_u8(packed, 2), mask), one));
+            const int8x16_t q2 = vreinterpretq_s8_u8(vsubq_u8(
+                vandq_u8(vshrq_n_u8(packed, 4), mask), one));
+            const int8x16_t q3 = vreinterpretq_s8_u8(
+                vsubq_u8(vshrq_n_u8(packed, 6), one));
+            const auto z01 = vzipq_s8(q0, q1), z23 = vzipq_s8(q2, q3);
+            const auto rows0 = vzipq_s16(vreinterpretq_s16_s8(z01.val[0]),
+                                         vreinterpretq_s16_s8(z23.val[0]));
+            const auto rows1 = vzipq_s16(vreinterpretq_s16_s8(z01.val[1]),
+                                         vreinterpretq_s16_s8(z23.val[1]));
+            const int8x16_t tile[4] = {
+                vreinterpretq_s8_s16(rows0.val[0]),
+                vreinterpretq_s8_s16(rows0.val[1]),
+                vreinterpretq_s8_s16(rows1.val[0]),
+                vreinterpretq_s8_s16(rows1.val[1])};
+            for (std::size_t token = 0; token < token_count; ++token)
+              for (std::size_t lane = 0; lane < 4; ++lane)
+                sums[token][lane] =
+                    vdotq_s32(sums[token][lane], tile[lane], activation[token]);
+          }
+          for (std::size_t token = 0; token < token_count; ++token) {
+            const float scale =
+                quant_scales[token * group_count + begin / quant_group];
+            for (std::size_t lane = 0; lane < 4; ++lane)
+              output[token][lane] = vfmaq_n_f32(
+                  output[token][lane], vcvtq_f32_s32(sums[token][lane]), scale);
+          }
+        }
+        for (std::size_t token = 0; token < token_count; ++token) {
+          float values[16];
+          for (std::size_t lane = 0; lane < 4; ++lane)
+            vst1q_f32(values + lane * 4, output[token][lane]);
+          for (std::size_t lane = 0; lane < 16; ++lane)
+            y[token * out + row + lane] =
+                values[lane] * scales[row + lane];
+        }
+      }
+    });
+    return;
+  }
+  // Control path for approximate DotProd prefill. This immediately exposes the
+  // qualified single-token kernel; a fused implementation must beat this while
+  // preserving its group-64 numerics.
+  if (kind == WeightKind::ternary3 && dotprod_ffn_group() &&
+      (!ternary_dotprod.empty() || !ternary_dotprod_compact.empty())) {
+    for (std::size_t token = 0; token < 4; ++token)
+      matvec_into(x.subspan(token * in, in), y.subspan(token * out, out));
+    return;
+  }
+#endif
   if (kind == WeightKind::rvq) {
     const auto started = active_profile ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};

@@ -443,3 +443,24 @@ decode from 57.37 to 60.71 tok/s (+5.8%); the shared scan won six of seven paire
 runs. Initial context-512 and context-1024 screens showed no benefit, which is why
 this is thresholded. These are Surface WSL development results; confirm the
 threshold and gain on physical RK3566.
+
+### Compact64 fused batch-4 prefill
+
+Compact64 prefill now quantizes four normalized token states independently,
+unpacks each packed ternary weight tile once, and reuses it across four `sdot`
+streams. FP32 group scaling and output accumulation preserve the qualified
+group-64 numerical definition. The fused path produced byte-identical logits and
+tokens versus four sequential Compact64 calls.
+
+Three-run WSL medians against exact batch-4 prefill were uniformly positive:
+
+| Threads | 4 tokens | 16 tokens | 64 tokens | 256 tokens |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | +31.5% | +28.2% | +30.5% | +29.8% |
+| 2 | +22.6% | +31.5% | +38.7% | +26.9% |
+| 4 | +25.2% | +28.6% | +22.1% | +26.6% |
+
+At four threads the resulting Compact64 throughput was 236.04, 253.30, 250.28,
+and 235.14 prompt tok/s respectively. Raw measurements are in
+`rk3566_compact64_batch4_prefill_wsl.json`. These are Surface WSL development
+results; repeat the matrix on the physical RK3566 before publishing board claims.
