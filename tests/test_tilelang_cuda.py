@@ -536,7 +536,12 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
         packed[:, :32].astype(np.uint16)
         | (packed[:, 32:].astype(np.uint16) << 8)
     )
+    paired_words = (
+        paired[:, 0::2].astype(np.uint32)
+        | (paired[:, 1::2].astype(np.uint32) << 16)
+    )
     packed_cuda = torch.from_numpy(paired).cuda()
+    packed_words_cuda = torch.from_numpy(paired_words).cuda()
     dense = torch.from_numpy(
         np.unpackbits(packed, axis=1).astype(np.float32) * 2.0 - 1.0
     ).cuda().bfloat16()
@@ -545,13 +550,29 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
         compile_fingerprint_unpack(features)(packed_cuda[37]), dense[37], rtol=0, atol=0
     )
     torch.testing.assert_close(
+        compile_fingerprint_unpack(features, 32)(packed_words_cuda[37]),
+        dense[37], rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
         compile_fingerprint_gather(vocabulary, features)(
             packed_cuda, torch.tensor([37], device="cuda")
         ),
         dense[37], rtol=0, atol=0,
     )
     torch.testing.assert_close(
+        compile_fingerprint_gather(vocabulary, features, 32)(
+            packed_words_cuda, torch.tensor([37], device="cuda")
+        ),
+        dense[37], rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
         compile_fingerprint_unpack_batch(3, vocabulary, features)(packed_cuda, indices),
+        dense[indices], rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        compile_fingerprint_unpack_batch(
+            3, vocabulary, features, 32
+        )(packed_words_cuda, indices),
         dense[indices], rtol=0, atol=0,
     )
     projected = torch.randn(features, device="cuda", dtype=torch.bfloat16)
@@ -560,6 +581,16 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     expected = projected.float() @ (dense.float().T / (features ** 0.5)) + bias
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     assert int(actual.argmax()) == int(expected.argmax())
+    actual_words = compile_fingerprint_logits(
+        vocabulary, features, False, True, 32
+    )(projected, packed_words_cuda, bias)
+    torch.testing.assert_close(actual_words, actual, rtol=0, atol=0)
+    word_values, word_indices = compile_fingerprint_logits(
+        vocabulary, features, True, False, 32
+    )(projected, packed_words_cuda, bias)
+    word_token = compile_candidate_argmax(
+        word_values.numel(), vocabulary
+    )(word_values, word_indices)
 
     selected_logits, block_values, block_indices = compile_fingerprint_logits(
         vocabulary, features, True
@@ -578,6 +609,9 @@ def test_tilelang_packed_fingerprint_logits_match_dense_reference():
     torch.testing.assert_close(candidate_values, block_values, rtol=0, atol=0)
     torch.testing.assert_close(candidate_indices, block_indices, rtol=0, atol=0)
     assert int(candidate_token) == int(actual.argmax())
+    torch.testing.assert_close(word_values, block_values, rtol=0, atol=0)
+    torch.testing.assert_close(word_indices, block_indices, rtol=0, atol=0)
+    assert int(word_token) == int(actual.argmax())
 
     projected.zero_()
     bias.fill_(-1.0)
@@ -619,7 +653,7 @@ def test_tilelang_packed_fingerprint_embedding_is_bit_exact(token):
                 engine._fingerprint_cuda(), engine.weights["emb.weight"]
             )
             actual = compile_fingerprint_embedding(
-                VOCAB_SIZE, FINGERPRINT_DIM, D
+                VOCAB_SIZE, FINGERPRINT_DIM, D, 32
             )(
                 engine.fingerprints, engine._token_cuda,
                 engine.weights["emb.weight"],

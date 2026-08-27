@@ -356,20 +356,24 @@ class TileLangEngine:
                 source[:, :, :32].astype(np.uint16)
                 | (source[:, :, 32:].astype(np.uint16) << 8)
             ).reshape(VOCAB_SIZE, byte_width // 2)
-            return torch.from_numpy(paired).to(self.device).contiguous()
+            paired_words = (
+                paired[:, 0::2].astype(np.uint32)
+                | (paired[:, 1::2].astype(np.uint32) << 16)
+            )
+            return torch.from_numpy(paired_words).to(self.device).contiguous()
         bits = np.unpackbits(packed, axis=1)[:, :FINGERPRINT_DIM]
         values = bits.astype(np.float32) * 2.0 - 1.0
         return torch.from_numpy(values).to(self.device, self.dtype).contiguous()
 
     def _fingerprint(self, token_id: int):
         if self.backend == "tilelang":
-            return compile_fingerprint_unpack(FINGERPRINT_DIM)(
+            return compile_fingerprint_unpack(FINGERPRINT_DIM, 32)(
                 self.fingerprints[token_id]
             )
         return self.fingerprints[token_id]
 
     def _fingerprint_cuda(self):
-        return compile_fingerprint_gather(VOCAB_SIZE, FINGERPRINT_DIM)(
+        return compile_fingerprint_gather(VOCAB_SIZE, FINGERPRINT_DIM, 32)(
             self.fingerprints, self._token_cuda
         )
 
@@ -380,14 +384,14 @@ class TileLangEngine:
             padded = torch.zeros(batch_size, device=self.device, dtype=torch.int64)
             padded[: indices.numel()] = indices
             return compile_fingerprint_unpack_batch(
-                batch_size, VOCAB_SIZE, FINGERPRINT_DIM
+                batch_size, VOCAB_SIZE, FINGERPRINT_DIM, 32
             )(self.fingerprints, padded)
         return self.fingerprints[indices]
 
     def _logits(self, projected, *, select_token=False, output_logits=True):
         if self.backend == "tilelang":
             return compile_fingerprint_logits(
-                VOCAB_SIZE, FINGERPRINT_DIM, select_token, output_logits
+                VOCAB_SIZE, FINGERPRINT_DIM, select_token, output_logits, 32
             )(
                 projected, self.fingerprints, self.weights["tb"].float()
             )
@@ -639,7 +643,7 @@ class TileLangEngine:
             self._position_cuda, self._inv_frequency
         )
         hidden = compile_fingerprint_embedding(
-            VOCAB_SIZE, FINGERPRINT_DIM, D
+            VOCAB_SIZE, FINGERPRINT_DIM, D, 32
         )(
             self.fingerprints, self._token_cuda,
             self.weights["emb.weight"],

@@ -1739,26 +1739,36 @@ def compile_prefill_attention(
 
 
 @lru_cache(maxsize=None)
-def compile_fingerprint_unpack(features: int):
+def compile_fingerprint_unpack(features: int, word_bits: int = 16):
     """Expand one lane-paired fingerprint to BF16 signs."""
 
     if features % 512:
         raise ValueError("paired fingerprint width must be divisible by 512")
+    if word_bits not in (16, 32):
+        raise ValueError("fingerprint word width must be 16 or 32 bits")
     tilelang, T = _imports()
-    packed_width = features // 16
+    packed_width = features // word_bits
+    packed_dtype = T.uint16 if word_bits == 16 else T.uint32
     threads = min(features, 256)
 
     @tilelang.jit(target="cuda")
-    def unpack(packed: T.Tensor((packed_width,), T.uint16)):
+    def unpack(packed: T.Tensor((packed_width,), packed_dtype)):
         output = T.empty((features,), T.bfloat16)
         with T.Kernel(T.ceildiv(features, threads), threads=threads) as block:
             lane = T.get_thread_binding(0)
             feature = block * threads + lane
             if feature < features:
                 byte_index = feature // 8
-                word_index = (byte_index // 64) * 32 + byte_index % 32
+                word_index = (
+                    (byte_index // 64) * (64 // (word_bits // 8))
+                    + (byte_index % 32) // (word_bits // 16)
+                )
                 word = packed[word_index].astype(T.int32)
-                shift = ((byte_index % 64) // 32) * 8 + 7 - feature % 8
+                shift = (
+                    ((byte_index % 64) // 32) * 8
+                    + (byte_index % (word_bits // 16)) * 16
+                    + 7 - feature % 8
+                )
                 bit = (word >> shift) & 1
                 output[feature] = (bit * 2 - 1).astype(T.bfloat16)
         return output
@@ -1767,18 +1777,23 @@ def compile_fingerprint_unpack(features: int):
 
 
 @lru_cache(maxsize=None)
-def compile_fingerprint_gather(vocabulary: int, features: int):
+def compile_fingerprint_gather(
+    vocabulary: int, features: int, word_bits: int = 16
+):
     """Gather a CUDA-selected paired fingerprint and expand its signs."""
 
     if features % 512:
         raise ValueError("paired fingerprint width must be divisible by 512")
+    if word_bits not in (16, 32):
+        raise ValueError("fingerprint word width must be 16 or 32 bits")
     tilelang, T = _imports()
-    packed_width = features // 16
+    packed_width = features // word_bits
+    packed_dtype = T.uint16 if word_bits == 16 else T.uint32
     threads = min(features, 256)
 
     @tilelang.jit(target="cuda")
     def gather(
-        packed: T.Tensor((vocabulary, packed_width), T.uint16),
+        packed: T.Tensor((vocabulary, packed_width), packed_dtype),
         index: T.Tensor((1,), T.int64),
     ):
         output = T.empty((features,), T.bfloat16)
@@ -1787,9 +1802,16 @@ def compile_fingerprint_gather(vocabulary: int, features: int):
             feature = block * threads + lane
             if feature < features:
                 byte_index = feature // 8
-                word_index = (byte_index // 64) * 32 + byte_index % 32
+                word_index = (
+                    (byte_index // 64) * (64 // (word_bits // 8))
+                    + (byte_index % 32) // (word_bits // 16)
+                )
                 word = packed[index[0], word_index].astype(T.int32)
-                shift = ((byte_index % 64) // 32) * 8 + 7 - feature % 8
+                shift = (
+                    ((byte_index % 64) // 32) * 8
+                    + (byte_index % (word_bits // 16)) * 16
+                    + 7 - feature % 8
+                )
                 bit = (word >> shift) & 1
                 output[feature] = (bit * 2 - 1).astype(T.bfloat16)
         return output
@@ -1799,20 +1821,23 @@ def compile_fingerprint_gather(vocabulary: int, features: int):
 
 @lru_cache(maxsize=None)
 def compile_fingerprint_embedding(
-    vocabulary: int, features: int, out_features: int
+    vocabulary: int, features: int, out_features: int, word_bits: int = 16
 ):
     """Project one packed token fingerprint with dense BF16 weights."""
 
     if features % 512:
         raise ValueError("paired fingerprint width must be divisible by 512")
+    if word_bits not in (16, 32):
+        raise ValueError("fingerprint word width must be 16 or 32 bits")
     tilelang, T = _imports()
-    packed_width = features // 16
+    packed_width = features // word_bits
+    packed_dtype = T.uint16 if word_bits == 16 else T.uint32
     n_partition, reduce_threads, vector = 8, 16, 8
     block_k = reduce_threads * vector
 
     @tilelang.jit(target="cuda")
     def embedding(
-        packed: T.Tensor((vocabulary, packed_width), T.uint16),
+        packed: T.Tensor((vocabulary, packed_width), packed_dtype),
         token: T.Tensor((1,), T.int64),
         weight: T.Tensor((out_features, features), T.bfloat16),
     ):
@@ -1830,10 +1855,15 @@ def compile_fingerprint_embedding(
                 for inner in T.serial(vector):
                     feature = tile_k * block_k + lane_k * vector + inner
                     byte_index = feature // 8
-                    word_index = (byte_index // 64) * 32 + byte_index % 32
+                    word_index = (
+                        (byte_index // 64) * (64 // (word_bits // 8))
+                        + (byte_index % 32) // (word_bits // 16)
+                    )
                     word = packed[token[0], word_index].astype(T.int32)
                     shift = (
-                        ((byte_index % 64) // 32) * 8 + 7 - feature % 8
+                        ((byte_index % 64) // 32) * 8
+                        + (byte_index % (word_bits // 16)) * 16
+                        + 7 - feature % 8
                     )
                     bit = (word >> shift) & 1
                     sign = (bit * 2 - 1).astype(T.bfloat16)
@@ -2049,18 +2079,23 @@ def compile_structural_softmax(max_context: int, input_scale: float = 1.0):
 
 
 @lru_cache(maxsize=None)
-def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features: int):
+def compile_fingerprint_unpack_batch(
+    batch_size: int, vocabulary: int, features: int, word_bits: int = 16
+):
     """Gather and expand a batch of lane-paired fingerprints."""
 
     if features % 512:
         raise ValueError("paired fingerprint width must be divisible by 512")
+    if word_bits not in (16, 32):
+        raise ValueError("fingerprint word width must be 16 or 32 bits")
     tilelang, T = _imports()
-    packed_width = features // 16
+    packed_width = features // word_bits
+    packed_dtype = T.uint16 if word_bits == 16 else T.uint32
     threads = min(features, 256)
 
     @tilelang.jit(target="cuda")
     def unpack(
-        packed: T.Tensor((vocabulary, packed_width), T.uint16),
+        packed: T.Tensor((vocabulary, packed_width), packed_dtype),
         indices: T.Tensor((batch_size,), T.int64),
     ):
         output = T.empty((batch_size, features), T.bfloat16)
@@ -2071,9 +2106,16 @@ def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features:
             feature = block * threads + lane
             if feature < features:
                 byte_index = feature // 8
-                word_index = (byte_index // 64) * 32 + byte_index % 32
+                word_index = (
+                    (byte_index // 64) * (64 // (word_bits // 8))
+                    + (byte_index % 32) // (word_bits // 16)
+                )
                 word = packed[indices[token], word_index].astype(T.int32)
-                shift = ((byte_index % 64) // 32) * 8 + 7 - feature % 8
+                shift = (
+                    ((byte_index % 64) // 32) * 8
+                    + (byte_index % (word_bits // 16)) * 16
+                    + 7 - feature % 8
+                )
                 bit = (word >> shift) & 1
                 output[token, feature] = (bit * 2 - 1).astype(T.bfloat16)
         return output
@@ -2085,6 +2127,7 @@ def compile_fingerprint_unpack_batch(batch_size: int, vocabulary: int, features:
 def compile_fingerprint_logits(
     vocabulary: int, features: int, select_token: bool = False,
     output_logits: bool = True,
+    word_bits: int = 16,
 ):
     """Project BF16 features directly against lane-paired signs."""
 
@@ -2092,9 +2135,12 @@ def compile_fingerprint_logits(
         raise ValueError("paired fingerprint width must be divisible by 512")
     if not output_logits and not select_token:
         raise ValueError("candidate-only logits require token selection")
+    if word_bits not in (16, 32):
+        raise ValueError("fingerprint word width must be 16 or 32 bits")
     tilelang, T = _imports()
-    packed_width = features // 16
-    lanes = 32
+    packed_width = features // word_bits
+    packed_dtype = T.uint16 if word_bits == 16 else T.uint32
+    lanes = 32 if word_bits == 16 else 16
     rows_per_block = 8
     normalization = features ** -0.5
     blocks = (vocabulary + rows_per_block - 1) // rows_per_block
@@ -2102,7 +2148,7 @@ def compile_fingerprint_logits(
     @tilelang.jit(target="cuda")
     def logits(
         projected: T.Tensor((features,), T.bfloat16),
-        packed: T.Tensor((vocabulary, packed_width), T.uint16),
+        packed: T.Tensor((vocabulary, packed_width), packed_dtype),
         bias: T.Tensor((vocabulary,), T.float32),
     ):
         if output_logits:
@@ -2131,14 +2177,21 @@ def compile_fingerprint_logits(
                     word_index = word_tile * lanes + lane
                     if word_index < packed_width:
                         word = packed[token, word_index].astype(T.int32)
-                        for half in T.serial(2):
-                            byte = (word >> (half * 8)) & 255
+                        for part in T.serial(word_bits // 8):
+                            byte = (word >> (part * 8)) & 255
                             for component in T.serial(8):
                                 bit = (byte >> (7 - component)) & 1
-                                feature = (
-                                    word_tile * 512 + half * 256
-                                    + lane * 8 + component
-                                )
+                                if word_bits == 16:
+                                    feature = (
+                                        word_tile * 512 + part * 256
+                                        + lane * 8 + component
+                                    )
+                                else:
+                                    feature = (
+                                        word_tile * 512 + (part % 2) * 256
+                                        + lane * 16 + (part // 2) * 8
+                                        + component
+                                    )
                                 value = shared_projected[
                                     feature
                                 ].astype(T.float32)
