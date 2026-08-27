@@ -424,6 +424,48 @@ bool compact_dotprod_ffn() {
 #endif
 }
 
+#if defined(SHADOW_ARM_DOTPROD)
+void quantize_group(std::span<const float> input, std::int8_t *output,
+                    float &scale) {
+  float peak = 0;
+#if defined(__aarch64__)
+  {
+    float32x4_t maximum = vdupq_n_f32(0);
+    std::size_t column = 0;
+    for (; column + 4 <= input.size(); column += 4)
+      maximum = vmaxq_f32(maximum, vabsq_f32(vld1q_f32(input.data() + column)));
+    peak = vmaxvq_f32(maximum);
+    for (; column < input.size(); ++column)
+      peak = std::max(peak, std::abs(input[column]));
+    scale = peak / 127.0f;
+    const float inverse = scale == 0 ? 0 : 1 / scale;
+    const float32x4_t inverse_vector = vdupq_n_f32(inverse);
+    column = 0;
+    for (; column + 4 <= input.size(); column += 4) {
+      const int32x4_t rounded =
+          vcvtnq_s32_f32(vmulq_f32(vld1q_f32(input.data() + column),
+                                    inverse_vector));
+      std::int32_t lanes[4];
+      vst1q_s32(lanes, rounded);
+      for (std::size_t lane = 0; lane < 4; ++lane)
+        output[column + lane] = static_cast<std::int8_t>(
+            std::clamp(lanes[lane], std::int32_t{-127}, std::int32_t{127}));
+    }
+    for (; column < input.size(); ++column)
+      output[column] = static_cast<std::int8_t>(std::clamp(
+          std::nearbyint(input[column] * inverse), -127.0f, 127.0f));
+    return;
+  }
+#endif
+  for (float value : input) peak = std::max(peak, std::abs(value));
+  scale = peak / 127.0f;
+  const float inverse = scale == 0 ? 0 : 1 / scale;
+  for (std::size_t column = 0; column < input.size(); ++column)
+    output[column] = static_cast<std::int8_t>(std::clamp(
+        std::nearbyint(input[column] * inverse), -127.0f, 127.0f));
+}
+#endif
+
 void silu_inplace(std::span<float> values) {
   for (float &value : values)
     value = value / (1.0f + std::exp(-value));
@@ -692,15 +734,8 @@ void Tensor::matvec_into(std::span<const float> x, std::span<float> y) const {
       quant_scales.resize((in + quant_group - 1) / quant_group);
       for (std::size_t begin = 0; begin < in; begin += quant_group) {
         const std::size_t end = std::min(begin + quant_group, std::size_t(in));
-        float peak = 0;
-        for (std::size_t column = begin; column < end; ++column)
-          peak = std::max(peak, std::abs(x[column]));
-        const float scale = peak / 127.0f;
-        const float inverse = scale == 0 ? 0 : 1 / scale;
-        quant_scales[begin / quant_group] = scale;
-        for (std::size_t column = begin; column < end; ++column)
-          quantized[column] = static_cast<std::int8_t>(std::clamp(
-              std::nearbyint(x[column] * inverse), -127.0f, 127.0f));
+        quantize_group(x.subspan(begin, end - begin), quantized.data() + begin,
+                       quant_scales[begin / quant_group]);
       }
       parallel_rows(out, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; row += 16) {
@@ -1046,15 +1081,8 @@ void Tensor::matvec_pair_into(const Tensor &other, std::span<const float> x,
     std::vector<float> quant_scales(group_count);
     for (std::size_t begin = 0; begin < in; begin += quant_group) {
       const std::size_t end = std::min(begin + quant_group, std::size_t(in));
-      float peak = 0;
-      for (std::size_t column = begin; column < end; ++column)
-        peak = std::max(peak, std::abs(x[column]));
-      const float scale = peak / 127.0f;
-      const float inverse = scale == 0 ? 0 : 1 / scale;
-      quant_scales[begin / quant_group] = scale;
-      for (std::size_t column = begin; column < end; ++column)
-        quantized[column] = static_cast<std::int8_t>(std::clamp(
-            std::nearbyint(x[column] * inverse), -127.0f, 127.0f));
+      quantize_group(x.subspan(begin, end - begin), quantized.data() + begin,
+                     quant_scales[begin / quant_group]);
     }
     const Tensor *weights[2] = {this, &other};
     std::span<float> outputs[2] = {y, other_y};
@@ -1301,16 +1329,9 @@ void Tensor::matvec_batch4_into(std::span<const float> x,
     for (std::size_t token = 0; token < token_count; ++token)
       for (std::size_t begin = 0; begin < in; begin += quant_group) {
         const std::size_t end = std::min(begin + quant_group, std::size_t(in));
-        float peak = 0;
-        for (std::size_t column = begin; column < end; ++column)
-          peak = std::max(peak, std::abs(x[token * in + column]));
-        const float scale = peak / 127.0f;
-        const float inverse = scale == 0 ? 0 : 1 / scale;
-        quant_scales[token * group_count + begin / quant_group] = scale;
-        for (std::size_t column = begin; column < end; ++column)
-          quantized[token * in + column] = static_cast<std::int8_t>(std::clamp(
-              std::nearbyint(x[token * in + column] * inverse), -127.0f,
-              127.0f));
+        quantize_group(x.subspan(token * in + begin, end - begin),
+                       quantized.data() + token * in + begin,
+                       quant_scales[token * group_count + begin / quant_group]);
       }
     parallel_rows(out, [&](std::size_t row_begin, std::size_t row_end) {
       const uint8x16_t mask = vdupq_n_u8(3), one = vdupq_n_u8(1);

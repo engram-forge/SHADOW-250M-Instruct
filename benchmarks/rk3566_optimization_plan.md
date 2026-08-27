@@ -477,3 +477,15 @@ runs improved median decode from 167.63 to 175.24 tok/s (+4.5%). The fused path
 won all seven pairs. This gain is additional to Compact64 itself and comes from
 removing duplicate activation quantization and one worker dispatch. Confirm on
 physical RK3566 before treating it as a board result.
+
+### Vectorized Compact64 activation quantization
+
+Group-64 peak detection and float-to-INT8 rounding now use ARM NEON in DotProd
+builds. The conversion uses round-to-nearest-even, matching `nearbyint`; clamping,
+group scales, and all downstream arithmetic are unchanged. Generated tokens and
+dumped logits were byte-identical to the scalar quantizer.
+
+Seven-run, four-thread WSL medians improved context-128 decode from 173.04 to
+176.62 tok/s (+2.1%). Length-256 batch-4 prefill time fell from 1.1358 to 1.1131
+seconds (+2.0% throughput). This is a small numerical-equivalent gain layered on
+the fused Compact64 kernels; confirm it on physical RK3566.
