@@ -35,3 +35,14 @@ repository on a mounted Windows drive so Windows interop can execute the bundled
 
 Use `--limit 0` for all assistant turns and `--max-tokens` to control the maximum decode
 length. Run the same command with `--kernel deployment/bin/linux/shadow` for a Linux binary.
+
+`tilelang_bench.py` compares the eager PyTorch CUDA reference with the optimized
+TileLang runtime across prefill and greedy decode lengths. It excludes model
+loading, lazy compilation, graph capture, and decode prompt prefill:
+
+    uv run python benchmarks/tilelang_bench.py \
+      --sizes 32 128 1024 2048 --repetitions 3 \
+      --out tilelang-benchmark.json
+
+The H100 results and methodology are recorded in
+`doc/tilelang/cuda-backend-benchmark.md`.

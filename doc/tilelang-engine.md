@@ -80,13 +80,18 @@ backends run on CUDA and use the same quantized weight values and caches.
 The stateful fallback processes prompt additions one token at a time; fresh
 prompts use the batched prefill path.
 
-On the development H100 NVL, native packed-weight GEMV and exact attention run
-the warm stateful decode fixture at about 165 tokens/s. Packed-weight GEMV
-reduced load-time CUDA allocation from 644.7 MiB to 178.8 MiB; the fixed K/V
-cache plus packed fingerprints brings the final load allocation to 68.8 MiB
-and peak allocation to 102.0 MiB. Warm 128-token batched prefill runs at about 1,527 tokens/s versus
-113 tokens/s for the token-wise path. These are bring-up numbers, not release
-claims: the GPU was shared during measurement.
+In an earlier development H100 NVL measurement, native packed-weight GEMV and
+exact attention ran the warm stateful decode fixture at about 165 tokens/s.
+Packed-weight GEMV reduced load-time CUDA allocation from 644.7 MiB to 178.8
+MiB; the fixed K/V cache plus packed fingerprints brings the final load
+allocation to 68.8 MiB and peak allocation to 102.0 MiB. Warm 128-token batched
+prefill runs at about 1,527 tokens/s versus 113 tokens/s for the token-wise
+path. These are bring-up numbers, not release claims: the GPU was shared during
+measurement.
+
+For the current, reproducible comparison against the PyTorch CUDA reference at
+32 through 2,048 tokens, see
+[`tilelang/cuda-backend-benchmark.md`](tilelang/cuda-backend-benchmark.md).
 
 ## Inspect generated CUDA
 
