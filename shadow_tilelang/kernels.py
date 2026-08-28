@@ -743,7 +743,9 @@ def compile_ternary_swiglu(out_features: int, in_features: int):
 
 
 @lru_cache(maxsize=None)
-def compile_interleaved_ternary_swiglu(out_features: int, in_features: int):
+def compile_interleaved_ternary_swiglu(
+    out_features: int, in_features: int, rows_per_block: int = 8
+):
     """Project paired up/gate words from one interleaved 32-bit load."""
 
     if out_features % 2:
@@ -751,7 +753,7 @@ def compile_interleaved_ternary_swiglu(out_features: int, in_features: int):
     tilelang, T = _imports()
     hidden_features = out_features // 2
     packed_width = (in_features + 4) // 5
-    n_partition, reduce_threads = 8, 32
+    n_partition, reduce_threads = rows_per_block, 32
 
     @tilelang.jit(target="cuda")
     def swiglu(
