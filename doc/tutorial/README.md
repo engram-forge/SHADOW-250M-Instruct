@@ -4,6 +4,9 @@ This tutorial traces the quantization code in `finetune/modeling/` from
 trainable tensors to deployed bytes. It is divided by mechanism so that the
 three meanings of “one bit” do not get mixed together.
 
+For the implementation-oriented Chinese companion, see
+[SHADOW 模型实现导读](README.zh-local.md).
+
 ## Reading order
 
 1. [System map and quantization-aware training](01-system-map.md)
@@ -36,4 +39,3 @@ quantization compresses dynamic activations rather than model parameters.
 | base-3 and FP16 repacking | `finetune/modeling/repack_shdw.py` |
 | paged cold KV storage | `finetune/modeling/paged_kv.py` |
 | training-time overrides | `finetune/finetune.py` |
-

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>SHADOW RVQ 与 STE 交互演示</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f7f8fa; --fg:#18202a; --muted:#5c6875; --panel:#fff; --line:#ccd3da; --a:#1769aa; --b:#ad4e00; --ok:#147d47; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#11151a; --fg:#e5ebf1; --muted:#9ca8b4; --panel:#181e25; --line:#3a4652; --a:#67b7f7; --b:#ffad66; --ok:#55c98a; } }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:980px; margin:auto; padding:24px; }
+    h1 { font-size:1.55rem; margin:0 0 8px; }
+    h2 { font-size:1.15rem; margin:0 0 12px; }
+    p { margin:6px 0 14px; color:var(--muted); }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; margin:18px 0; }
+    .controls { display:flex; flex-wrap:wrap; gap:14px 24px; align-items:end; margin:12px 0; }
+    label { display:grid; gap:4px; min-width:220px; font-weight:600; }
+    input[type="range"] { width:240px; }
+    output, code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .flow { display:grid; grid-template-columns:repeat(7,minmax(74px,1fr)); align-items:center; gap:8px; margin-top:18px; }
+    .node { min-height:76px; display:grid; place-content:center; text-align:center; padding:8px; border:1px solid var(--line); border-radius:9px; }
+    .node strong { font-size:1.08rem; }
+    .arrow { text-align:center; color:var(--muted); font-size:1.4rem; }
+    .accent { color:var(--a); }
+    .orange { color:var(--b); }
+    .ok { color:var(--ok); }
+    .legend { display:flex; flex-wrap:wrap; gap:14px; color:var(--muted); margin:8px 0; }
+    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; background:currentColor; }
+    svg { width:100%; height:auto; min-height:330px; display:block; }
+    .axis { stroke:var(--line); stroke-width:1; }
+    .guide { stroke:var(--line); stroke-dasharray:4 4; }
+    .vector { stroke-width:3; fill:none; }
+    .point { stroke:var(--panel); stroke-width:2; }
+    .caption { fill:var(--fg); font:14px system-ui,sans-serif; }
+    .muted { fill:var(--muted); font:13px system-ui,sans-serif; }
+    .steps { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:12px; }
+    .step { border-left:4px solid var(--line); padding:8px 10px; background:color-mix(in srgb,var(--panel),var(--line) 8%); }
+    .step.active { border-color:var(--a); }
+    button { font:inherit; padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--fg); cursor:pointer; }
+    button[aria-pressed="true"] { border-color:var(--a); color:var(--a); }
+    @media (max-width:700px) { .flow { grid-template-columns:1fr; } .arrow { transform:rotate(90deg); } .steps { grid-template-columns:1fr; } main { padding:14px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>RVQ 与 STE：把前向离散、反向连续放在一张图里</h1>
+  <p>这是教学用的简化二维例子，不使用模型真实权重。对应代码入口是 common.py 中的 RVQ.enc、RVQ.qw 和 _ExactSTE。</p>
+
+  <section aria-labelledby="ste-title">
+    <h2 id="ste-title">1. STE：同一个节点，前向与反向采用不同规则</h2>
+    <div class="controls">
+      <label>浮点主权重 x = <output id="x-value">0.73</output>
+        <input id="x" type="range" min="-2" max="2" step="0.01" value="0.73">
+      </label>
+      <label>量化步长 s = <output id="s-value">1.00</output>
+        <input id="s" type="range" min="0.1" max="1" step="0.05" value="1">
+      </label>
+    </div>
+    <div class="flow" aria-live="polite">
+      <div class="node"><span>float x</span><strong id="ste-x">0.73</strong></div><div class="arrow">→</div>
+      <div class="node"><span>round(x/s)·s</span><strong class="orange" id="ste-q">1.00</strong></div><div class="arrow">→</div>
+      <div class="node"><span>L = y²</span><strong id="ste-loss">1.00</strong></div><div class="arrow">⇢</div>
+      <div class="node"><span>STE 送回 x</span><strong class="ok" id="ste-grad">dL/dx ≈ 2.00</strong></div>
+    </div>
+    <p id="ste-note">前向后续层看到 y = 1.00；反向不使用 round 的零导数，而把 dL/dy 原样传给 x。</p>
+  </section>
+
+  <section aria-labelledby="rvq-title">
+    <h2 id="rvq-title">2. 两级 RVQ：第二级量化的是第一级留下的残差</h2>
+    <div class="controls">
+      <label>原始向量 w₁ = <output id="w1-value">2.20</output>
+        <input id="w1" type="range" min="-3" max="3" step="0.05" value="2.2">
+      </label>
+      <label>原始向量 w₂ = <output id="w2-value">1.40</output>
+        <input id="w2" type="range" min="-3" max="3" step="0.05" value="1.4">
+      </label>
+      <div role="group" aria-label="显示阶段">
+        <button type="button" data-stage="0">原向量</button>
+        <button type="button" data-stage="1">第 1 级</button>
+        <button type="button" data-stage="2" aria-pressed="true">第 2 级</button>
+      </div>
+    </div>
+    <div class="legend">
+      <span class="accent"><i class="dot"></i>目标/残差</span>
+      <span class="orange"><i class="dot"></i>当前级选中的 code</span>
+      <span class="ok"><i class="dot"></i>累计重建</span>
+    </div>
+    <svg id="plot" viewBox="0 0 720 390" role="img" aria-labelledby="plot-title plot-desc">
+      <title id="plot-title">二维两级 RVQ 向量图</title>
+      <desc id="plot-desc">显示原向量、第一级码本近似、残差与第二级修正。</desc>
+      <defs>
+        <marker id="arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--a)"/></marker>
+        <marker id="arrow-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--b)"/></marker>
+        <marker id="arrow-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--ok)"/></marker>
+      </defs>
+      <line class="axis" x1="45" y1="195" x2="690" y2="195"/><line class="axis" x1="360" y1="25" x2="360" y2="365"/>
+      <text class="muted" x="680" y="216">x₁</text><text class="muted" x="370" y="38">x₂</text>
+      <g id="codes"></g><g id="vectors"></g><g id="labels"></g>
+    </svg>
+    <div class="steps" aria-live="polite">
+      <div class="step" id="step0"><strong>目标</strong><br><code id="target-text"></code></div>
+      <div class="step" id="step1"><strong>第 1 级</strong><br><code id="stage1-text"></code></div>
+      <div class="step" id="step2"><strong>第 2 级</strong><br><code id="stage2-text"></code></div>
+    </div>
+  </section>
+</main>
+<script>
+(() => {
+  const byId = id => document.getElementById(id);
+  const fmt = n => Number(n).toFixed(2);
+  const x = byId('x'), s = byId('s');
+  function updateSte() {
+    const xv = +x.value, sv = +s.value, q = Math.round(xv / sv) * sv;
+    byId('x-value').value = fmt(xv); byId('s-value').value = fmt(sv);
+    byId('ste-x').textContent = fmt(xv); byId('ste-q').textContent = fmt(q);
+    byId('ste-loss').textContent = fmt(q*q); byId('ste-grad').textContent = 'dL/dx ≈ ' + fmt(2*q);
+    byId('ste-note').textContent = '前向后续层看到 y = ' + fmt(q) + '；反向不使用 round 的零导数，而把 dL/dy 原样传给 x。';
+  }
+  x.addEventListener('input', updateSte); s.addEventListener('input', updateSte); updateSte();
+
+  const c1 = [[-2,-2],[-2,1],[0,-2],[0,0],[1,2],[2,0],[2,2]];
+  const c2 = [[-1,-1],[-1,0],[0,-1],[0,0],[0,1],[1,0],[1,1],[-.5,.5],[.5,-.5]];
+  const w1 = byId('w1'), w2 = byId('w2'); let shown = 2;
+  const sx = a => 360 + a*92, sy = a => 195 - a*52;
+  const nearest = (v, codes) => codes.reduce((best,c) => {
+    const d=(v[0]-c[0])**2+(v[1]-c[1])**2; return d<best.d ? {c,d} : best;
+  }, {c:codes[0], d:Infinity}).c;
+  const el = (name, attrs, text) => { const n=document.createElementNS('http://www.w3.org/2000/svg',name); Object.entries(attrs).forEach(([k,v])=>n.setAttribute(k,v)); if(text)n.textContent=text; return n; };
+  function vector(group, from, to, color, marker) {
+    group.appendChild(el('line',{x1:sx(from[0]),y1:sy(from[1]),x2:sx(to[0]),y2:sy(to[1]),class:'vector',stroke:color,'marker-end':'url(#'+marker+')'}));
+  }
+  function updateRvq() {
+    const w=[+w1.value,+w2.value], q1=nearest(w,c1), r1=[w[0]-q1[0],w[1]-q1[1]], q2=nearest(r1,c2), rec=[q1[0]+q2[0],q1[1]+q2[1]], r2=[w[0]-rec[0],w[1]-rec[1]];
+    byId('w1-value').value=fmt(w[0]); byId('w2-value').value=fmt(w[1]);
+    byId('target-text').textContent='w = ('+fmt(w[0])+', '+fmt(w[1])+')';
+    byId('stage1-text').textContent='q₁ = ('+fmt(q1[0])+', '+fmt(q1[1])+'), r₁ = ('+fmt(r1[0])+', '+fmt(r1[1])+')';
+    byId('stage2-text').textContent='q₂ = ('+fmt(q2[0])+', '+fmt(q2[1])+'), ŵ = ('+fmt(rec[0])+', '+fmt(rec[1])+'), r₂ = ('+fmt(r2[0])+', '+fmt(r2[1])+')';
+    ['step0','step1','step2'].forEach((id,i)=>byId(id).classList.toggle('active',i===shown));
+    const cg=byId('codes'), vg=byId('vectors'), lg=byId('labels'); cg.replaceChildren(); vg.replaceChildren(); lg.replaceChildren();
+    const visibleCodes=shown===2?c2:c1;
+    visibleCodes.forEach(c=>cg.appendChild(el('circle',{cx:sx(c[0]+(shown===2?q1[0]:0)),cy:sy(c[1]+(shown===2?q1[1]:0)),r:5,fill:'var(--b)',class:'point'})));
+    vector(vg,[0,0],w,'var(--a)','arrow-a');
+    if(shown>=1) vector(vg,[0,0],q1,'var(--ok)','arrow-ok');
+    if(shown===1) vector(vg,q1,w,'var(--a)','arrow-a');
+    if(shown===2) { vector(vg,q1,rec,'var(--b)','arrow-b'); vector(vg,[0,0],rec,'var(--ok)','arrow-ok'); vector(vg,rec,w,'var(--a)','arrow-a'); }
+    lg.appendChild(el('text',{x:sx(w[0])+8,y:sy(w[1])-8,class:'caption'},'w'));
+    if(shown>=1) lg.appendChild(el('text',{x:sx(q1[0])+8,y:sy(q1[1])+18,class:'caption'},'q₁'));
+    if(shown===2) lg.appendChild(el('text',{x:sx(rec[0])+8,y:sy(rec[1])-8,class:'caption'},'q₁+q₂'));
+  }
+  [w1,w2].forEach(n=>n.addEventListener('input',updateRvq));
+  document.querySelectorAll('[data-stage]').forEach(b=>b.addEventListener('click',()=>{ shown=+b.dataset.stage; document.querySelectorAll('[data-stage]').forEach(x=>x.setAttribute('aria-pressed',String(x===b))); updateRvq(); }));
+  updateRvq();
+})();
+</script>
+</body>
+</html>
